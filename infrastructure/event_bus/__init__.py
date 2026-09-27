@@ -25,6 +25,11 @@ from .event_bus import (
     EventBusSnapshot,
     PublishResult,
 )
+from .publisher import (
+    EventBusPublisher,
+    EventPublisher,
+    EventSink,
+)
 from .queue import (
     EventQueue,
     EventQueueSet,
@@ -52,11 +57,14 @@ __all__ = [
     "DeliveryResult",
     "DeliveryStatus",
     "EventBus",
+    "EventBusPublisher",
     "EventBusSnapshot",
     "EventDelivery",
+    "EventPublisher",
     "EventQueue",
     "EventQueueSet",
     "EventRouter",
+    "EventSink",
     "EventSubscription",
     "PublishResult",
     "QueueItem",

@@ -486,13 +486,13 @@ P0-1 sh3dev Packaging
     PASS
 
 P0-2 Security Workflow
-    LOCAL PASS / GITHUB EXECUTION PENDING
+    LOCAL PASS / GITHUB PASS
 
 P0-3 Release Workflow
-    LOCAL PASS / GITHUB EXECUTION PENDING
+    LOCAL PASS / GITHUB PASS
 
 P0-4 Certification Evidence
-    ESTABLISHED
+    PASS
 
 Overall P0 certification decision:
 

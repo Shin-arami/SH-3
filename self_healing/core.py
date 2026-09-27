@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import RLock
 from typing import Any
 
+from foundation.Enums.category import Category
+from foundation.Enums.event import EventType
 from foundation.utils.exceptions import SH3Exception
 from foundation.utils.hash import short_id
 from foundation.utils.logging import error, info
 from foundation.utils.time import iso
+from infrastructure.event_bus import EventBus, EventPublisher, EventSubscription
+from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security import EvidenceRecord, EvidenceStore
 
 __all__ = [
     "FailureSnapshot",
@@ -108,11 +114,17 @@ class SelfHealingCore:
     __slots__ = (
         "_attempts",
         "_detected",
+        "_event_bus",
+        "_event_publisher",
+        "_evidence_store",
         "_failed",
+        "_last_event_id",
         "_last_failure",
         "_last_plan",
         "_last_result",
+        "_learned_records",
         "_lock",
+        "_propagation_context",
         "_recovered",
         "context_manager",
         "learning",
@@ -123,23 +135,180 @@ class SelfHealingCore:
 
     def __init__(
         self,
-        runtime: Any | None = None,
-        context_manager: Any | None = None,
-        learning: Any | None = None,
+        runtime: Any = None,
+        context_manager: Any = None,
+        learning: Any = None,
         *,
-        learning_service: Any | None = None,
+        learning_service: Any = None,
+        event_publisher: EventPublisher | None = None,
     ) -> None:
         self.runtime = runtime
         self.context_manager = context_manager
-        self.learning = learning_service if learning_service is not None else learning
+        self.learning = (
+            learning_service if learning_service is not None else learning
+        )
         self._lock = RLock()
+        self._event_publisher = event_publisher
+        self._event_bus: EventBus | None = None
+        self._evidence_store = EvidenceStore()
+        self._last_event_id: str | None = None
+        self._attempts: list[RecoveryAttempt] = []
         self._detected = 0
         self._recovered = 0
         self._failed = 0
         self._last_failure: FailureSnapshot | None = None
         self._last_plan: RecoveryPlan | None = None
         self._last_result: Any = None
-        self._attempts: list[RecoveryAttempt] = []
+        self._propagation_context: EventPropagationContext | None = None
+        self._learned_records: list[dict[str, Any]] = []
+        self._configure_learning_subscription()
+
+
+    @property
+    def evidence_store(self) -> EvidenceStore:
+        return self._evidence_store
+
+    def recovery_evidence(self) -> EvidenceRecord | None:
+        with self._lock:
+            failure = self._last_failure
+            plan = self._last_plan
+            attempts = tuple(self._attempts)
+            result = self._last_result
+        if failure is None or plan is None:
+            return None
+        record = EvidenceRecord.create(
+            evidence_id=f"recovery:{failure.trace_id}",
+            kind="recovery",
+            source="self-healing",
+            subject_id=plan.trace_id,
+            version="1.0.0",
+            trace_id=failure.trace_id,
+            payload={
+                "failure": failure.to_dict(),
+                "plan": plan.to_dict(),
+                "attempts": [attempt.to_dict() for attempt in attempts],
+                "result": result,
+                "recovered": self.recovered,
+                "failed": self.failed,
+            },
+        )
+        return self._evidence_store.register(record)
+
+    @property
+    def event_publisher(self) -> EventPublisher | None:
+        return self._event_publisher
+
+    def set_event_publisher(self, publisher: EventPublisher | None) -> None:
+        if publisher is not None and not isinstance(publisher, EventPublisher):
+            raise TypeError("publisher must implement EventPublisher")
+        self._event_publisher = publisher
+        self._configure_learning_subscription()
+
+    def _configure_learning_subscription(self) -> None:
+        publisher = self._event_publisher
+        event_bus = (
+            getattr(publisher, "event_bus", None) if publisher is not None else None
+        )
+        if event_bus is not None and not isinstance(event_bus, EventBus):
+            event_bus = None
+        if self._event_bus is event_bus:
+            return
+        if self._event_bus is not None:
+            with suppress(KeyError):
+                self._event_bus.unsubscribe("self-healing-learning")
+        self._event_bus = event_bus
+        if event_bus is None:
+            return
+        event_bus.subscribe(
+            EventSubscription(
+                subscriber_id="self-healing-learning",
+                handler=self._handle_learning_event,
+                event_name="LearningResultRecorded",
+                priority=100,
+            ),
+            replace=True,
+        )
+
+    def _handle_learning_event(self, event: Event) -> None:
+        if event.name != "LearningResultRecorded":
+            return
+        record = event.payload
+        if not isinstance(record, Mapping):
+            return
+        domain = str(record.get("domain", ""))
+        details = record.get("details", {})
+        success = record.get("success")
+        score = record.get("score")
+        if domain != "self_healing.recovery" or not isinstance(details, Mapping):
+            return
+        if (
+            not isinstance(success, bool)
+            or not isinstance(score, (int, float))
+            or isinstance(score, bool)
+        ):
+            return
+        if float(score) != (1.0 if success else 0.0):
+            return
+        normalized = {
+            "domain": domain,
+            "score": float(score),
+            "success": success,
+            "details": dict(details),
+            "record_id": record.get("record_id"),
+        }
+        with self._lock:
+            self._learned_records.append(normalized)
+
+    def _publish(
+        self,
+        event_name: str,
+        event_type: EventType,
+        payload: dict[str, Any],
+        snapshot: FailureSnapshot | None = None,
+        context: EventPropagationContext | None = None,
+    ) -> EventPropagationContext | None:
+        publisher = self._event_publisher
+        propagation = context or self._propagation_context
+
+        if publisher is None:
+            return propagation
+
+        try:
+            if propagation is None:
+                trace_id = snapshot.trace_id if snapshot is not None else None
+                propagation = EventPropagationContext.create(
+                    correlation_id=trace_id or "healing",
+                    trace_id=trace_id,
+                )
+
+            event = Event.create(
+                event_name=event_name,
+                producer="healing",
+                payload=payload,
+                category=(
+                    Category.LEARNING
+                    if event_name == "HealingFeedbackRecorded"
+                    else Category.ACTION
+                ),
+                event_type=event_type,
+                correlation_id=propagation.correlation_id,
+                causation_id=propagation.causation_id,
+                trace_id=propagation.trace_id,
+                tenant_id=propagation.tenant_id,
+            )
+            publisher.publish(event)
+
+            next_context = propagation.next(event.metadata.event_id)
+            self._last_event_id = event.metadata.event_id
+            self._propagation_context = next_context
+            return next_context
+
+        except Exception as exc:
+            info(
+                "Self-healing event publication failed",
+                {"event": event_name, "error": str(exc)},
+            )
+            return propagation
 
     def detect(
         self,
@@ -154,6 +323,17 @@ class SelfHealingCore:
             self._last_failure = snapshot
             self._attempts.clear()
         error("Failure detected", snapshot.to_dict())
+        self._publish(
+            "FailureDetected",
+            EventType.FAILURE,
+            {
+                "failure_id": snapshot.trace_id,
+                "component": "self-healing",
+                "error": str(snapshot.error),
+                "details": dict(snapshot.context),
+            },
+            snapshot,
+        )
         return snapshot
 
     def _strategy_candidates(
@@ -209,11 +389,15 @@ class SelfHealingCore:
 
     @classmethod
     def _record_strategy(cls, record: Any) -> str | None:
-        key = str(getattr(record, "key", ""))
+        if isinstance(record, Mapping):
+            key = str(record.get("key", record.get("domain", "")))
+            details = record.get("details", {})
+        else:
+            key = str(getattr(record, "key", ""))
+            details = getattr(record, "details", None)
         if key.startswith("self_healing:"):
             strategy = key.removeprefix("self_healing:")
         elif key == "self_healing.recovery":
-            details = getattr(record, "details", None)
             if not isinstance(details, Mapping):
                 return None
             strategy = str(details.get("strategy", ""))
@@ -221,13 +405,23 @@ class SelfHealingCore:
             return None
         return strategy if strategy in cls._VALID_STRATEGIES else None
 
+    @staticmethod
+    def _record_success(record: Any) -> bool:
+        if isinstance(record, Mapping):
+            return bool(record.get("success", False))
+        return bool(getattr(record, "success", False))
+
     def _learning_records(self) -> tuple[Any, ...]:
         learning = self.learning
         if learning is None:
-            return ()
+            with self._lock:
+                values = tuple(self._learned_records)
+            return tuple(record for record in values if self._record_strategy(record) is not None)
         records = getattr(learning, "records", None)
         if not callable(records):
-            return ()
+            with self._lock:
+                values = tuple(self._learned_records)
+            return tuple(record for record in values if self._record_strategy(record) is not None)
         try:
             values = records()
         except Exception as exc:
@@ -251,7 +445,7 @@ class SelfHealingCore:
                 (0, 0, 0.0),
             )
             count += 1
-            successes += int(bool(getattr(record, "success", False)))
+            successes += int(self._record_success(record))
             scores[strategy] = (
                 count,
                 successes,
@@ -353,6 +547,16 @@ class SelfHealingCore:
                 "plan_id": plan.trace_id,
             },
         )
+        self._publish(
+            "RecoveryPlanned",
+            EventType.CREATED,
+            {
+                "recovery_id": plan.trace_id,
+                "failure_id": snapshot.trace_id,
+                "strategy": plan.strategy,
+            },
+            snapshot,
+        )
         return plan
 
     def _record_attempt(
@@ -415,17 +619,65 @@ class SelfHealingCore:
         )
         return result
 
-    def recover(self, snapshot: FailureSnapshot) -> Any:
-        plan = self.plan_recovery(snapshot)
+    def recover(
+        self,
+        snapshot: FailureSnapshot,
+        plan: RecoveryPlan | None = None,
+    ) -> Any:
+        if not isinstance(snapshot, FailureSnapshot):
+            raise TypeError("snapshot must be a FailureSnapshot")
+        if plan is None:
+            plan = self.plan_recovery(snapshot)
+        elif not isinstance(plan, RecoveryPlan):
+            raise TypeError("plan must be a RecoveryPlan or None")
+        self._publish(
+            "RecoveryStarted",
+            EventType.START,
+            {
+                "recovery_id": plan.trace_id,
+                "failure_id": snapshot.trace_id,
+                "strategy": plan.strategy,
+            },
+            snapshot,
+        )
         try:
             result = self._execute_plan(snapshot, plan, 1)
-        except SH3Exception:
+        except SH3Exception as exc:
             with self._lock:
                 self._failed += 1
+            self._publish(
+                "RecoveryFailed",
+                EventType.FAILURE,
+                {
+                    "recovery_id": plan.trace_id,
+                    "failure_id": snapshot.trace_id,
+                    "strategy": plan.strategy,
+                    "error": str(exc),
+                    "details": {
+                        "error_type": type(exc).__name__,
+                    },
+                    "success": False,
+                },
+                context=self._propagation_context,
+            )
             raise
         except Exception as exc:
             with self._lock:
                 self._failed += 1
+            self._publish(
+                "RecoveryFailed",
+                EventType.FAILURE,
+                {
+                    "recovery_id": plan.trace_id,
+                    "failure_id": snapshot.trace_id,
+                    "strategy": plan.strategy,
+                    "error": str(exc),
+                    "details": {
+                        "error_type": type(exc).__name__,
+                    },
+                },
+                context=self._propagation_context,
+            )
             wrapped = SelfHealingException(f"Recovery failed: {plan.strategy}")
             error(
                 "Recovery failed",
@@ -440,6 +692,19 @@ class SelfHealingCore:
         with self._lock:
             self._recovered += 1
             self._last_result = result
+
+        self._publish(
+            "RecoveryCompleted",
+            EventType.COMPLETE,
+            {
+                "recovery_id": plan.trace_id,
+                "failure_id": snapshot.trace_id,
+                "strategy": plan.strategy,
+                "success": True,
+                "details": result,
+            },
+            context=self._propagation_context,
+        )
         info(
             "Recovery successful",
             {
@@ -481,6 +746,27 @@ class SelfHealingCore:
             with self._lock:
                 self._last_plan = plan
 
+            self._publish(
+                "RecoveryPlanned",
+                EventType.CREATED,
+                {
+                    "recovery_id": plan.trace_id,
+                    "failure_id": snapshot.trace_id,
+                    "strategy": strategy,
+                },
+                snapshot,
+            )
+            self._publish(
+                "RecoveryStarted",
+                EventType.START,
+                {
+                    "recovery_id": plan.trace_id,
+                    "failure_id": snapshot.trace_id,
+                    "strategy": strategy,
+                },
+                snapshot,
+            )
+
             try:
                 result = self._execute_plan(
                     snapshot,
@@ -489,6 +775,20 @@ class SelfHealingCore:
                 )
             except Exception as exc:
                 last_error = exc
+                self._publish(
+                    "RecoveryFailed",
+                    EventType.FAILURE,
+                    {
+                        "recovery_id": plan.trace_id,
+                        "failure_id": snapshot.trace_id,
+                        "strategy": plan.strategy,
+                        "error": str(exc),
+                        "details": {
+                            "error_type": type(exc).__name__,
+                        },
+                    },
+                    snapshot,
+                )
                 error(
                     "Recovery attempt failed",
                     {
@@ -503,6 +803,19 @@ class SelfHealingCore:
             with self._lock:
                 self._recovered += 1
                 self._last_result = result
+
+            self._publish(
+                "RecoveryCompleted",
+                EventType.COMPLETE,
+                {
+                    "recovery_id": plan.trace_id,
+                    "failure_id": snapshot.trace_id,
+                    "strategy": strategy,
+                    "success": True,
+                    "details": result,
+                },
+                snapshot,
+            )
 
             info(
                 "Learning recovery successful",
@@ -534,55 +847,74 @@ class SelfHealingCore:
         *,
         attempt: int,
         success: bool,
-        result: Any,
+        result: Any = None,
         recovery_error: Exception | None = None,
     ) -> None:
-        learning = self.learning
-        if learning is None:
-            return
-        record = getattr(learning, "record", None)
-        if not callable(record):
-            return
-
-        details: dict[str, Any] = {
+        score = 1.0 if success else 0.0
+        details = {
+            **dict(snapshot.context),
+            "trace_id": snapshot.trace_id,
             "strategy": plan.strategy,
             "attempt": attempt,
-            "trace_id": snapshot.trace_id,
+            "snapshot_trace_id": snapshot.trace_id,
             "plan_id": plan.trace_id,
             "error_type": type(snapshot.error).__name__,
-            # "failure_context": dict(snapshot.context),
             "recovery_result": result,
-            **dict(snapshot.context),
+            "snapshot_context": dict(snapshot.context),
+            "recovery_error": str(recovery_error) if recovery_error is not None else None,
         }
-        if recovery_error is not None:
-            details["recovery_error"] = str(recovery_error)
 
-        try:
-            record(
-                "self_healing.recovery",
-                1.0 if success else 0.0,
-                success=success,
-                details=details,
-            )
-        except Exception as exc:
-            error(
-                "Learning record failed",
-                {
-                    "strategy": plan.strategy,
-                    "trace_id": snapshot.trace_id,
+        publisher = self._event_publisher
+        if publisher is None:
+            learning = self.learning
+            record = getattr(learning, "record", None) if learning is not None else None
+            if callable(record):
+                try:
+                    record(
+                        "self_healing.recovery",
+                        score,
+                        success=success,
+                        details=details,
+                    )
+                except Exception as exc:
+                    info(
+                        "Self-healing learning record failed",
+                        {
+                            "strategy": plan.strategy,
+                            "trace_id": snapshot.trace_id,
+                            "error": str(exc),
+                        },
+                    )
+            return
+
+        self._publish(
+            "HealingFeedbackRecorded",
+            EventType.CREATED,
+            {
+                "recovery_id": plan.trace_id,
+                "success": success,
+                "strategy": plan.strategy,
+                "feedback": {
                     "attempt": attempt,
-                    "error": str(exc),
+                    "score": score,
+                    "error_type": type(snapshot.error).__name__,
+                    "recovery_error": str(recovery_error) if recovery_error is not None else None,
+                    "details": details,
                 },
-            )
+            },
+            snapshot,
+        )
+
 
     @property
     def learned(self) -> bool:
         learning = self.learning
-        if learning is None:
-            return False
-        return callable(getattr(learning, "record", None)) and callable(
-            getattr(learning, "records", None)
-        )
+        if learning is not None:
+            return callable(getattr(learning, "record", None)) and callable(
+                getattr(learning, "records", None)
+            )
+        with self._lock:
+            return bool(self._learned_records)
 
     def learning_records(self) -> tuple[Any, ...]:
         return self._learning_records()
@@ -605,7 +937,7 @@ class SelfHealingCore:
                 },
             )
             entry["count"] += 1
-            if bool(getattr(record, "success", False)):
+            if self._record_success(record):
                 entry["successes"] += 1
             else:
                 entry["failures"] += 1
@@ -615,7 +947,7 @@ class SelfHealingCore:
             entry["success_rate"] = entry["successes"] / count if count else 0.0
 
         total = len(records)
-        successes = sum(bool(getattr(record, "success", False)) for record in records)
+        successes = sum(self._record_success(record) for record in records)
 
         return {
             "enabled": self.learned,
@@ -733,6 +1065,7 @@ class SelfHealingCore:
             self._last_plan = None
             self._last_result = None
             self._attempts.clear()
+            self._last_event_id = None
         info("Self-healing state reset")
 
     def snapshot(self) -> dict[str, Any]:
@@ -752,3 +1085,16 @@ class SelfHealingCore:
 
         result["learning"] = self.learning_summary()
         return result
+
+
+    @property
+    def propagation_context(self) -> EventPropagationContext | None:
+        return self._propagation_context
+
+    def set_propagation_context(
+        self,
+        context: EventPropagationContext | None,
+    ) -> None:
+        if context is not None and not isinstance(context, EventPropagationContext):
+            raise TypeError("context must be EventPropagationContext or None")
+        self._propagation_context = context

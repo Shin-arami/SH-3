@@ -281,7 +281,7 @@ def test_learning_failure_does_not_break_feedback_loop(
             key: str,
             value: float,
             success: bool = True,
-            details: Mapping[str, Any] | None = None
+            details: Mapping[str, Any] | None = None,
         ) -> Any:
             raise RuntimeError("learning storage failure")
 

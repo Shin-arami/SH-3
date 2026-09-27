@@ -26,7 +26,7 @@ class CognitiveState:
         self.assumptions: list[str] = []
         self.results: dict[str, Any] = {}
         self.trace_id = short_id(goal)
-        self.created_at = iso(__import__("datetime").datetime.utcnow())
+        self.created_at = iso(__import__("datetime").datetime.now(__import__("datetime").UTC))
 
     def add_step(self, step: str) -> None:
         self.steps.append(step)

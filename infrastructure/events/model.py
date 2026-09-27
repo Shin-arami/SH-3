@@ -21,6 +21,7 @@ from foundation.Enums.event import EventType
 from foundation.Enums.priority import Priority
 from foundation.types.identifiers import IdentifierGenerator
 from foundation.types.protocols import Serializable, Validatable
+from foundation.version import EVENT_SCHEMA_VERSION
 
 __all__ = [
     "Event",
@@ -262,7 +263,7 @@ class Event(Serializable, Validatable):
         payload: Mapping[str, Any] | None = None,
         category: Category = Category.RUNTIME,
         event_type: EventType = EventType.UNKNOWN,
-        event_version: str = "1.0.0",
+        event_version: str = EVENT_SCHEMA_VERSION,
         correlation_id: str | None = None,
         causation_id: str | None = None,
         priority: Priority = Priority.NORMAL,

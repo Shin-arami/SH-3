@@ -18,7 +18,7 @@ class PersistenceCore:
     def save_state(self, name: str, state: dict[str, Any]) -> str:
         snapshot = {
             "name": name,
-            "timestamp": iso(__import__("datetime").datetime.utcnow()),
+            "timestamp": iso(__import__("datetime").datetime.now(__import__("datetime").UTC)),
             "state": state,
             "version": 1,
         }
@@ -59,7 +59,7 @@ class PersistenceCore:
         system_state = {
             "kernel": self.snapshot_kernel(kernel),
             "cognition": self.snapshot_cognition(kernel),
-            "timestamp": iso(__import__("datetime").datetime.utcnow()),
+            "timestamp": iso(__import__("datetime").datetime.now(__import__("datetime").UTC)),
         }
         return system_state
 

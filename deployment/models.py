@@ -43,6 +43,9 @@ class DeploymentManifest:
     build_id: str = ""
     commit: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    dependencies: tuple[str, ...] = ()
+    release_date: datetime | None = None
+    compatibility: str = ""
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -53,11 +56,16 @@ class DeploymentManifest:
             raise ValueError("source must not be empty")
         if not isinstance(self.environment, DeploymentEnvironment):
             raise TypeError("environment must be a DeploymentEnvironment")
-        object.__setattr__(
-            self,
-            "metadata",
-            MappingProxyType(dict(self.metadata)),
-        )
+        if not all(isinstance(item, str) and item.strip() for item in self.dependencies):
+            raise TypeError("dependencies must contain non-empty strings")
+        if self.release_date is not None and (
+            not isinstance(self.release_date, datetime) or self.release_date.tzinfo is None
+        ):
+            raise ValueError("release_date must be timezone-aware")
+        if not isinstance(self.compatibility, str):
+            raise TypeError("compatibility must be a string")
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "dependencies", tuple(self.dependencies))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +76,9 @@ class DeploymentManifest:
             "build_id": self.build_id,
             "commit": self.commit,
             "metadata": dict(self.metadata),
+            "dependencies": list(self.dependencies),
+            "release_date": self.release_date.isoformat() if self.release_date else None,
+            "compatibility": self.compatibility,
         }
 
 

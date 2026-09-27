@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sh3"
-version = "2.1.0"
+dynamic = ["version"]
 description = "SH-3 AI Operating System Framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,6 +16,9 @@ dependencies = []
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "foundation.version.PACKAGE_VERSION"}
 
 [tool.setuptools.packages.find]
 include = [

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from threading import RLock
 from typing import Any
 
+from foundation.Enums.category import Category
+from foundation.Enums.event import EventType
 from foundation.utils.exceptions import SH3Exception, ValidationException
 from foundation.utils.hash import short_id
 from foundation.utils.logging import error, event, info
+from infrastructure.event_bus import EventPublisher
+from infrastructure.events.model import Event
 
 from .models import (
     DeploymentManifest,
@@ -28,9 +33,12 @@ __all__ = ["DeploymentController"]
 
 class DeploymentController:
     __slots__ = (
+        "_correlation_id",
         "_environment",
+        "_event_publisher",
         "_events",
         "_installer",
+        "_last_event_id",
         "_lock",
         "_package",
         "_previous",
@@ -50,6 +58,8 @@ class DeploymentController:
         rollback_manager: RollbackManagerProtocol,
         verifier: DeploymentVerifier,
         event_sink: DeploymentEventSink | None = None,
+        *,
+        event_publisher: EventPublisher | None = None,
     ) -> None:
         self._package = package_manager
         self._environment = environment_manager
@@ -58,6 +68,9 @@ class DeploymentController:
         self._rollback = rollback_manager
         self._verifier = verifier
         self._events = event_sink or event
+        self._event_publisher = event_publisher
+        self._correlation_id: str | None = None
+        self._last_event_id: str | None = None
         self._lock = RLock()
         self._state = DeploymentState.CREATED
         self._target = ""
@@ -78,12 +91,24 @@ class DeploymentController:
         with self._lock:
             return self._previous
 
+    @property
+    def event_publisher(self) -> EventPublisher | None:
+        with self._lock:
+            return self._event_publisher
+
+    def set_event_publisher(self, publisher: EventPublisher | None) -> None:
+        with self._lock:
+            self._event_publisher = publisher
+
     def deploy(
         self,
         manifest: DeploymentManifest,
         previous: DeploymentManifest | None = None,
     ) -> DeploymentResult:
         started = now_utc()
+
+        self._correlation_id = None
+        self._last_event_id = None
         deployment_id = short_id(
             f"{manifest.name}:{manifest.version}:{started.isoformat()}"
         )
@@ -98,16 +123,17 @@ class DeploymentController:
             }:
                 raise ValidationException("Deployment is already in progress")
             self._previous = previous
+            self._last_event_id = None
 
-        self._publish(
-            "DeploymentStarted",
-            {
-                "deployment_id": deployment_id,
-                "name": manifest.name,
-                "version": manifest.version,
-                "environment": manifest.environment.value,
-            },
-        )
+            self._publish(
+                "DeploymentStarted",
+                {
+                    "deployment_id": deployment_id,
+                    "version": manifest.version,
+                },
+                EventType.START,
+                correlation_id=deployment_id,
+            )
 
         try:
             self._set_state(DeploymentState.VALIDATING)
@@ -144,7 +170,14 @@ class DeploymentController:
             )
             self._publish(
                 "DeploymentCompleted",
-                result.to_dict(),
+                {
+                    "deployment_id": deployment_id,
+                    "version": manifest.version,
+                    "success": True,
+                    "target": target,
+                },
+                EventType.COMPLETE,
+                correlation_id=deployment_id,
             )
             info("Deployment completed", result.to_dict())
             return result
@@ -169,6 +202,7 @@ class DeploymentController:
         with self._lock:
             previous = self._previous
             target = self._target
+            self._last_event_id = None
 
         if previous is None:
             raise ValidationException("No previous deployment is available")
@@ -185,8 +219,9 @@ class DeploymentController:
             {
                 "deployment_id": deployment_id,
                 "version": previous.version,
-                "target": target,
             },
+            EventType.START,
+            correlation_id=deployment_id,
         )
 
         try:
@@ -205,7 +240,17 @@ class DeploymentController:
                 message="Rollback completed",
                 details={"target": target},
             )
-            self._publish("RollbackCompleted", result.to_dict())
+            self._publish(
+                "RollbackCompleted",
+                {
+                    "deployment_id": deployment_id,
+                    "version": previous.version,
+                    "success": True,
+                    "target": target,
+                },
+                EventType.COMPLETE,
+                correlation_id=deployment_id,
+            )
             return result
         except Exception as exc:
             self._set_state(DeploymentState.FAILED)
@@ -213,9 +258,11 @@ class DeploymentController:
                 "DeploymentFailed",
                 {
                     "deployment_id": deployment_id,
+                    "version": previous.version,
                     "error": str(exc),
-                    "target": target,
                 },
+                EventType.FAILURE,
+                correlation_id=deployment_id,
             )
             raise
 
@@ -242,7 +289,16 @@ class DeploymentController:
             message=str(exc),
             details=details,
         )
-        self._publish("DeploymentFailed", result.to_dict())
+        self._publish(
+            "DeploymentFailed",
+            {
+                "deployment_id": result.deployment_id,
+                "version": manifest.version,
+                "error": result.message,
+            },
+            EventType.FAILURE,
+            correlation_id=result.deployment_id,
+        )
         error("Deployment failed", result.to_dict())
         return result
 
@@ -250,5 +306,31 @@ class DeploymentController:
         with self._lock:
             self._state = state
 
-    def _publish(self, name: str, payload: dict[str, Any]) -> None:
-        self._events(name, payload)
+    def _publish(
+        self,
+        name: str,
+        payload: Mapping[str, Any],
+        event_type: EventType,
+        *,
+        correlation_id: str,
+    ) -> None:
+        self._events(name, dict(payload))
+        if self._event_publisher is None:
+            return
+        try:
+            event_context = Event.create(
+                event_name=name,
+                producer="deployment",
+                payload=payload,
+                category=Category.COMPONENT,
+                event_type=event_type,
+                correlation_id=correlation_id,
+                causation_id=self._last_event_id,
+            )
+            self._event_publisher.publish(event_context)
+            self._last_event_id = event_context.metadata.event_id
+        except Exception as exc:
+            error(
+                "Deployment event publication failed",
+                data={"event_name": name, "error": str(exc)},
+            )

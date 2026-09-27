@@ -105,7 +105,7 @@ class Planner:
         plan = {
             "goal": goal,
             "tree": root.to_dict(),
-            "created_at": iso(__import__("datetime").datetime.utcnow()),
+            "created_at": iso(__import__("datetime").datetime.now(__import__("datetime").UTC)),
             "trace_id": root.trace_id,
         }
 

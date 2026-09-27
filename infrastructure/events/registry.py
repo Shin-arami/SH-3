@@ -15,6 +15,7 @@ from threading import RLock
 from typing import Final
 
 from foundation.Enums.category import Category
+from foundation.version import EVENT_SCHEMA_VERSION
 
 __all__ = [
     "EventSchema",
@@ -66,7 +67,7 @@ class EventSchema:
 class EventSchemaRegistry:
     """Thread-safe registry for production event schemas."""
 
-    _DEFAULT_VERSION: Final[str] = "1.0.0"
+    _DEFAULT_VERSION: Final[str] = EVENT_SCHEMA_VERSION
 
     def __init__(self) -> None:
         self._schemas: dict[SchemaKey, EventSchema] = {}

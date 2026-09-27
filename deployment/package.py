@@ -33,7 +33,8 @@ class FilePackageManager:
         if expected_hash is not None:
             if not isinstance(expected_hash, str) or len(expected_hash) != 64:
                 raise ValidationException("metadata.sha256 must be a SHA-256 digest")
-            if source.is_file() and self._sha256(source) != expected_hash.lower():
+            actual = self._sha256(source)
+            if actual != expected_hash.lower():
                 raise ValidationException("Deployment package checksum mismatch")
 
     def prepare(self, manifest: DeploymentManifest) -> str:
@@ -50,7 +51,16 @@ class FilePackageManager:
     @staticmethod
     def _sha256(path: Path) -> str:
         digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+        if path.is_file():
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        for child in sorted(item for item in path.rglob("*") if item.is_file()):
+            relative = child.relative_to(path).as_posix().encode("utf-8")
+            digest.update(relative)
+            digest.update(b"\0")
+            with child.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
         return digest.hexdigest()

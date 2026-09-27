@@ -41,7 +41,7 @@ class SH3Exception(Exception):  # noqa: N818
         self.message = message
         self.code = code or self.__class__.__name__
         self.context = context or {}
-        self.timestamp = iso(__import__("datetime").datetime.utcnow())
+        self.timestamp = iso(__import__("datetime").datetime.now(__import__("datetime").UTC))
         self.trace_id = short_id(message)
 
     def to_dict(self) -> dict[str, Any]:

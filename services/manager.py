@@ -6,6 +6,7 @@ from typing import Any
 
 from foundation.enums import LifecycleState
 from foundation.utils.logging import info
+from infrastructure.event_bus import EventPublisher
 
 from .base import Service, ServiceException
 
@@ -13,11 +14,31 @@ __all__ = ["ServiceManager"]
 
 
 class ServiceManager:
-    __slots__ = ("_lock", "_services")
+    __slots__ = ("_event_publisher", "_lock", "_services")
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        event_publisher: EventPublisher | None = None,
+    ) -> None:
         self._services: dict[str, Service] = {}
         self._lock = RLock()
+        self._event_publisher = event_publisher
+
+    @property
+    def event_publisher(self) -> EventPublisher | None:
+        with self._lock:
+            return self._event_publisher
+
+    def set_event_publisher(
+        self,
+        publisher: EventPublisher | None,
+    ) -> None:
+        with self._lock:
+            self._event_publisher = publisher
+            services = tuple(self._services.values())
+        for service in services:
+            service.set_event_publisher(publisher)
 
     def register(self, service: Service) -> None:
         if not isinstance(service, Service):
@@ -25,7 +46,9 @@ class ServiceManager:
         with self._lock:
             if service.name in self._services:
                 raise ServiceException(f"Service already registered: {service.name}")
+            publisher = self._event_publisher
             self._services[service.name] = service
+            service.set_event_publisher(publisher)
             info(
                 "Service registered",
                 {
@@ -65,20 +88,16 @@ class ServiceManager:
             return tuple(self._services.values())
 
     def start(self, name: str) -> None:
-        service = self.get(name)
-        service.start()
+        self.get(name).start()
 
     def suspend(self, name: str) -> None:
-        service = self.get(name)
-        service.suspend()
+        self.get(name).suspend()
 
     def resume(self, name: str) -> None:
-        service = self.get(name)
-        service.resume()
+        self.get(name).resume()
 
     def terminate(self, name: str) -> None:
-        service = self.get(name)
-        service.terminate()
+        self.get(name).terminate()
 
     def start_all(self) -> None:
         for service in self.services():

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from cognition.policy import PolicyRule
+from foundation.Enums.category import Category
+from foundation.Enums.event import EventType
 from foundation.utils.exceptions import SH3Exception
+from infrastructure.event_bus import PublishResult
 from kernel import SH3Kernel
 from kernel.core import SH3Kernel as CoreSH3Kernel
 
@@ -155,3 +160,92 @@ def test_kernel_snapshot_contains_management_state() -> None:
     assert snapshot["learning_loop_id"] == kernel.learning_loop.loop_id
     assert snapshot["meta_controller_id"] == kernel.meta_controller.meta_id
     assert snapshot["system_optimizer_id"] == kernel.system_optimizer.optimizer_id
+
+
+class RecordingPublisher:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    def publish(self, event: Any) -> PublishResult:
+        self.events.append(event)
+        return PublishResult(
+            event_id=event.metadata.event_id,
+            accepted=True,
+            queued=True,
+            delivered=False,
+        )
+
+
+def test_execute_publishes_kernel_cycle_events() -> None:
+    publisher = RecordingPublisher()
+    kernel = SH3Kernel(event_publisher=publisher)
+
+    result = kernel.execute("prepare release notes")
+
+    assert result["goal"] == "prepare release notes"
+    assert [event.metadata.event_name for event in publisher.events] == [
+        "KernelCycleStarted",
+        "KernelCycleCompleted",
+    ]
+    assert publisher.events[0].category == Category.LIFECYCLE
+    assert publisher.events[1].category == Category.LIFECYCLE
+    assert publisher.events[0].event_type == EventType.START
+    assert publisher.events[1].event_type == EventType.COMPLETE
+    assert publisher.events[0].metadata.event_id
+    assert publisher.events[1].metadata.event_id
+    assert publisher.events[1].payload["cycle_id"] == publisher.events[0].metadata.event_id
+    assert publisher.events[1].payload["goal"] == "prepare release notes"
+    assert publisher.events[1].payload["success"] is True
+
+
+def test_execute_publishes_kernel_cycle_failed() -> None:
+    publisher = RecordingPublisher()
+    kernel = SH3Kernel(event_publisher=publisher)
+
+    def fail(_: str) -> object:
+        raise ValueError("failure")
+
+    kernel.cognition.run = fail  # type: ignore[method-assign, assignment]
+
+    with pytest.raises(SH3Exception, match="failure"):
+        kernel.execute("goal")
+
+    assert [event.metadata.event_name for event in publisher.events] == [
+        "KernelCycleStarted",
+        "KernelCycleFailed",
+    ]
+    assert publisher.events[0].event_type == EventType.START
+    assert publisher.events[1].event_type == EventType.FAILURE
+    assert publisher.events[1].category == Category.LIFECYCLE
+    assert publisher.events[1].payload["cycle_id"] == publisher.events[0].metadata.event_id
+    assert publisher.events[1].payload["error"] == "failure"
+    assert publisher.events[1].payload["error_type"] == "ValueError"
+    assert publisher.events[1].payload["success"] is False
+    assert kernel.context_manager.snapshot()["depth"] == 0
+
+
+def test_kernel_event_publisher_is_shared_with_runtime() -> None:
+    publisher = RecordingPublisher()
+    kernel = SH3Kernel(event_publisher=publisher)
+
+    assert kernel.event_publisher is publisher
+    assert kernel.runtime.event_publisher is publisher
+
+
+def test_set_event_publisher_updates_runtime() -> None:
+    kernel = SH3Kernel()
+    publisher = RecordingPublisher()
+
+    kernel.set_event_publisher(publisher)
+
+    assert kernel.event_publisher is publisher
+    assert kernel.runtime.event_publisher is publisher
+
+
+def test_kernel_without_event_publisher_preserves_execution() -> None:
+    kernel = SH3Kernel()
+
+    result = kernel.execute("prepare release notes")
+
+    assert result["goal"] == "prepare release notes"
+    assert result["kernel_id"] == kernel.kernel_id
