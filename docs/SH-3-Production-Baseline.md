@@ -53,12 +53,11 @@ Any material change to architecture, dependencies, security, deployment, configu
 
 ## Baseline Freeze Procedure
 
-1. Confirm `git status` is clean except for intentionally staged baseline documentation.
+1. Confirm the certified production commit and repository state.
 2. Run Ruff, mypy, full pytest, deprecation-warning gate, build, install, and version checks.
-3. Commit the certified state.
-4. Create and push the release tag `v2.1.0`.
-5. Publish the release only from the validated commit/tag.
-6. Preserve this document together with the Production Certification Evidence.
+3. Confirm that the existing release tag `v2.1.0` points to the certified production commit `eb3093c`.
+4. Preserve the Production Certification Evidence together with this baseline documentation.
+5. Treat subsequent material changes as a new certification cycle.
 
 ## Re-certification Trigger
 
