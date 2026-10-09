@@ -5,6 +5,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import RLock
+from types import MappingProxyType
 from typing import Any
 
 from foundation.Enums.category import Category
@@ -505,6 +506,26 @@ class SelfHealingCore:
             + [item[0] for item in failed]
         )
 
+    def strategy_candidates(
+        self,
+        snapshot: FailureSnapshot,
+    ) -> tuple[str, ...]:
+        if not isinstance(snapshot, FailureSnapshot):
+            raise TypeError("snapshot must be a FailureSnapshot")
+        return self._strategy_candidates(snapshot)
+
+    def evaluate_strategies(
+        self,
+        snapshot: FailureSnapshot,
+    ) -> Mapping[str, tuple[int, int, float]]:
+        if not isinstance(snapshot, FailureSnapshot):
+            raise TypeError("snapshot must be a FailureSnapshot")
+        scores = self._learned_strategy_scores()
+        return MappingProxyType({
+            strategy: scores.get(strategy, (0, 0, 0.0))
+            for strategy in self._strategy_candidates(snapshot)
+        })
+
     def _select_strategy(
         self,
         snapshot: FailureSnapshot,
@@ -527,6 +548,28 @@ class SelfHealingCore:
                 },
             )
         return strategy
+
+    def select_strategy(
+        self,
+        snapshot: FailureSnapshot,
+    ) -> str:
+        if not isinstance(snapshot, FailureSnapshot):
+            raise TypeError("snapshot must be a FailureSnapshot")
+        return self._select_strategy(snapshot)
+
+    def recover_with_strategy(
+        self,
+        snapshot: FailureSnapshot,
+        strategy: str,
+    ) -> Any:
+        if not isinstance(snapshot, FailureSnapshot):
+            raise TypeError("snapshot must be a FailureSnapshot")
+        if not isinstance(strategy, str) or not strategy.strip():
+            raise ValueError("strategy must not be empty")
+        if strategy not in self._strategy_candidates(snapshot):
+            raise SelfHealingException(f"Unknown recovery strategy: {strategy}")
+        plan = RecoveryPlan.create(strategy, self._strategy_action(strategy))
+        return self.recover(snapshot, plan)
 
     def plan_recovery(
         self,

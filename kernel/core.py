@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 from cognition.core import CognitionCore
+from cognition.feedback_boundary import CognitiveFeedbackBoundary
 from cognition.memory import MemoryCore
 from cognition.planner import Planner
 from cognition.policy import PolicyEngine
@@ -27,13 +28,23 @@ class SH3Kernel:
         "_last_event_id",
         "_propagation_context",
         "cognition",
+        "cognitive_learning_boundary",
         "context_manager",
+        "feedback_boundary",
         "kernel_id",
+        "learning_closed_loop_evidence_boundary",
+        "learning_feedback_loop",
         "learning_loop",
+        "learning_optimizer_boundary",
         "memory",
         "meta_controller",
+        "optimizer_evidence_boundary",
+        "optimizer_healing_boundary",
+        "optimizer_update_boundary",
         "planner",
         "policy",
+        "recovery_execution_boundary",
+        "recovery_strategy_boundary",
         "runtime",
         "system_optimizer",
     )
@@ -49,7 +60,7 @@ class SH3Kernel:
 
         self.runtime = RuntimeCore(event_publisher=event_publisher)
         self.context_manager = ContextManager()
-        self.cognition = CognitionCore(self.context_manager)
+        self.cognition = CognitionCore(self.context_manager, event_publisher=event_publisher)
         self.planner = Planner()
         self.policy = PolicyEngine()
         self.memory = MemoryCore()
@@ -70,6 +81,65 @@ class SH3Kernel:
             self,
             event_publisher=event_publisher,
         )
+        from kernel.cognitive_learning_boundary import CognitiveLearningBoundary
+        from kernel.learning_closed_loop_evidence_boundary import LearningClosedLoopEvidenceBoundary
+        from kernel.learning_feedback_loop import LearningClosedLoopCoordinator
+        from kernel.learning_optimizer_boundary import LearningOptimizerBoundary
+        from kernel.optimizer_evidence_boundary import OptimizationEvidenceBoundary
+        from kernel.optimizer_healing_boundary import OptimizerHealingBoundary
+        from kernel.optimizer_update_boundary import OptimizationUpdateBoundary
+        from kernel.recovery_execution_boundary import RecoveryExecutionBoundary
+        from kernel.recovery_strategy_boundary import RecoveryStrategyBoundary
+        self.cognitive_learning_boundary = CognitiveLearningBoundary(
+            self.learning_loop,
+            event_publisher=event_publisher,
+        )
+        self.feedback_boundary = CognitiveFeedbackBoundary(
+            self.cognition,
+            event_publisher=event_publisher,
+        )
+        self.optimizer_evidence_boundary = OptimizationEvidenceBoundary(
+            event_publisher=event_publisher,
+        )
+        self.learning_closed_loop_evidence_boundary = LearningClosedLoopEvidenceBoundary(
+            self.optimizer_evidence_boundary.evidence_store,
+            event_publisher=event_publisher,
+        )
+        self.optimizer_update_boundary = OptimizationUpdateBoundary(
+            self.system_optimizer,
+            event_publisher=event_publisher,
+            evidence_boundary=self.optimizer_evidence_boundary,
+        )
+        self.learning_optimizer_boundary = LearningOptimizerBoundary(
+            self.system_optimizer,
+            event_publisher=event_publisher,
+            update_boundary=self.optimizer_update_boundary,
+        )
+        self.recovery_strategy_boundary = RecoveryStrategyBoundary(
+            self.meta_controller.healer,
+            event_publisher=event_publisher,
+        )
+        self.recovery_execution_boundary = RecoveryExecutionBoundary(
+            self.meta_controller.healer,
+            event_publisher=event_publisher,
+        )
+        self.optimizer_healing_boundary = OptimizerHealingBoundary(
+            self.meta_controller.healer,
+            event_publisher=event_publisher,
+            strategy_boundary=self.recovery_strategy_boundary,
+            execution_boundary=self.recovery_execution_boundary,
+        )
+        self.learning_feedback_loop = LearningClosedLoopCoordinator(
+            self,
+            event_publisher=event_publisher,
+            learning_boundary=self.cognitive_learning_boundary,
+            optimizer_boundary=self.learning_optimizer_boundary,
+            healing_boundary=self.optimizer_healing_boundary,
+            recovery_strategy_boundary=self.recovery_strategy_boundary,
+            recovery_execution_boundary=self.recovery_execution_boundary,
+            feedback_boundary=self.feedback_boundary,
+            closed_loop_evidence_boundary=self.learning_closed_loop_evidence_boundary,
+        )
         self.kernel_id = short_id("sh3-kernel")
 
     @property
@@ -82,9 +152,20 @@ class SH3Kernel:
 
         self._event_publisher = publisher
         self.runtime.set_event_publisher(publisher)
+        self.cognition.set_event_publisher(publisher)
         self.learning_loop.set_event_publisher(publisher)
         self.meta_controller.set_event_publisher(publisher)
         self.system_optimizer.set_event_publisher(publisher)
+        self.learning_feedback_loop.set_event_publisher(publisher)
+        self.cognitive_learning_boundary.set_event_publisher(publisher)
+        self.feedback_boundary.set_event_publisher(publisher)
+        self.learning_optimizer_boundary.set_event_publisher(publisher)
+        self.optimizer_update_boundary.set_event_publisher(publisher)
+        self.optimizer_evidence_boundary.set_event_publisher(publisher)
+        self.learning_closed_loop_evidence_boundary.set_event_publisher(publisher)
+        self.optimizer_healing_boundary.set_event_publisher(publisher)
+        self.recovery_strategy_boundary.set_event_publisher(publisher)
+        self.recovery_execution_boundary.set_event_publisher(publisher)
 
     @property
     def propagation_context(self) -> EventPropagationContext | None:
@@ -304,6 +385,26 @@ class SH3Kernel:
             context=propagation,
         )
 
+    def learning_feedback_cycle(
+        self,
+        result: Any,
+        *,
+        context: EventPropagationContext | None = None,
+        optimize: bool = True,
+        recover: bool = True,
+    ) -> Any:
+        from cognition.contracts import CognitiveResult
+        if not isinstance(result, CognitiveResult):
+            raise TypeError("result must be CognitiveResult")
+        propagation = self._new_propagation(context)
+        self._propagation_context = propagation
+        return self.learning_feedback_loop.run(
+            result,
+            context=propagation,
+            optimize=optimize,
+            recover=recover,
+        )
+
     def meta_cycle(
         self,
         *,
@@ -328,8 +429,23 @@ class SH3Kernel:
         exc: Exception,
         context: dict[str, Any] | None = None,
     ) -> Any:
+        propagation = self._new_propagation()
+        self._propagation_context = propagation
+        self.meta_controller.healer.set_propagation_context(propagation)
         snapshot = self.meta_controller.healer.detect(exc, context or {})
-        return self.meta_controller.healer.recover(snapshot)
+        strategy = self.recovery_strategy_boundary.request(
+            snapshot,
+            context=propagation,
+        )
+        execution = self.recovery_execution_boundary.request(
+            strategy,
+            snapshot,
+            context=strategy.propagation_context,
+        )
+        self._propagation_context = execution.propagation_context
+        if not execution.success:
+            raise RuntimeError(execution.error or "recovery execution failed")
+        return execution.result
 
     def execute_safe(
         self,
