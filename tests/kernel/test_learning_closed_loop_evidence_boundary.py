@@ -464,3 +464,45 @@ def test_parallel_closed_loops_keep_trace_context_isolated() -> None:
 
     assert reports[0].cycle_id != reports[1].cycle_id
     assert reports[0].result_id != reports[1].result_id
+
+
+def test_closed_loop_evidence_does_not_link_optimization_records_across_tenants() -> None:
+    kernel = SH3Kernel()
+    context = EventPropagationContext.create(
+        correlation_id="shared-correlation:tenant-isolation",
+        causation_id="cause:tenant-a",
+        trace_id="shared-trace:tenant-isolation",
+        tenant_id="tenant-a",
+    )
+    store = kernel.learning_closed_loop_evidence_boundary.evidence_store
+
+    for evidence_id, tenant_id in (
+        ("optimization:tenant-a", "tenant-a"),
+        ("optimization:tenant-b", "tenant-b"),
+    ):
+        store.register(
+            EvidenceRecord.create(
+                evidence_id=evidence_id,
+                kind="optimization",
+                source="test.optimization",
+                subject_id=f"subject:{tenant_id}",
+                collected_at=NOW.isoformat(),
+                trace_id=context.trace_id,
+                payload={
+                    "correlation_id": context.correlation_id,
+                    "tenant_id": tenant_id,
+                },
+            )
+        )
+
+    report = kernel.learning_feedback_loop.run(
+        _result("result:tenant-isolation"),
+        context=context,
+        optimize=False,
+    )
+    outcome = kernel.learning_closed_loop_evidence_boundary.get(report.cycle_id)
+
+    assert outcome is not None and outcome.evidence is not None
+    assert outcome.evidence.payload["related_optimization_evidence_ids"] == [
+        "optimization:tenant-a"
+    ]

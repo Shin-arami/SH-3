@@ -269,6 +269,8 @@ class LearningClosedLoopEvidenceBoundary:
                 continue
             if context.trace_id is not None and record.trace_id != context.trace_id:
                 continue
+            if record.payload.get("tenant_id") != context.tenant_id:
+                continue
             related.append(record.evidence_id)
         return tuple(sorted(related))
 

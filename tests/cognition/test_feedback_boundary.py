@@ -8,7 +8,11 @@ from time import sleep
 import pytest
 
 from cognition.feedback import CognitiveFeedback, CognitiveFeedbackKind
-from cognition.feedback_boundary import CognitiveFeedbackBoundary, CognitiveFeedbackRequest, CognitiveFeedbackResult
+from cognition.feedback_boundary import (
+    CognitiveFeedbackBoundary,
+    CognitiveFeedbackRequest,
+    CognitiveFeedbackResult,
+)
 from foundation.Enums.category import Category
 from foundation.Enums.event import EventType
 from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
