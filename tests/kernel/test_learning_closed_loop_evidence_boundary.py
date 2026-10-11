@@ -26,7 +26,11 @@ from kernel.learning_closed_loop_evidence_boundary import (
     LearningClosedLoopEvidenceBoundary,
     LearningClosedLoopEvidenceResult,
 )
-from kernel.learning_feedback_loop import ClosedLoopStatus, LearningClosedLoopReport
+from kernel.learning_feedback_loop import (
+    ClosedLoopStatus,
+    LearningClosedLoopCoordinator,
+    LearningClosedLoopReport,
+)
 
 NOW = datetime(2026, 10, 9, 0, 0, tzinfo=UTC)
 
@@ -354,6 +358,76 @@ def test_event_publisher_replacement_uses_new_publisher() -> None:
     assert next_report.cycle_id != report.cycle_id
     assert any(event.name == "LearningClosedLoopEvidenceRecorded" for event in first_events)
     assert any(event.name == "LearningClosedLoopEvidenceRecorded" for event in second_events)
+
+
+def test_evidence_commit_then_raise_is_reconciled_as_success() -> None:
+    class CommitThenRaiseEvidenceStore(EvidenceStore):
+        def register(self, record: EvidenceRecord) -> EvidenceRecord:
+            super().register(record)
+            raise RuntimeError("evidence committed but acknowledgement failed")
+
+    kernel = SH3Kernel()
+    report = kernel.learning_feedback_loop.run(
+        _result("result:commit-then-raise"),
+        optimize=False,
+    )
+    store = CommitThenRaiseEvidenceStore()
+    boundary = LearningClosedLoopEvidenceBoundary(store)
+
+    outcome = boundary.record(report, context=_context(), created_at=NOW)
+
+    assert outcome.recorded is True
+    assert outcome.evidence is not None
+    assert outcome.evidence.verify()
+    assert store.get(outcome.evidence.evidence_id) == outcome.evidence
+    assert outcome.metadata["write_error_reconciled"] is True
+    assert len(store.records()) == 1
+
+
+def test_evidence_write_failure_marks_cycle_failed_and_retries_without_reexecution() -> None:
+    class FailThreeTimesEvidenceStore(EvidenceStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def register(self, record: EvidenceRecord) -> EvidenceRecord:
+            self.calls += 1
+            if self.calls <= 3:
+                raise ValueError("temporary evidence store failure")
+            return super().register(record)
+
+    kernel = SH3Kernel()
+    store = FailThreeTimesEvidenceStore()
+    evidence_boundary = LearningClosedLoopEvidenceBoundary(store)
+    coordinator = LearningClosedLoopCoordinator(
+        kernel,
+        closed_loop_evidence_boundary=evidence_boundary,
+    )
+    result = _result("result:retry-evidence-write")
+
+    first = coordinator.run(result, optimize=False)
+
+    assert first.status is ClosedLoopStatus.FAILED
+    assert first.failure_detail["evidence_error"] == "temporary evidence store failure"
+    assert store.calls == 3
+    pending = evidence_boundary.get(first.cycle_id)
+    assert pending is not None
+    assert pending.recorded is False
+
+    retried = coordinator.run(result, optimize=False)
+
+    assert retried is first
+    assert store.calls == 4
+    recorded = evidence_boundary.get(first.cycle_id)
+    assert recorded is not None and recorded.recorded
+    assert recorded.evidence is not None
+    assert recorded.evidence.payload["status"] == ClosedLoopStatus.FAILED.value
+    assert (
+        recorded.evidence.payload["failure_detail"]["evidence_error"]
+        == "temporary evidence store failure"
+    )
+    assert len(coordinator.records()) == 1
+    assert len(store.records()) == 1
 
 
 def test_evidence_failure_is_reported_as_typed_boundary_result() -> None:

@@ -238,6 +238,80 @@ def test_closed_loop_feedback_rejection_marks_terminal_event_failed() -> None:
         failed_events[-1].payload["feedback_error"]
         == "injected feedback rejection"
     )
+    evidence_result = kernel.learning_closed_loop_evidence_boundary.get(
+        report.cycle_id
+    )
+    assert evidence_result is not None
+    assert evidence_result.recorded is True
+    assert evidence_result.evidence is not None
+    assert evidence_result.evidence.payload["status"] == ClosedLoopStatus.FAILED.value
+    assert (
+        evidence_result.evidence.payload["failure_detail"]["feedback_error"]
+        == "injected feedback rejection"
+    )
+
+
+def test_feedback_finalization_retry_does_not_reexecute_cycle() -> None:
+    class FailOnceFeedbackBoundary(CognitiveFeedbackBoundary):
+        calls = 0
+
+        def record(
+            self,
+            feedback: CognitiveFeedback,
+            *,
+            context: EventPropagationContext,
+            created_at: datetime | None = None,
+        ) -> CognitiveFeedbackResult:
+            self.calls += 1
+            if (
+                feedback.kind is CognitiveFeedbackKind.CLOSED_LOOP
+                and self.calls == 1
+            ):
+                return CognitiveFeedbackResult(
+                    request_id=f"rejected:{feedback.feedback_id}",
+                    feedback_id=feedback.feedback_id,
+                    success=False,
+                    created_at=created_at or feedback.created_at,
+                    correlation_id=context.correlation_id,
+                    causation_id=context.causation_id,
+                    trace_id=context.trace_id,
+                    tenant_id=context.tenant_id,
+                    error="injected one-time feedback failure",
+                )
+            return super().record(
+                feedback,
+                context=context,
+                created_at=created_at,
+            )
+
+    kernel = SH3Kernel()
+    feedback_boundary = FailOnceFeedbackBoundary(kernel.cognition)
+    coordinator = LearningClosedLoopCoordinator(
+        kernel,
+        feedback_boundary=feedback_boundary,
+    )
+    result = _result(result_id="result:feedback-finalization-retry")
+
+    first = coordinator.run(result, optimize=False)
+    assert first.status is ClosedLoopStatus.FAILED
+    assert first.failure_detail["feedback_error"] == "injected one-time feedback failure"
+
+    second = coordinator.run(result, optimize=False)
+
+    assert second is first
+    assert feedback_boundary.calls == 2
+    assert len(coordinator.records()) == 1
+    assert len(feedback_boundary.records()) == 1
+    stored_evidence = kernel.learning_closed_loop_evidence_boundary.get(
+        first.cycle_id
+    )
+    assert stored_evidence is not None and stored_evidence.recorded
+    assert stored_evidence.evidence is not None
+    assert stored_evidence.evidence.payload["status"] == ClosedLoopStatus.FAILED.value
+    assert (
+        stored_evidence.evidence.payload["failure_detail"]["feedback_error"]
+        == "injected one-time feedback failure"
+    )
 
 
 def test_closed_loop_rejects_conflicting_options_for_same_result() -> None:

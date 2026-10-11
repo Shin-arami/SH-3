@@ -115,6 +115,32 @@ def test_feedback_boundary_serializes_concurrent_duplicate_requests() -> None:
     assert boundary.records() == (results[0],)
 
 
+def test_failed_feedback_record_can_be_retried_with_same_request_identity() -> None:
+    class FlakyCognition:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def record_feedback(self, feedback: CognitiveFeedback) -> CognitiveFeedback:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary feedback storage failure")
+            return feedback
+
+    cognition = FlakyCognition()
+    boundary = CognitiveFeedbackBoundary(cognition)
+    feedback = _feedback()
+    context = _context()
+
+    first = boundary.record(feedback, context=context, created_at=NOW)
+    second = boundary.record(feedback, context=context, created_at=NOW)
+
+    assert first.success is False
+    assert second.success is True
+    assert second.request_id == first.request_id
+    assert cognition.calls == 2
+    assert boundary.records() == (second,)
+
+
 def test_feedback_request_event_replay_does_not_repeat_storage() -> None:
     class CountingCognition:
         def __init__(self) -> None:

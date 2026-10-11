@@ -165,7 +165,7 @@ class LearningClosedLoopEvidenceBoundary:
         now = timestamp.astimezone(UTC)
         with self._lock:
             existing = self._results.get(report.cycle_id)
-            if existing is not None:
+            if existing is not None and existing.recorded:
                 return existing
             waiter = self._inflight.get(report.cycle_id)
             if waiter is None:
@@ -184,6 +184,7 @@ class LearningClosedLoopEvidenceBoundary:
             return resolved
 
         related_evidence_ids: tuple[str, ...] = ()
+        evidence: EvidenceRecord | None = None
         try:
             related_evidence_ids = self._related_optimization_evidence(propagation)
             evidence = self._build_evidence(
@@ -208,18 +209,41 @@ class LearningClosedLoopEvidenceBoundary:
                 },
             )
         except Exception as exc:
-            outcome = LearningClosedLoopEvidenceResult(
-                cycle_id=report.cycle_id,
-                recorded=False,
-                evidence=None,
-                created_at=now,
-                correlation_id=propagation.correlation_id,
-                causation_id=propagation.causation_id,
-                trace_id=propagation.trace_id,
-                tenant_id=propagation.tenant_id,
-                error=str(exc) or type(exc).__name__,
-                metadata={"status": report.status.value},
-            )
+            persisted: EvidenceRecord | None = None
+            if evidence is not None:
+                try:
+                    persisted = self._store.get(evidence.evidence_id)
+                except Exception:
+                    persisted = None
+            if persisted is not None and persisted == evidence and persisted.verify():
+                outcome = LearningClosedLoopEvidenceResult(
+                    cycle_id=report.cycle_id,
+                    recorded=True,
+                    evidence=persisted,
+                    created_at=now,
+                    correlation_id=propagation.correlation_id,
+                    causation_id=propagation.causation_id,
+                    trace_id=propagation.trace_id,
+                    tenant_id=propagation.tenant_id,
+                    metadata={
+                        "status": report.status.value,
+                        "related_optimization_evidence": len(related_evidence_ids),
+                        "write_error_reconciled": True,
+                    },
+                )
+            else:
+                outcome = LearningClosedLoopEvidenceResult(
+                    cycle_id=report.cycle_id,
+                    recorded=False,
+                    evidence=None,
+                    created_at=now,
+                    correlation_id=propagation.correlation_id,
+                    causation_id=propagation.causation_id,
+                    trace_id=propagation.trace_id,
+                    tenant_id=propagation.tenant_id,
+                    error=str(exc) or type(exc).__name__,
+                    metadata={"status": report.status.value},
+                )
         with self._lock:
             self._results[report.cycle_id] = outcome
             self._last_context = propagation
@@ -313,6 +337,7 @@ class LearningClosedLoopEvidenceBoundary:
             else dict(report.optimization_result),
             "healing_result": report.healing_result,
             "feedback": [item.to_dict() for item in feedback],
+            "failure_detail": dict(report.failure_detail),
             "success_semantics": {
                 "learning": None if learning is None else learning.success,
                 "optimization": None if optimization is None else optimization.success,

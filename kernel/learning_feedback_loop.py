@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum, unique
 from threading import Event as ThreadEvent
@@ -314,6 +314,7 @@ class LearningClosedLoopCoordinator:
         current_thread = get_ident()
         convergence_failure_detail: dict[str, str] | None = None
         next_partial_count = 0
+        existing_report: LearningClosedLoopReport | None = None
 
         with self._lock:
             configured_options = self._cycle_options.get(cycle_id)
@@ -324,9 +325,6 @@ class LearningClosedLoopCoordinator:
                 )
 
             existing = self._cycles.get(cycle_id)
-            if existing is not None:
-                return existing
-
             inflight = self._inflight.get(cycle_id)
             if inflight is not None:
                 waiter, owner_thread = inflight
@@ -334,6 +332,9 @@ class LearningClosedLoopCoordinator:
                     raise RuntimeError(
                         f"closed-loop cycle re-entry detected: {cycle_id}"
                     )
+                leader = False
+            elif existing is not None:
+                existing_report = existing
                 leader = False
             else:
                 previous_state = self._goal_lifecycle_states.get(result.goal_id)
@@ -392,6 +393,10 @@ class LearningClosedLoopCoordinator:
                     )
                 leader = True
 
+        if existing_report is not None:
+            self._retry_finalization(existing_report)
+            return existing_report
+
         if not leader:
             waiter.wait()
             existing = self.get(cycle_id)
@@ -417,6 +422,7 @@ class LearningClosedLoopCoordinator:
                 self._goal_lifecycle_states[result.goal_id] = (
                     CognitiveLifecycleState.FAILED
                     if convergence_failure_detail is not None
+                    or report.status is ClosedLoopStatus.FAILED
                     else result.lifecycle_state
                 )
             return report
@@ -439,6 +445,72 @@ class LearningClosedLoopCoordinator:
                     if cycle_id not in self._cycles:
                         self._cycle_options.pop(cycle_id, None)
                     completion[0].set()
+
+    def _retry_finalization(self, report: LearningClosedLoopReport) -> None:
+        feedback_error = report.failure_detail.get("feedback_error")
+        if feedback_error:
+            aggregate_feedback = next(
+                (
+                    item
+                    for item in reversed(report.feedback)
+                    if item.kind is CognitiveFeedbackKind.CLOSED_LOOP
+                ),
+                None,
+            )
+            if aggregate_feedback is not None:
+                feedback_context = EventPropagationContext.create(
+                    correlation_id=aggregate_feedback.correlation_id,
+                    causation_id=aggregate_feedback.causation_id,
+                    trace_id=aggregate_feedback.trace_id,
+                    tenant_id=aggregate_feedback.tenant_id,
+                )
+                try:
+                    feedback_result = self._feedback_boundary.record(
+                        aggregate_feedback,
+                        context=feedback_context,
+                        created_at=aggregate_feedback.created_at,
+                    )
+                    if not feedback_result.success:
+                        error(
+                            "Closed-loop feedback retry failed",
+                            {
+                                "cycle_id": report.cycle_id,
+                                "error": feedback_result.error or feedback_error,
+                            },
+                        )
+                except Exception as exc:
+                    error(
+                        "Closed-loop feedback retry raised an exception",
+                        {"cycle_id": report.cycle_id, "error": str(exc)},
+                    )
+
+        evidence_result = self._closed_loop_evidence_boundary.get(report.cycle_id)
+        if evidence_result is None or not evidence_result.recorded:
+            evidence_context = EventPropagationContext.create(
+                correlation_id=report.correlation_id,
+                causation_id=report.causation_id,
+                trace_id=report.trace_id,
+                tenant_id=report.tenant_id,
+            )
+            try:
+                retried_evidence = self._closed_loop_evidence_boundary.record(
+                    report,
+                    context=evidence_context,
+                    created_at=report.created_at,
+                )
+                if not retried_evidence.recorded:
+                    error(
+                        "Closed-loop evidence retry failed",
+                        {
+                            "cycle_id": report.cycle_id,
+                            "error": retried_evidence.error or "evidence recording failed",
+                        },
+                    )
+            except Exception as exc:
+                error(
+                    "Closed-loop evidence retry raised an exception",
+                    {"cycle_id": report.cycle_id, "error": str(exc)},
+                )
 
     def _run_cycle(
         self,
@@ -702,12 +774,76 @@ class LearningClosedLoopCoordinator:
             context=propagation,
             created_at=now,
         )
-        if not evidence_result.recorded:
+        if evidence_result.recorded:
+            return report
+
+        error(
+            "Learning closed-loop evidence was not recorded; retrying once",
+            {"cycle_id": cycle_id, "error": evidence_result.error},
+        )
+        retry_result = self._closed_loop_evidence_boundary.record(
+            report,
+            context=propagation,
+            created_at=now,
+        )
+        if retry_result.recorded:
+            return report
+
+        evidence_error = (
+            retry_result.error
+            or evidence_result.error
+            or "closed-loop evidence persistence failed"
+        )
+        failure_detail = dict(report.failure_detail)
+        failure_detail.setdefault(
+            "error_type",
+            "ClosedLoopEvidencePersistenceError",
+        )
+        failure_detail.setdefault("error", evidence_error)
+        failure_detail["evidence_error_type"] = (
+            "ClosedLoopEvidencePersistenceError"
+        )
+        failure_detail["evidence_error"] = evidence_error
+        failure_detail.setdefault(
+            "evidence_failure_kind",
+            "evidence_persistence",
+        )
+        failure_payload: dict[str, Any] = {
+            "cycle_id": cycle_id,
+            "result_id": result.result_id,
+            "success": False,
+            "status": ClosedLoopStatus.FAILED.value,
+        }
+        failure_payload.update(failure_detail)
+        failure_context = self._publish(
+            "LearningClosedLoopFailed",
+            EventType.FAILURE,
+            failure_payload,
+            propagation,
+        )
+        failed_report = replace(
+            report,
+            status=ClosedLoopStatus.FAILED,
+            causation_id=failure_context.causation_id,
+            failure_detail=failure_detail,
+        )
+        with self._lock:
+            self._cycles[cycle_id] = failed_report
+
+        final_evidence_result = self._closed_loop_evidence_boundary.record(
+            failed_report,
+            context=failure_context,
+            created_at=now,
+        )
+        if not final_evidence_result.recorded:
             error(
-                "Learning closed-loop evidence was not recorded",
-                {"cycle_id": cycle_id, "error": evidence_result.error},
+                "Failed closed-loop report evidence remains pending",
+                {
+                    "cycle_id": cycle_id,
+                    "error": final_evidence_result.error or evidence_error,
+                },
             )
-        return report
+        return failed_report
 
     def _handle_cognition_result(self, event: Event) -> None:
         payload = event.payload.get("result")

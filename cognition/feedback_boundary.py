@@ -299,7 +299,7 @@ class CognitiveFeedbackBoundary:
                         f"feedback request re-entry detected: {request.request_id}"
                     )
                 leader = False
-            elif existing is not None:
+            elif existing is not None and existing.success:
                 return existing
             else:
                 waiter = ThreadEvent()
@@ -389,7 +389,7 @@ class CognitiveFeedbackBoundary:
             existing = self._results.get(request.request_id)
             inflight = self._inflight.get(request.request_id)
             if inflight is None:
-                if existing is not None:
+                if existing is not None and existing.success:
                     return existing
                 waiter = ThreadEvent()
                 self._inflight[request.request_id] = (
@@ -443,7 +443,7 @@ class CognitiveFeedbackBoundary:
     ) -> CognitiveFeedbackResult:
         with self._lock:
             existing = self._results.get(request.request_id)
-            if existing is not None:
+            if existing is not None and existing.success:
                 return existing
         result_context = context
         try:
