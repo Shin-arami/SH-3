@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from math import isfinite
 from threading import RLock
@@ -36,6 +36,19 @@ def _text(name: str, value: object) -> str:
 
 def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return MappingProxyType(dict(value or {}))
+
+
+def _matches_trace(candidate: object, requested: EventPropagationContext) -> bool:
+    return (
+        isinstance(candidate, EventPropagationContext)
+        and candidate.correlation_id == requested.correlation_id
+        and (
+            requested.trace_id is None or candidate.trace_id == requested.trace_id
+        )
+        and (
+            requested.tenant_id is None or candidate.tenant_id == requested.tenant_id
+        )
+    )
 
 
 class OptimizerBackend(Protocol):
@@ -222,8 +235,15 @@ class LearningOptimizationResult:
     trace_id: str | None = None
     tenant_id: str | None = None
     error: str | None = None
+    _next_context: EventPropagationContext | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
+        if self._next_context is not None and not isinstance(
+            self._next_context, EventPropagationContext
+        ):
+            raise TypeError("_next_context must be EventPropagationContext or None")
         for name, value in (
             ("request_id", self.request_id),
             ("learning_record_id", self.learning_record_id),
@@ -261,6 +281,17 @@ class LearningOptimizationResult:
             "tenant_id": self.tenant_id,
             "error": self.error,
         }
+
+    @property
+    def propagation_context(self) -> EventPropagationContext:
+        if self._next_context is not None:
+            return self._next_context
+        return EventPropagationContext.create(
+            correlation_id=self.correlation_id,
+            causation_id=self.causation_id,
+            trace_id=self.trace_id,
+            tenant_id=self.tenant_id,
+        )
 
 
 class LearningOptimizerBoundary:
@@ -425,23 +456,71 @@ class LearningOptimizerBoundary:
             existing = self._results.get(request.request_id)
             if existing is not None:
                 return existing
+            event_context = context
+            context_before = getattr(self.optimizer, "propagation_context", None)
             try:
                 update_boundary = self._update_boundary
                 if update_boundary is None:
                     optimization = self.optimizer.optimize(context=context, execute=True)
                     optimizer_id = str(optimization.get("optimizer_id", "optimizer"))
+                    optimizer_context = getattr(self.optimizer, "propagation_context", None)
+                    if (
+                        isinstance(optimizer_context, EventPropagationContext)
+                        and _matches_trace(optimizer_context, context)
+                        and optimizer_context != context_before
+                    ):
+                        event_context = optimizer_context
                     success = self._optimization_success(optimization)
                 else:
                     optimization = self.optimizer.optimize(context=context, execute=False)
                     optimizer_id = str(optimization.get("optimizer_id", "optimizer"))
                     optimizer_context = getattr(self.optimizer, "propagation_context", None)
-                    update_context = optimizer_context if isinstance(optimizer_context, EventPropagationContext) else context
-                    update = update_boundary.request(optimization, context=update_context, created_at=request.created_at)
+                    update_context = context
+                    if (
+                        isinstance(optimizer_context, EventPropagationContext)
+                        and _matches_trace(optimizer_context, context)
+                        and optimizer_context != context_before
+                    ):
+                        update_context = optimizer_context
+                    update = update_boundary.request(
+                        optimization,
+                        context=update_context,
+                        created_at=request.created_at,
+                    )
+                    update_context_after = getattr(
+                        update,
+                        "propagation_context",
+                        None,
+                    )
+                    if not isinstance(
+                        update_context_after,
+                        EventPropagationContext,
+                    ):
+                        update_context_after = getattr(
+                            update_boundary,
+                            "propagation_context",
+                            None,
+                        )
+                    event_context = (
+                        update_context_after
+                        if isinstance(
+                            update_context_after,
+                            EventPropagationContext,
+                        )
+                        else update_context
+                    )
                     optimization = dict(optimization)
                     optimization["update"] = update.to_dict()
                     success = update.success
                 error_message = None
             except Exception as exc:
+                optimizer_context = getattr(self.optimizer, "propagation_context", None)
+                if (
+                    isinstance(optimizer_context, EventPropagationContext)
+                    and _matches_trace(optimizer_context, context)
+                    and optimizer_context != context_before
+                ):
+                    event_context = optimizer_context
                 optimization = {}
                 optimizer_id = str(getattr(self.optimizer, "optimizer_id", "optimizer"))
                 success = False
@@ -470,10 +549,14 @@ class LearningOptimizerBoundary:
             event_name,
             event_type,
             {"result": result.to_dict(), "request": request.to_dict()},
-            context,
+            event_context,
         )
+        result = replace(result, _next_context=result_context)
+
         with self._lock:
             self._last_context = result_context
+            self._results[request.request_id] = result
+
         return result
 
     @staticmethod

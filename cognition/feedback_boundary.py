@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from threading import RLock
 from types import MappingProxyType
@@ -142,8 +142,15 @@ class CognitiveFeedbackResult:
     trace_id: str | None = None
     tenant_id: str | None = None
     error: str | None = None
+    _next_context: EventPropagationContext | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
+        if self._next_context is not None and not isinstance(
+            self._next_context, EventPropagationContext
+        ):
+            raise TypeError("_next_context must be EventPropagationContext or None")
         for name, value in (("request_id", self.request_id), ("feedback_id", self.feedback_id), ("correlation_id", self.correlation_id)):
             _text(name, value)
         if not isinstance(self.success, bool):
@@ -187,6 +194,17 @@ class CognitiveFeedbackResult:
             "tenant_id": self.tenant_id,
             "error": self.error,
         }
+
+    @property
+    def propagation_context(self) -> EventPropagationContext:
+        if self._next_context is not None:
+            return self._next_context
+        return EventPropagationContext.create(
+            correlation_id=self.correlation_id,
+            causation_id=self.causation_id,
+            trace_id=self.trace_id,
+            tenant_id=self.tenant_id,
+        )
 
 
 class CognitiveFeedbackBoundary:
@@ -345,6 +363,13 @@ class CognitiveFeedbackBoundary:
                 {"request": request.to_dict(), "feedback": request.feedback.to_dict(), "result": result.to_dict()},
                 context,
             )
+            result = replace(result, _next_context=result_context)
+
+            with self._lock:
+                self._results[request.request_id] = result
+                self._last_context = result_context
+
+            return result
         except Exception as exc:
             result = CognitiveFeedbackResult(
                 request_id=request.request_id,
@@ -365,8 +390,13 @@ class CognitiveFeedbackBoundary:
                 {"request": request.to_dict(), "result": result.to_dict()},
                 context,
             )
+
+        result = replace(result, _next_context=result_context)
+
         with self._lock:
+            self._results[request.request_id] = result
             self._last_context = result_context
+
         return result
 
     def _publish(

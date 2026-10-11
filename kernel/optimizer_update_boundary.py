@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum, unique
 from threading import Event as ThreadEvent
@@ -165,7 +165,14 @@ class OptimizationUpdateRequest:
             raise TypeError("optimization.rebalance.actions must be a sequence")
         actions = tuple(raw_actions)
         request_id = short_id(
-            {"optimization_id": optimization_id, "actions": actions},
+            {
+                "optimization_id": optimization_id,
+                "actions": actions,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
+            },
             prefix="optimization-update:",
         )
         return cls(
@@ -206,8 +213,15 @@ class OptimizationUpdateResult:
     trace_id: str | None = None
     tenant_id: str | None = None
     error: str | None = None
+    _next_context: EventPropagationContext | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
+        if self._next_context is not None and not isinstance(
+            self._next_context, EventPropagationContext
+        ):
+            raise TypeError("_next_context must be EventPropagationContext or None")
         for name, value in (
             ("request_id", self.request_id),
             ("optimization_id", self.optimization_id),
@@ -235,6 +249,17 @@ class OptimizationUpdateResult:
     def changed(self) -> bool:
         return any(item.changed and not item.rolled_back for item in self.updates)
 
+    @property
+    def propagation_context(self) -> EventPropagationContext:
+        if self._next_context is not None:
+            return self._next_context
+        return EventPropagationContext.create(
+            correlation_id=self.correlation_id,
+            causation_id=self.causation_id,
+            trace_id=self.trace_id,
+            tenant_id=self.tenant_id,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
@@ -256,7 +281,8 @@ class OptimizationUpdateBoundary:
         "_event_bus",
         "_event_publisher",
         "_evidence_boundary",
-        "_inflight",        "_last_context",
+        "_inflight",
+        "_last_context",
         "_lock",
         "_results",
         "_subscriber_id",
@@ -512,8 +538,10 @@ class OptimizationUpdateBoundary:
                     "Optimization evidence recording failed",
                     {"request_id": result.request_id, "error": str(exc)},
                 )
+        result = replace(result, _next_context=result_context)
         with self._lock:
             self._last_context = result_context
+            self._results[request.request_id] = result
         return result
 
     @staticmethod

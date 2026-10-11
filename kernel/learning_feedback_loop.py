@@ -6,11 +6,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum, unique
 from threading import Event as ThreadEvent
-from threading import RLock
+from threading import RLock, get_ident
 from types import MappingProxyType
 from typing import Any
 
-from cognition.contracts import CognitiveResult, CognitiveResultStatus
+from cognition.contracts import CognitiveLifecycleState, CognitiveResult, CognitiveResultStatus
 from cognition.feedback import CognitiveFeedback, CognitiveFeedbackBridge, CognitiveFeedbackKind
 from cognition.feedback_boundary import CognitiveFeedbackBoundary
 from foundation.Enums.category import Category
@@ -54,6 +54,7 @@ class LearningClosedLoopReport:
     optimization_result: Mapping[str, Any] | None = None
     healing_result: Any = None
     feedback: tuple[CognitiveFeedback, ...] = ()
+    failure_detail: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name, value in (("cycle_id", self.cycle_id), ("result_id", self.result_id), ("goal_id", self.goal_id), ("correlation_id", self.correlation_id)):
@@ -71,6 +72,21 @@ class LearningClosedLoopReport:
         object.__setattr__(self, "learning_result", _map(self.learning_result))
         object.__setattr__(self, "optimization_result", None if self.optimization_result is None else _map(self.optimization_result))
 
+        if not isinstance(self.failure_detail, Mapping):
+            raise TypeError("failure_detail must be a mapping")
+        if any(
+            not isinstance(key, str)
+            or not key.strip()
+            or not isinstance(value, str)
+            for key, value in self.failure_detail.items()
+        ):
+            raise TypeError("failure_detail must contain string keys and values")
+        object.__setattr__(
+            self,
+            "failure_detail",
+            MappingProxyType(dict(self.failure_detail)),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "cycle_id": self.cycle_id,
@@ -86,21 +102,28 @@ class LearningClosedLoopReport:
             "optimization_result": None if self.optimization_result is None else dict(self.optimization_result),
             "healing_result": self.healing_result,
             "feedback": [item.to_dict() for item in self.feedback],
+            "failure_detail": dict(self.failure_detail),
         }
 
 
 class LearningClosedLoopCoordinator:
     __slots__ = (
         "_closed_loop_evidence_boundary",
+        "_cycle_failure_details",
+        "_cycle_options",
         "_cycles",
         "_event_bus",
         "_event_publisher",
         "_feedback_boundary",
         "_feedback_bridge",
+        "_goal_inflight",
+        "_goal_lifecycle_states",
+        "_goal_partial_counts",
         "_healing_boundary",
         "_inflight",
         "_learning_boundary",
         "_lock",
+        "_max_partial_cycles",
         "_optimizer_boundary",
         "_recovery_execution_boundary",
         "_recovery_strategy_boundary",
@@ -120,9 +143,16 @@ class LearningClosedLoopCoordinator:
         recovery_execution_boundary: RecoveryExecutionBoundary | None = None,
         feedback_boundary: CognitiveFeedbackBoundary | None = None,
         closed_loop_evidence_boundary: LearningClosedLoopEvidenceBoundary | None = None,
+        max_partial_cycles: int = 3,
     ) -> None:
         if kernel is None:
             raise TypeError("kernel must not be None")
+        if isinstance(max_partial_cycles, bool) or not isinstance(
+            max_partial_cycles, int
+        ):
+            raise TypeError("max_partial_cycles must be an integer")
+        if max_partial_cycles < 1:
+            raise ValueError("max_partial_cycles must be >= 1")
         if event_publisher is not None and not isinstance(event_publisher, EventPublisher):
             raise TypeError("event_publisher must be EventPublisher or None")
         self.kernel = kernel
@@ -162,8 +192,14 @@ class LearningClosedLoopCoordinator:
             raise TypeError("closed_loop_evidence_boundary must be LearningClosedLoopEvidenceBoundary")
         self._lock = RLock()
         self._cycles: dict[str, LearningClosedLoopReport] = {}
-        self._inflight: dict[str, ThreadEvent] = {}
+        self._cycle_options: dict[str, tuple[bool, bool]] = {}
+        self._inflight: dict[str, tuple[ThreadEvent, int]] = {}
+        self._goal_inflight: dict[str, tuple[str, int]] = {}
+        self._goal_lifecycle_states: dict[str, CognitiveLifecycleState] = {}
         self._started = False
+        self._max_partial_cycles = max_partial_cycles
+        self._goal_partial_counts: dict[str, int] = {}
+        self._cycle_failure_details: dict[str, dict[str, str]] = {}
         self._configure()
 
     @property
@@ -260,37 +296,149 @@ class LearningClosedLoopCoordinator:
     ) -> LearningClosedLoopReport:
         if not isinstance(result, CognitiveResult):
             raise TypeError("result must be CognitiveResult")
+
+        expected_state = {
+            CognitiveResultStatus.SUCCESS: CognitiveLifecycleState.COMPLETED,
+            CognitiveResultStatus.FAILURE: CognitiveLifecycleState.FAILED,
+            CognitiveResultStatus.PARTIAL: CognitiveLifecycleState.ACTIVE,
+        }[result.status]
+        if result.lifecycle_state is not expected_state:
+            raise ValueError(
+                "result status and lifecycle_state are inconsistent: "
+                f"status={result.status.value}, "
+                f"lifecycle_state={result.lifecycle_state.value}"
+            )
+
         cycle_id = f"learning-cycle:{result.result_id}"
+        options = (optimize, recover)
+        current_thread = get_ident()
+        convergence_failure_detail: dict[str, str] | None = None
+        next_partial_count = 0
+
         with self._lock:
+            configured_options = self._cycle_options.get(cycle_id)
+            if configured_options is not None and configured_options != options:
+                raise ValueError(
+                    f"closed-loop cycle options conflict for {cycle_id}: "
+                    f"requested={options!r}, established={configured_options!r}"
+                )
+
             existing = self._cycles.get(cycle_id)
             if existing is not None:
                 return existing
-            waiter = self._inflight.get(cycle_id)
-            if waiter is None:
-                waiter = ThreadEvent()
-                self._inflight[cycle_id] = waiter
-                leader = True
-            else:
+
+            inflight = self._inflight.get(cycle_id)
+            if inflight is not None:
+                waiter, owner_thread = inflight
+                if owner_thread == current_thread:
+                    raise RuntimeError(
+                        f"closed-loop cycle re-entry detected: {cycle_id}"
+                    )
                 leader = False
+            else:
+                previous_state = self._goal_lifecycle_states.get(result.goal_id)
+                if previous_state in (
+                    CognitiveLifecycleState.COMPLETED,
+                    CognitiveLifecycleState.FAILED,
+                    CognitiveLifecycleState.TERMINATED,
+                ):
+                    raise ValueError(
+                        "closed-loop goal is already in a terminal lifecycle state: "
+                        f"goal_id={result.goal_id}, state={previous_state.value}"
+                    )
+
+                goal_inflight = self._goal_inflight.get(result.goal_id)
+                if goal_inflight is not None:
+                    active_cycle_id, owner_thread = goal_inflight
+                    if owner_thread == current_thread:
+                        raise RuntimeError(
+                            "closed-loop goal re-entry detected: "
+                            f"{result.goal_id} ({active_cycle_id})"
+                        )
+                    raise RuntimeError(
+                        "closed-loop goal already has an in-flight cycle: "
+                        f"{result.goal_id} ({active_cycle_id})"
+                    )
+
+                next_partial_count = self._goal_partial_counts.get(
+                    result.goal_id,
+                    0,
+                )
+                if result.status is CognitiveResultStatus.PARTIAL:
+                    next_partial_count += 1
+                    if next_partial_count >= self._max_partial_cycles:
+                        convergence_error = (
+                            f"maximum partial cycles reached for goal "
+                            f"{result.goal_id}: "
+                            f"{next_partial_count}/{self._max_partial_cycles}"
+                        )
+                        convergence_failure_detail = {
+                            "failure_kind": "convergence_limit",
+                            "convergence_error_type": (
+                                "ClosedLoopConvergenceLimitError"
+                            ),
+                            "convergence_error": convergence_error,
+                            "partial_cycles": str(next_partial_count),
+                            "max_partial_cycles": str(self._max_partial_cycles),
+                        }
+
+                waiter = ThreadEvent()
+                self._inflight[cycle_id] = (waiter, current_thread)
+                self._goal_inflight[result.goal_id] = (cycle_id, current_thread)
+                self._cycle_options[cycle_id] = options
+                if convergence_failure_detail is not None:
+                    self._cycle_failure_details[cycle_id] = (
+                        convergence_failure_detail
+                    )
+                leader = True
+
         if not leader:
             waiter.wait()
             existing = self.get(cycle_id)
             if existing is None:
-                raise RuntimeError(f"closed-loop report not produced: {cycle_id}")
+                raise RuntimeError(
+                    f"closed-loop report not produced: {cycle_id}"
+                )
             return existing
+
         try:
-            return self._run_cycle(
+            report = self._run_cycle(
                 result,
                 cycle_id,
                 context=context,
                 optimize=optimize,
                 recover=recover,
             )
+            with self._lock:
+                if result.status is CognitiveResultStatus.PARTIAL:
+                    self._goal_partial_counts[result.goal_id] = (
+                        next_partial_count
+                    )
+                self._goal_lifecycle_states[result.goal_id] = (
+                    CognitiveLifecycleState.FAILED
+                    if convergence_failure_detail is not None
+                    else result.lifecycle_state
+                )
+            return report
         finally:
             with self._lock:
+                self._cycle_failure_details.pop(cycle_id, None)
                 completion = self._inflight.pop(cycle_id, None)
                 if completion is not None:
-                    completion.set()
+                    if cycle_id in self._cycles:
+                        self._goal_lifecycle_states.setdefault(
+                            result.goal_id,
+                            result.lifecycle_state,
+                        )
+                    goal_inflight = self._goal_inflight.get(result.goal_id)
+                    if (
+                        goal_inflight is not None
+                        and goal_inflight[0] == cycle_id
+                    ):
+                        self._goal_inflight.pop(result.goal_id, None)
+                    if cycle_id not in self._cycles:
+                        self._cycle_options.pop(cycle_id, None)
+                    completion[0].set()
 
     def _run_cycle(
         self,
@@ -315,9 +463,22 @@ class LearningClosedLoopCoordinator:
         status = ClosedLoopStatus.COMPLETED
         failure_detail: dict[str, str] = {}
         try:
-            propagation = self._publish("LearningClosedLoopStarted", EventType.START, {"cycle_id": cycle_id, "result_id": result.result_id, "goal_id": result.goal_id}, propagation)
-            learning_value = self._learning_boundary.record(result, context=propagation, created_at=now)
-            propagation = self._learning_boundary.propagation_context or propagation
+            propagation = self._publish(
+                "LearningClosedLoopStarted",
+                EventType.START,
+                {
+                    "cycle_id": cycle_id,
+                    "result_id": result.result_id,
+                    "goal_id": result.goal_id
+                },
+                    propagation
+            )
+            learning_value = self._learning_boundary.record(
+                result,
+                context=propagation,
+                created_at=now
+            )
+            propagation = learning_value.propagation_context
             if not learning_value.success:
                 raise RuntimeError(learning_value.error or f"cognitive learning failed: {learning_value.request_id}")
             learning_result = dict(learning_value.learning)
@@ -338,9 +499,14 @@ class LearningClosedLoopCoordinator:
                 metadata={"result_id": result.result_id, "memory_key": learning_result.get("memory_key")},
             ))
             if optimize:
-                propagation = self._publish("LearningOptimizationStarted", EventType.START, {"cycle_id": cycle_id}, propagation)
+                propagation = self._publish(
+                    "LearningOptimizationStarted",
+                    EventType.START,
+                    {"cycle_id": cycle_id},
+                    propagation
+                )
                 optimization = self._optimizer_boundary.request(learning_result, context=propagation, created_at=now)
-                propagation = self._optimizer_boundary.propagation_context or propagation
+                propagation = optimization.propagation_context
                 optimization_result = dict(optimization.optimization)
                 execution = optimization.optimization.get("execution", ())
                 optimization_success = optimization.success
@@ -348,7 +514,7 @@ class LearningClosedLoopCoordinator:
                     status = ClosedLoopStatus.RECOVERED if recover else ClosedLoopStatus.FAILED
                     if recover:
                         healing = self._healing_boundary.request(optimization, context=propagation, created_at=now)
-                        propagation = self._healing_boundary.propagation_context or propagation
+                        propagation = healing.propagation_context
                         healing_result = {
                             "success": healing.success,
                             "status": "recovered" if healing.success else "failed",
@@ -394,7 +560,47 @@ class LearningClosedLoopCoordinator:
                 metadata={"error_type": type(exc).__name__, "recovery_error": None if healing_error is None else str(healing_error)},
             ))
             failure_detail = {"error_type": type(exc).__name__, "error": str(exc)}
+        with self._lock:
+            convergence_failure_detail = self._cycle_failure_details.get(cycle_id)
+
+        if convergence_failure_detail is not None:
+            status = ClosedLoopStatus.FAILED
+            failure_detail.setdefault(
+                "error_type",
+                convergence_failure_detail["convergence_error_type"],
+            )
+            failure_detail.setdefault(
+                "error",
+                convergence_failure_detail["convergence_error"],
+            )
+            failure_detail.update(convergence_failure_detail)
+
+        with self._lock:
+            convergence_failure_detail = self._cycle_failure_details.get(
+                cycle_id
+            )
+
+        if convergence_failure_detail is not None:
+            status = ClosedLoopStatus.FAILED
+            failure_detail.setdefault(
+                "error_type",
+                convergence_failure_detail["convergence_error_type"],
+            )
+            failure_detail.setdefault(
+                "error",
+                convergence_failure_detail["convergence_error"],
+            )
+            failure_detail.update(convergence_failure_detail)
+
         aggregate_success = status is not ClosedLoopStatus.FAILED and all(item.success for item in feedback if item.kind is not CognitiveFeedbackKind.SELF_HEALING or healing_result is not None)
+        aggregate_metadata: dict[str, Any] = {
+            "result_id": result.result_id,
+            "status": status.value,
+            "status_scope": "pre_feedback_recording",
+        }
+        if failure_detail:
+            aggregate_metadata["failure_detail"] = dict(failure_detail)
+
         aggregate_feedback = CognitiveFeedback.create(
             cycle_id=cycle_id, goal_id=result.goal_id, kind=CognitiveFeedbackKind.CLOSED_LOOP,
             source_id=cycle_id, success=aggregate_success,
@@ -402,13 +608,54 @@ class LearningClosedLoopCoordinator:
             reason="closed loop feedback returned to cognition",
             correlation_id=propagation.correlation_id, causation_id=propagation.causation_id,
             trace_id=propagation.trace_id, tenant_id=propagation.tenant_id, created_at=now,
-            metadata={"result_id": result.result_id, "status": status.value},
+            metadata=aggregate_metadata,
         )
         feedback.append(aggregate_feedback)
-        feedback_result = self._feedback_boundary.record(aggregate_feedback, context=propagation, created_at=now)
-        propagation = self._feedback_boundary.propagation_context or propagation
-        if not feedback_result.success:
+        try:
+            feedback_result = self._feedback_boundary.record(
+                aggregate_feedback,
+                context=propagation,
+                created_at=now,
+            )
+        except Exception as exc:
+            with self._lock:
+                convergence_failure_detail = self._cycle_failure_details.get(
+                    cycle_id
+                )
+            if convergence_failure_detail is not None:
+                status = ClosedLoopStatus.FAILED
+                failure_detail.setdefault(
+                    "error_type",
+                    convergence_failure_detail["convergence_error_type"],
+                )
+                failure_detail.setdefault(
+                    "error",
+                    convergence_failure_detail["convergence_error"],
+                )
+
             status = ClosedLoopStatus.FAILED
+            failure_detail.setdefault("error_type", type(exc).__name__)
+            failure_detail.setdefault("error", str(exc))
+            failure_detail["feedback_error_type"] = type(exc).__name__
+            failure_detail["feedback_error"] = str(exc)
+
+        else:
+            propagation = feedback_result.propagation_context
+            if not feedback_result.success:
+                status = ClosedLoopStatus.FAILED
+                feedback_error = (
+                    feedback_result.error
+                    or "closed-loop feedback recording failed"
+                )
+                failure_detail.setdefault(
+                    "error_type",
+                    "CognitiveFeedbackRecordingError",
+                )
+                failure_detail.setdefault("error", feedback_error)
+                failure_detail["feedback_error_type"] = (
+                    "CognitiveFeedbackRecordingError"
+                )
+                failure_detail["feedback_error"] = feedback_error
         terminal_event_name = (
             "LearningClosedLoopFailed"
             if status is ClosedLoopStatus.FAILED
@@ -433,11 +680,20 @@ class LearningClosedLoopCoordinator:
             propagation,
         )
         report = LearningClosedLoopReport(
-            cycle_id=cycle_id, result_id=result.result_id, goal_id=result.goal_id, status=status,
-            created_at=now, correlation_id=propagation.correlation_id, causation_id=propagation.causation_id,
-            trace_id=propagation.trace_id, tenant_id=propagation.tenant_id,
-            learning_result=learning_result, optimization_result=optimization_result,
-            healing_result=healing_result, feedback=tuple(feedback),
+            cycle_id=cycle_id,
+            result_id=result.result_id,
+            goal_id=result.goal_id,
+            status=status,
+            created_at=now,
+            correlation_id=propagation.correlation_id,
+            causation_id=propagation.causation_id,
+            trace_id=propagation.trace_id,
+            tenant_id=propagation.tenant_id,
+            learning_result=learning_result,
+            optimization_result=optimization_result,
+            healing_result=healing_result,
+            feedback=tuple(feedback),
+            failure_detail=failure_detail,
         )
         with self._lock:
             self._cycles[cycle_id] = report

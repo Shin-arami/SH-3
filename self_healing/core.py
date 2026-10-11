@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from threading import RLock
+from threading import RLock, local
 from types import MappingProxyType
 from typing import Any
 
@@ -122,10 +122,11 @@ class SelfHealingCore:
         "_last_event_id",
         "_last_failure",
         "_last_plan",
+        "_last_propagation_context",
         "_last_result",
         "_learned_records",
         "_lock",
-        "_propagation_context",
+        "_propagation_context_local",
         "_recovered",
         "context_manager",
         "learning",
@@ -160,7 +161,8 @@ class SelfHealingCore:
         self._last_failure: FailureSnapshot | None = None
         self._last_plan: RecoveryPlan | None = None
         self._last_result: Any = None
-        self._propagation_context: EventPropagationContext | None = None
+        self._propagation_context_local = local()
+        self._last_propagation_context: EventPropagationContext | None = None
         self._learned_records: list[dict[str, Any]] = []
         self._configure_learning_subscription()
 
@@ -1129,6 +1131,23 @@ class SelfHealingCore:
         result["learning"] = self.learning_summary()
         return result
 
+
+    @property
+    def _propagation_context(self) -> EventPropagationContext | None:
+        if hasattr(self._propagation_context_local, "value"):
+            value = self._propagation_context_local.value
+            return value if isinstance(value, EventPropagationContext) else None
+        with self._lock:
+            return self._last_propagation_context
+
+    @_propagation_context.setter
+    def _propagation_context(
+        self,
+        context: EventPropagationContext | None,
+    ) -> None:
+        self._propagation_context_local.value = context
+        with self._lock:
+            self._last_propagation_context = context
 
     @property
     def propagation_context(self) -> EventPropagationContext | None:

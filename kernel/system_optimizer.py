@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from threading import RLock
+from threading import RLock, local
 from typing import Any
 
 from cognition.memory import MemoryCore
@@ -57,15 +57,16 @@ class OptimizationActionResult:
 
 class SystemOptimizer:
     __slots__ = (
-    "_actions",
-    "_event_publisher",
-    "_history",
-    "_last_event_id",
-    "_lock",
-    "_propagation_context",
-    "kernel",
-    "memory",
-    "optimizer_id",
+        "_actions",
+        "_event_publisher",
+        "_history",
+        "_last_event_id",
+        "_last_propagation_context",
+        "_lock",
+        "_propagation_context_local",
+        "kernel",
+        "memory",
+        "optimizer_id",
     )
 
     def __init__(
@@ -79,11 +80,29 @@ class SystemOptimizer:
         self.optimizer_id = short_id("system-optimizer")
         self._event_publisher = event_publisher
         self._last_event_id: str | None = None
-        self._propagation_context: EventPropagationContext | None = None
+        self._propagation_context_local = local()
+        self._last_propagation_context: EventPropagationContext | None = None
         self._actions: dict[str, OptimizationAction] = {}
         self._history: list[OptimizationActionResult] = []
         self._lock = RLock()
         self._register_default_actions()
+
+    @property
+    def _propagation_context(self) -> EventPropagationContext | None:
+        if hasattr(self._propagation_context_local, "value"):
+            value = self._propagation_context_local.value
+            return value if isinstance(value, EventPropagationContext) else None
+        with self._lock:
+            return self._last_propagation_context
+
+    @_propagation_context.setter
+    def _propagation_context(
+        self,
+        context: EventPropagationContext | None,
+    ) -> None:
+        self._propagation_context_local.value = context
+        with self._lock:
+            self._last_propagation_context = context
 
     @property
     def propagation_context(self) -> EventPropagationContext | None:

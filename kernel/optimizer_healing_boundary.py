@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from threading import RLock
 from types import MappingProxyType
@@ -195,8 +195,15 @@ class OptimizerHealingResult:
     trace_id: str | None = None
     tenant_id: str | None = None
     error: str | None = None
+    _next_context: EventPropagationContext | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
+        if self._next_context is not None and not isinstance(
+            self._next_context, EventPropagationContext
+        ):
+            raise TypeError("_next_context must be EventPropagationContext or None")
         for name, value in (
             ("request_id", self.request_id),
             ("optimizer_id", self.optimizer_id),
@@ -264,6 +271,17 @@ class OptimizerHealingResult:
             "tenant_id": self.tenant_id,
             "error": self.error,
         }
+
+    @property
+    def propagation_context(self) -> EventPropagationContext:
+        if self._next_context is not None:
+            return self._next_context
+        return EventPropagationContext.create(
+            correlation_id=self.correlation_id,
+            causation_id=self.causation_id,
+            trace_id=self.trace_id,
+            tenant_id=self.tenant_id,
+        )
 
 
 class OptimizerHealingBoundary:
@@ -511,8 +529,12 @@ class OptimizerHealingBoundary:
             {"request": request.to_dict(), "result": result.to_dict()},
             result_context,
         )
+        result = replace(result, _next_context=final_context)
+
         with self._lock:
             self._last_context = final_context
+            self._results[request.request_id] = result
+
         return result
 
     def _publish(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Barrier
 from typing import Any
 
 import pytest
@@ -19,6 +21,33 @@ from kernel.optimizer_healing_boundary import (
 from self_healing.core import SelfHealingCore
 
 NOW = datetime(2026, 10, 5, 0, 0, tzinfo=UTC)
+
+
+def test_self_healing_context_is_isolated_between_threads() -> None:
+    healer = SelfHealingCore()
+    barrier = Barrier(2)
+    contexts = (
+        EventPropagationContext.create(
+            correlation_id="parallel-healing-a",
+            trace_id="parallel-trace-a",
+            tenant_id="parallel-tenant-a",
+        ),
+        EventPropagationContext.create(
+            correlation_id="parallel-healing-b",
+            trace_id="parallel-trace-b",
+            tenant_id="parallel-tenant-b",
+        ),
+    )
+
+    def observe(context: EventPropagationContext) -> EventPropagationContext | None:
+        healer.set_propagation_context(context)
+        barrier.wait(timeout=5)
+        return healer.propagation_context
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        observed = tuple(executor.map(observe, contexts))
+
+    assert observed == contexts
 
 
 def _optimization_result(
@@ -137,6 +166,7 @@ def test_boundary_event_path_preserves_causation_and_reports_completion() -> Non
     assert result.correlation_id == "corr-4"
     assert result.trace_id == "trace-4"
     assert result.tenant_id == "tenant-4"
+    assert result.propagation_context.causation_id == completed.metadata.event_id
     assert boundary.propagation_context is not None
     assert boundary.propagation_context.causation_id == completed.metadata.event_id
 
@@ -223,15 +253,24 @@ def test_closed_loop_uses_optimizer_healing_boundary(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(kernel.system_optimizer.__class__, "optimize", fail_optimize)
 
     goal = "phase 11-3"
-    from cognition.contracts import CognitiveGoal, CognitiveResult, CognitiveResultStatus
+    from cognition.contracts import (
+        CognitiveGoal,
+        CognitiveLifecycleState,
+        CognitiveResult,
+        CognitiveResultStatus,
+    )
 
     goal_contract = CognitiveGoal.create(goal, created_at=NOW, correlation_id="corr-7", trace_id="trace-7")
     result = CognitiveResult.create(
         goal_contract,
         status=CognitiveResultStatus.SUCCESS,
-        lifecycle_state=goal_contract.lifecycle_state,
+        lifecycle_state=CognitiveLifecycleState.COMPLETED,
         created_at=NOW,
-        output={"goal": goal_contract.to_dict(), "plan": {"steps": [goal]}, "decision": {"selected_option": goal}},
+        output={
+            "goal": goal_contract.to_dict(),
+            "plan": {"steps": [goal]},
+            "decision": {"selected_option": goal},
+        },
         result_id="result:phase11-3",
     )
 
@@ -257,13 +296,18 @@ def test_closed_loop_recovery_flag_is_preserved_for_optimizer_failure(monkeypatc
 
     monkeypatch.setattr(kernel.system_optimizer.__class__, "optimize", fail_optimize)
 
-    from cognition.contracts import CognitiveGoal, CognitiveResult, CognitiveResultStatus
+    from cognition.contracts import (
+        CognitiveGoal,
+        CognitiveLifecycleState,
+        CognitiveResult,
+        CognitiveResultStatus,
+    )
 
     goal = CognitiveGoal.create("phase 11-3 no recovery", created_at=NOW, correlation_id="corr-8")
     result = CognitiveResult.create(
         goal,
         status=CognitiveResultStatus.SUCCESS,
-        lifecycle_state=goal.lifecycle_state,
+        lifecycle_state=CognitiveLifecycleState.COMPLETED,
         created_at=NOW,
         output={"goal": goal.to_dict(), "plan": {"steps": ["phase 11-3"]}, "decision": {"selected_option": "phase 11-3"}},
         result_id="result:phase11-3-no-recovery",

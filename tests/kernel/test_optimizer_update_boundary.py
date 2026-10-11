@@ -158,3 +158,37 @@ def test_update_boundary_supports_concurrent_duplicate_requests() -> None:
     assert len({item.request_id for item in results}) == 1
     assert len(boundary.records()) == 1
     assert kernel.context_manager.snapshot()["depth"] == 6
+
+def test_update_boundary_does_not_share_results_across_trace_contexts() -> None:
+    kernel = SH3Kernel()
+    optimization = {
+        "optimizer_id": kernel.system_optimizer.optimizer_id,
+        "rebalance": {"actions": []},
+    }
+    first_context = EventPropagationContext.create(
+        correlation_id="update-isolation-a",
+        causation_id="update-cause-a",
+        trace_id="update-trace-a",
+        tenant_id="update-tenant-a",
+    )
+    second_context = EventPropagationContext.create(
+        correlation_id="update-isolation-b",
+        causation_id="update-cause-b",
+        trace_id="update-trace-b",
+        tenant_id="update-tenant-b",
+    )
+
+    first = kernel.optimizer_update_boundary.request(
+        optimization, context=first_context, created_at=NOW
+    )
+    second = kernel.optimizer_update_boundary.request(
+        optimization, context=second_context, created_at=NOW
+    )
+
+    assert first.request_id != second.request_id
+    assert first.propagation_context.correlation_id == first_context.correlation_id
+    assert first.propagation_context.trace_id == first_context.trace_id
+    assert first.propagation_context.tenant_id == first_context.tenant_id
+    assert second.propagation_context.correlation_id == second_context.correlation_id
+    assert second.propagation_context.trace_id == second_context.trace_id
+    assert second.propagation_context.tenant_id == second_context.tenant_id

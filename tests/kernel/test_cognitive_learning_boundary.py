@@ -96,6 +96,7 @@ def test_event_bus_order_and_trace_are_preserved() -> None:
     assert completed.metadata.correlation_id == requested.metadata.correlation_id
     assert completed.metadata.trace_id == requested.metadata.trace_id
     assert completed.metadata.tenant_id == requested.metadata.tenant_id
+    assert result.propagation_context.causation_id == completed.metadata.event_id
 
 
 def test_event_bus_subscription_is_rebound_when_publisher_changes() -> None:

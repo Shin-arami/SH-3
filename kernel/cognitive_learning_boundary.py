@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from threading import Condition, RLock
 from types import MappingProxyType
@@ -43,6 +43,22 @@ def _optional_text(name: str, value: object) -> str | None:
     if value is None:
         return None
     return _text(name, value)
+
+
+def _matches_trace(
+    candidate: object,
+    requested: EventPropagationContext,
+) -> bool:
+    return (
+        isinstance(candidate, EventPropagationContext)
+        and candidate.correlation_id == requested.correlation_id
+        and (
+            requested.trace_id is None or candidate.trace_id == requested.trace_id
+        )
+        and (
+            requested.tenant_id is None or candidate.tenant_id == requested.tenant_id
+        )
+    )
 
 
 class LearningBackend(Protocol):
@@ -172,11 +188,18 @@ class CognitiveLearningResult:
     trace_id: str | None = None
     tenant_id: str | None = None
     error: str | None = None
+    _next_context: EventPropagationContext | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         _text("request_id", self.request_id)
         _text("result_id", self.result_id)
         _text("loop_id", self.loop_id)
+        if self._next_context is not None and not isinstance(
+            self._next_context, EventPropagationContext
+        ):
+            raise TypeError("_next_context must be EventPropagationContext or None")
         _text("correlation_id", self.correlation_id)
         if not isinstance(self.success, bool):
             raise TypeError("success must be bool")
@@ -226,9 +249,21 @@ class CognitiveLearningResult:
             "error": self.error,
         }
 
+    @property
+    def propagation_context(self) -> EventPropagationContext:
+        if self._next_context is not None:
+            return self._next_context
+        return EventPropagationContext.create(
+            correlation_id=self.correlation_id,
+            causation_id=self.causation_id,
+            trace_id=self.trace_id,
+            tenant_id=self.tenant_id,
+        )
+
 
 class CognitiveLearningBoundary:
     __slots__ = (
+        "_backend_lock",
         "_condition",
         "_event_bus",
         "_event_publisher",
@@ -252,6 +287,7 @@ class CognitiveLearningBoundary:
         if event_publisher is not None and not isinstance(event_publisher, EventPublisher):
             raise TypeError("event_publisher must be EventPublisher or None")
         self.learning = learning
+        self._backend_lock = RLock()
         self._event_publisher = event_publisher
         self._event_bus: EventBus | None = None
         self._condition = Condition(RLock())
@@ -383,14 +419,25 @@ class CognitiveLearningBoundary:
             existing = self._results.get(request.request_id)
             if existing is not None:
                 return existing
+        result_context = context
         try:
-            learning = self.learning.run(dict(request.learning_input), context=context)
+            with self._backend_lock:
+                backend_context_before = getattr(self.learning, "propagation_context", None)
+                try:
+                    learning = self.learning.run(dict(request.learning_input), context=context)
+                finally:
+                    backend_context_after = getattr(self.learning, "propagation_context", None)
+                    if (
+                        isinstance(backend_context_after, EventPropagationContext)
+                        and _matches_trace(backend_context_after, context)
+                        and backend_context_after != backend_context_before
+                    ):
+                        result_context = backend_context_after
             if not isinstance(learning, Mapping):
                 raise TypeError("learning backend result must be a mapping")
             loop_id = learning.get("loop_id")
             if not isinstance(loop_id, str) or not loop_id.strip():
                 loop_id = "learning"
-            result_context = getattr(self.learning, "propagation_context", None) or context
             result = CognitiveLearningResult(
                 request_id=request.request_id,
                 result_id=request.result_id,
@@ -404,7 +451,6 @@ class CognitiveLearningBoundary:
                 tenant_id=result_context.tenant_id,
             )
         except Exception as exc:
-            result_context = getattr(self.learning, "propagation_context", None) or context
             result = CognitiveLearningResult(
                 request_id=request.request_id,
                 result_id=request.result_id,
@@ -428,9 +474,13 @@ class CognitiveLearningBoundary:
             {"request": request.to_dict(), "result": result.to_dict()},
             result_context,
         )
+        result = replace(result, _next_context=final_context)
+
         with self._condition:
+            self._results[request.request_id] = result
             self._last_context = final_context
             self._condition.notify_all()
+
         return result
 
     def _publish(

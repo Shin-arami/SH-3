@@ -455,3 +455,37 @@ py -3.12 -m pytest tests\cognition -q
 py -3.12 -m pytest -q
 py -3.12 -m pytest -q -W error::DeprecationWarning
 ```
+
+# Part 10-9 — Cognition EventBus / Evidence / Observability
+
+Adds typed cognition observability around the existing contract path.
+
+## Changed
+- `cognition/observability.py`
+  - `CognitionObservability`
+  - `CognitionObservationReport`
+  - EventBus publication for Policy / Decision / Execution / Result
+  - deterministic stage evidence IDs
+  - idempotent evidence reuse with integrity verification
+- `cognition/core.py`
+  - EventPublisher / EvidenceStore / CognitionObservability injection
+  - automatic observation of `run_contract()` / `execute_contract()` results
+  - public `observe_result()` access
+- `tests/cognition/test_cognition_observability.py`
+  - EventBus causation chain
+  - Evidence integrity and stage records
+  - policy denial / execution failure audit paths
+  - direct typed observation
+
+## Expected user-side baseline
+Part 10-8 baseline: 840 passed.
+Part 10-9 adds 7 cognition tests, so expected full suite: 847 passed.
+
+## Validation
+```powershell
+py -3.12 -m ruff check cognition foundation tests\cognition tests\runtime
+py -3.12 -m mypy cognition foundation tests\cognition tests\runtime --explicit-package-bases
+py -3.12 -m pytest tests\cognition -q
+py -3.12 -m pytest -q
+py -3.12 -m pytest -q -W error::DeprecationWarning
+```

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from threading import Event as ThreadEvent
@@ -7,7 +8,12 @@ from typing import cast
 
 import pytest
 
-from cognition.contracts import CognitiveGoal, CognitiveResult, CognitiveResultStatus
+from cognition.contracts import (
+    CognitiveGoal,
+    CognitiveLifecycleState,
+    CognitiveResult,
+    CognitiveResultStatus,
+)
 from foundation.Enums.category import Category
 from foundation.Enums.event import EventType
 from foundation.version import EVENT_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION
@@ -24,10 +30,14 @@ from kernel.learning_feedback_loop import ClosedLoopStatus, LearningClosedLoopRe
 
 NOW = datetime(2026, 10, 9, 0, 0, tzinfo=UTC)
 
-
-def _result(result_id: str = "result:closed-loop-evidence") -> CognitiveResult:
+#         "prepare release",
+def _result(
+    result_id: str = "result:closed-loop-evidence",
+    *,
+    intent: str = "closed-loop evidence",
+) -> CognitiveResult:
     goal = CognitiveGoal.create(
-        "prepare release",
+        intent,
         created_at=NOW,
         correlation_id="corr-closed-loop-evidence",
         trace_id="trace-closed-loop-evidence",
@@ -36,7 +46,7 @@ def _result(result_id: str = "result:closed-loop-evidence") -> CognitiveResult:
     return CognitiveResult.create(
         goal,
         status=CognitiveResultStatus.SUCCESS,
-        lifecycle_state=goal.lifecycle_state,
+        lifecycle_state=CognitiveLifecycleState.COMPLETED,
         created_at=NOW,
         output={
             "goal": goal.to_dict(),
@@ -95,6 +105,7 @@ def test_failed_cycle_is_recorded_with_failure_semantics() -> None:
     failed = CognitiveResult.create(
         result.goal_id,
         status=CognitiveResultStatus.FAILURE,
+        lifecycle_state=CognitiveLifecycleState.FAILED,
         output=result.output,
         result_id=result.result_id,
         correlation_id=result.correlation_id,
@@ -121,6 +132,7 @@ def test_recovered_cycle_is_distinguished_from_fully_successful_cycle() -> None:
     failed = CognitiveResult.create(
         result.goal_id,
         status=CognitiveResultStatus.FAILURE,
+        lifecycle_state=CognitiveLifecycleState.FAILED,
         output=result.output,
         result_id=result.result_id,
         correlation_id=result.correlation_id,
@@ -185,12 +197,20 @@ def test_evidence_event_is_causally_linked_to_terminal_cycle_event() -> None:
         if event.name in {"LearningClosedLoopCompleted", "LearningClosedLoopFailed"}
         and event.payload.get("cycle_id") == report.cycle_id
     )
+    feedback_recorded = next(
+        event
+        for event in events
+        if event.name == "CognitiveFeedbackRecorded"
+        and isinstance(event.payload.get("feedback"), Mapping)
+        and event.payload["feedback"].get("cycle_id") == report.cycle_id
+    )
     recorded = next(
         event
         for event in events
         if event.name == "LearningClosedLoopEvidenceRecorded"
         and event.payload.get("cycle_id") == report.cycle_id
     )
+    assert terminal.causation_id == feedback_recorded.id
     assert recorded.category is Category.LEARNING
     assert recorded.event_type is EventType.CREATED
     assert recorded.causation_id == terminal.id
@@ -323,8 +343,13 @@ def test_event_publisher_replacement_uses_new_publisher() -> None:
     report = kernel.learning_feedback_loop.run(_result("result:publisher-rebind"), optimize=False)
 
     kernel.set_event_publisher(second_publisher)
-    next_report = kernel.learning_feedback_loop.run(_result("result:publisher-rebind-next"), optimize=False)
-
+    next_report = kernel.learning_feedback_loop.run(
+        _result(
+            "result:publisher-rebind-next",
+            intent="closed-loop evidence after publisher replacement",
+        ),
+        optimize=False,
+    )
     assert kernel.learning_closed_loop_evidence_boundary.get(report.cycle_id) is not None
     assert next_report.cycle_id != report.cycle_id
     assert any(event.name == "LearningClosedLoopEvidenceRecorded" for event in first_events)
@@ -360,3 +385,82 @@ def test_evidence_failure_is_reported_as_typed_boundary_result() -> None:
     assert failed.category is Category.LEARNING
     assert failed.event_type is EventType.FAILURE
     CanonicalEventCatalog().validate(failed)
+
+
+def test_parallel_closed_loops_keep_trace_context_isolated() -> None:
+    bus = EventBus()
+    publisher = EventBusPublisher(bus)
+    events: list[Event] = []
+
+    bus.subscribe(
+        EventSubscription(
+            subscriber_id="parallel-closed-loop-audit",
+            handler=events.append,
+            priority=-100,
+        )
+    )
+    kernel = SH3Kernel(event_publisher=publisher)
+
+    contexts = (
+        EventPropagationContext.create(
+            "part11-11-correlation-a",
+            causation_id="part11-11-cause-a",
+            trace_id="part11-11-trace-a",
+            tenant_id="part11-11-tenant-a",
+        ),
+        EventPropagationContext.create(
+            "part11-11-correlation-b",
+            causation_id="part11-11-cause-b",
+            trace_id="part11-11-trace-b",
+            tenant_id="part11-11-tenant-b",
+        ),
+    )
+
+    results = (
+        _result("result:parallel-a", intent="parallel closed loop a"),
+        _result("result:parallel-b", intent="parallel closed loop b"),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = tuple(
+            executor.submit(
+                kernel.learning_feedback_loop.run,
+                result,
+                context=context,
+                optimize=True,
+                recover=True,
+            )
+            for result, context in zip(results, contexts, strict=True)
+        )
+        reports = tuple(future.result() for future in futures)
+
+    for report, context in zip(reports, contexts, strict=True):
+        assert report.correlation_id == context.correlation_id
+        assert report.trace_id == context.trace_id
+        assert report.tenant_id == context.tenant_id
+
+        terminal = next(
+            event
+            for event in events
+            if event.name
+            in {"LearningClosedLoopCompleted", "LearningClosedLoopFailed"}
+            and event.payload.get("cycle_id") == report.cycle_id
+        )
+        recorded = next(
+            event
+            for event in events
+            if event.name == "LearningClosedLoopEvidenceRecorded"
+            and event.payload.get("cycle_id") == report.cycle_id
+        )
+
+        assert terminal.correlation_id == context.correlation_id
+        assert terminal.trace_id == context.trace_id
+        assert terminal.metadata.tenant_id == context.tenant_id
+
+        assert recorded.causation_id == terminal.id
+        assert recorded.correlation_id == terminal.correlation_id
+        assert recorded.trace_id == terminal.trace_id
+        assert recorded.metadata.tenant_id == terminal.metadata.tenant_id
+
+    assert reports[0].cycle_id != reports[1].cycle_id
+    assert reports[0].result_id != reports[1].result_id

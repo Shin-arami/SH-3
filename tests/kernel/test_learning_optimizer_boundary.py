@@ -146,6 +146,7 @@ def test_boundary_uses_event_bus_and_preserves_causation() -> None:
     assert requested.metadata.causation_id == "learning-event"
     assert completed.metadata.causation_id == requested.metadata.event_id
     assert result.causation_id == requested.metadata.event_id
+    assert result.propagation_context.causation_id == completed.metadata.event_id
     assert boundary.propagation_context is not None
     assert boundary.propagation_context.causation_id == completed.metadata.event_id
 
