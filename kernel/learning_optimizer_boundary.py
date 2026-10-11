@@ -150,7 +150,14 @@ class LearningOptimizationRequest:
                 strategy = value
         metadata = learning_result.get("metadata")
         request_id = short_id(
-            {"learning_record_id": record_id, "domain": domain},
+            {
+                "learning_record_id": record_id,
+                "domain": domain,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
+            },
             prefix="learning-optimization:",
         )
         return cls(

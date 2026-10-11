@@ -122,7 +122,14 @@ class CognitiveLearningRequest:
             "success": result.status.value == "success",
         }
         request_id = short_id(
-            {"result_id": result.result_id, "goal_id": result.goal_id},
+            {
+                "result_id": result.result_id,
+                "goal_id": result.goal_id,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
+            },
             prefix="cognitive-learning:",
         )
         return cls(

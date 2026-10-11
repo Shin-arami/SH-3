@@ -95,6 +95,10 @@ class RecoveryExecutionRequest:
                 "strategy_request_id": result.request_id,
                 "failure_id": result.failure_id,
                 "strategy": result.selected_strategy,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
             },
             prefix="recovery-execution:",
         )

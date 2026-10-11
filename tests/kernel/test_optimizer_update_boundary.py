@@ -133,6 +133,46 @@ def test_update_boundary_is_idempotent_for_duplicate_request() -> None:
     assert kernel.context_manager.snapshot()["depth"] == 6
 
 
+def test_update_request_event_replay_does_not_repeat_side_effects() -> None:
+    bus = EventBus()
+    publisher = EventBusPublisher(bus)
+    events: list[Event] = []
+    bus.subscribe(
+        EventSubscription(
+            subscriber_id="update-replay-audit",
+            handler=events.append,
+            priority=-100,
+        )
+    )
+    kernel = SH3Kernel(event_publisher=publisher)
+    optimization = _runtime_optimization(kernel)
+    result = kernel.optimizer_update_boundary.request(
+        optimization, context=_context(), created_at=NOW
+    )
+    requested = next(
+        event for event in events if event.name == "OptimizationUpdateRequested"
+    )
+    completed_count = len(
+        [event for event in events if event.name == "OptimizationUpdateCompleted"]
+    )
+    updated_count = len(
+        [event for event in events if event.name in {"ContextUpdated", "PolicyUpdated", "MemoryUpdated"}]
+    )
+    context_after_first_run = kernel.context_manager.snapshot()
+
+    publisher.publish(requested)
+
+    assert kernel.optimizer_update_boundary.get(result.request_id) is result
+    assert kernel.context_manager.snapshot() == context_after_first_run
+    assert len(kernel.optimizer_update_boundary.records()) == 1
+    assert len(
+        [event for event in events if event.name == "OptimizationUpdateCompleted"]
+    ) == completed_count == 1
+    assert len(
+        [event for event in events if event.name in {"ContextUpdated", "PolicyUpdated", "MemoryUpdated"}]
+    ) == updated_count
+
+
 def test_update_boundary_rejects_unsupported_action() -> None:
     kernel = SH3Kernel()
     optimization = {

@@ -169,23 +169,6 @@ class OptimizationEvidenceBoundary:
             for update in result.updates
             if update.success and update.changed and not update.rolled_back
         )
-        if not material_updates:
-            outcome = OptimizationEvidenceResult(
-                request_id=result.request_id,
-                recorded=False,
-                evidence=None,
-                created_at=now,
-                correlation_id=propagation.correlation_id,
-                causation_id=propagation.causation_id,
-                trace_id=propagation.trace_id,
-                tenant_id=propagation.tenant_id,
-                metadata={"material_changes": 0},
-            )
-            with self._lock:
-                self._results[result.request_id] = outcome
-                self._last_context = propagation
-            return outcome
-
         with self._lock:
             existing = self._results.get(result.request_id)
             if existing is not None:
@@ -205,6 +188,23 @@ class OptimizationEvidenceBoundary:
             return resolved
 
         try:
+            if not material_updates:
+                outcome = OptimizationEvidenceResult(
+                    request_id=result.request_id,
+                    recorded=False,
+                    evidence=None,
+                    created_at=now,
+                    correlation_id=propagation.correlation_id,
+                    causation_id=propagation.causation_id,
+                    trace_id=propagation.trace_id,
+                    tenant_id=propagation.tenant_id,
+                    metadata={"material_changes": 0},
+                )
+                with self._lock:
+                    self._results[result.request_id] = outcome
+                    self._last_context = propagation
+                return outcome
+
             try:
                 evidence = self._store.register(
                     self._build_evidence(result, material_updates, propagation, now)

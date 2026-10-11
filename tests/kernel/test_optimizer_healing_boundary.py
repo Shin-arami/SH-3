@@ -93,6 +93,35 @@ def test_request_is_deterministic_and_requires_optimizer_failure() -> None:
         )
 
 
+def test_healing_request_identity_is_context_scoped() -> None:
+    result = _optimization_result()
+    first_context = EventPropagationContext.create(
+        correlation_id="healing-scope-a",
+        causation_id="healing-cause-a",
+        trace_id="healing-trace-a",
+        tenant_id="healing-tenant-a",
+    )
+    second_context = EventPropagationContext.create(
+        correlation_id="healing-scope-b",
+        causation_id="healing-cause-b",
+        trace_id="healing-trace-b",
+        tenant_id="healing-tenant-b",
+    )
+
+    first = OptimizerHealingRequest.from_result(
+        result, context=first_context, created_at=NOW
+    )
+    replay = OptimizerHealingRequest.from_result(
+        result, context=first_context, created_at=NOW
+    )
+    other_trace = OptimizerHealingRequest.from_result(
+        result, context=second_context, created_at=NOW
+    )
+
+    assert first.request_id == replay.request_id
+    assert first.request_id != other_trace.request_id
+
+
 def test_boundary_executes_real_self_healing_api_without_event_bus() -> None:
     healer = SelfHealingCore()
     boundary = OptimizerHealingBoundary(healer)

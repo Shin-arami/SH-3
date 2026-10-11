@@ -63,6 +63,35 @@ def test_learning_result_is_converted_to_deterministic_request() -> None:
 
 
 
+def test_learning_optimization_request_identity_is_context_scoped() -> None:
+    learning_result = _learning_result("record:context-scope")
+    first_context = EventPropagationContext.create(
+        correlation_id="corr:scope-a",
+        causation_id="cause:scope-a",
+        trace_id="trace:scope-a",
+        tenant_id="tenant:scope-a",
+    )
+    second_context = EventPropagationContext.create(
+        correlation_id="corr:scope-b",
+        causation_id="cause:scope-b",
+        trace_id="trace:scope-b",
+        tenant_id="tenant:scope-b",
+    )
+
+    first = LearningOptimizationRequest.from_learning_result(
+        learning_result, context=first_context, created_at=NOW
+    )
+    replay = LearningOptimizationRequest.from_learning_result(
+        learning_result, context=first_context, created_at=NOW
+    )
+    other_trace = LearningOptimizationRequest.from_learning_result(
+        learning_result, context=second_context, created_at=NOW
+    )
+
+    assert first.request_id == replay.request_id
+    assert first.request_id != other_trace.request_id
+
+
 def test_learning_result_uses_legacy_memory_key_as_record_id() -> None:
     context = EventPropagationContext.create(correlation_id="corr-legacy")
     learning_result = _learning_result("record:legacy")
@@ -149,6 +178,12 @@ def test_boundary_uses_event_bus_and_preserves_causation() -> None:
     assert result.propagation_context.causation_id == completed.metadata.event_id
     assert boundary.propagation_context is not None
     assert boundary.propagation_context.causation_id == completed.metadata.event_id
+
+    publisher.publish(requested)
+    assert optimizer.calls == 1
+    assert len(
+        [event for event in events if event.name == "LearningOptimizationCompleted"]
+    ) == 1
 
 
 def test_boundary_is_idempotent_for_duplicate_learning_result() -> None:

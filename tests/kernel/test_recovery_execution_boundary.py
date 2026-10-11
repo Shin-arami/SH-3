@@ -13,6 +13,7 @@ from infrastructure.events import Event, EventPropagationContext
 from kernel import SH3Kernel
 from kernel.recovery_execution_boundary import (
     RecoveryExecutionBoundary,
+    RecoveryExecutionRequest,
     RecoveryExecutionResult,
 )
 from kernel.recovery_strategy_boundary import RecoveryStrategyBoundary, RecoveryStrategyResult
@@ -41,6 +42,30 @@ def _strategy_result(
     snapshot = _snapshot()
     result = strategy.request(snapshot, context=_context(), created_at=NOW)
     return current, strategy, result, snapshot
+
+
+def test_recovery_execution_identity_is_context_scoped() -> None:
+    _, _, strategy_result, snapshot = _strategy_result()
+    first_context = _context()
+    second_context = EventPropagationContext.create(
+        correlation_id="execution-correlation-other",
+        causation_id="execution-cause-other",
+        trace_id="execution-trace-other",
+        tenant_id="execution-tenant-other",
+    )
+
+    first = RecoveryExecutionRequest.from_strategy(
+        strategy_result, snapshot=snapshot, context=first_context, created_at=NOW
+    )
+    replay = RecoveryExecutionRequest.from_strategy(
+        strategy_result, snapshot=snapshot, context=first_context, created_at=NOW
+    )
+    other_trace = RecoveryExecutionRequest.from_strategy(
+        strategy_result, snapshot=snapshot, context=second_context, created_at=NOW
+    )
+
+    assert first.request_id == replay.request_id
+    assert first.request_id != other_trace.request_id
 
 
 def test_boundary_executes_selected_strategy_directly() -> None:

@@ -42,6 +42,26 @@ def test_boundary_evaluates_and_selects_deterministically() -> None:
     assert result.confidence == 0.0
 
 
+def test_recovery_strategy_identity_is_context_scoped() -> None:
+    healer = SelfHealingCore()
+    boundary = RecoveryStrategyBoundary(healer)
+    snapshot = _snapshot()
+    first_context = _context()
+    second_context = EventPropagationContext.create(
+        correlation_id="strategy-correlation-other",
+        causation_id="strategy-cause-other",
+        trace_id="strategy-trace-other",
+        tenant_id="strategy-tenant-other",
+    )
+
+    first = boundary.request(snapshot, context=first_context, created_at=NOW)
+    replay = boundary.request(snapshot, context=first_context, created_at=NOW)
+    other_trace = boundary.request(snapshot, context=second_context, created_at=NOW)
+
+    assert first.request_id == replay.request_id
+    assert first.request_id != other_trace.request_id
+
+
 def test_boundary_uses_existing_learned_selection() -> None:
     from services.learning import LearningService
 

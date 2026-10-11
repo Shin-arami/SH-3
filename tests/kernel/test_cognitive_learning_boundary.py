@@ -8,7 +8,10 @@ from typing import Any
 from cognition.contracts import CognitiveGoal, CognitiveResult, CognitiveResultStatus
 from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
-from kernel.cognitive_learning_boundary import CognitiveLearningBoundary
+from kernel.cognitive_learning_boundary import (
+    CognitiveLearningBoundary,
+    CognitiveLearningRequest,
+)
 from kernel.core import SH3Kernel
 
 NOW = datetime(2026, 10, 6, 0, 0, tzinfo=UTC)
@@ -71,6 +74,30 @@ def test_request_is_deterministic_and_extracts_cognitive_result() -> None:
     assert first.request_id == second.request_id
     assert first.learning["memory_key"] == "memory:11-5"
     assert learning.calls == 1
+
+
+def test_request_identity_is_scoped_to_propagation_context() -> None:
+    result = _result()
+    first_context = _context()
+    second_context = EventPropagationContext.create(
+        correlation_id="corr:11-5-other",
+        causation_id="result:11-5-other",
+        trace_id="trace:11-5-other",
+        tenant_id="tenant:11-5-other",
+    )
+
+    first = CognitiveLearningRequest.from_result(
+        result, context=first_context, created_at=NOW
+    )
+    replay = CognitiveLearningRequest.from_result(
+        result, context=first_context, created_at=NOW
+    )
+    other_trace = CognitiveLearningRequest.from_result(
+        result, context=second_context, created_at=NOW
+    )
+
+    assert first.request_id == replay.request_id
+    assert first.request_id != other_trace.request_id
 
 
 def test_direct_execution_uses_learning_backend_without_event_bus() -> None:

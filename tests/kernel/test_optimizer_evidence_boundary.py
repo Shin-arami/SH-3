@@ -81,6 +81,8 @@ def test_non_material_update_does_not_create_evidence() -> None:
     update = kernel.optimizer_update_boundary.request(optimization, context=_context(), created_at=NOW)
 
     outcome = kernel.optimizer_evidence_boundary.record(update, context=_context(), created_at=NOW)
+    replay = kernel.optimizer_evidence_boundary.record(update, context=_context(), created_at=NOW)
+    assert outcome is replay
     assert outcome is not None
     assert outcome.recorded is False
     assert outcome.evidence is None

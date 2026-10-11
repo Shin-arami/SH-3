@@ -120,6 +120,10 @@ class OptimizerHealingRequest:
                 "learning_optimization_request_id": result.request_id,
                 "optimizer_id": result.optimizer_id,
                 "learning_record_id": result.learning_record_id,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
             },
             prefix="optimizer-healing:",
         )

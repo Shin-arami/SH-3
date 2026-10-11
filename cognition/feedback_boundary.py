@@ -4,7 +4,8 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from threading import RLock
+from threading import Event as ThreadEvent
+from threading import RLock, get_ident
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -83,7 +84,14 @@ class CognitiveFeedbackRequest:
         if not isinstance(context, EventPropagationContext):
             raise TypeError("context must be EventPropagationContext")
         request_id = short_id(
-            {"feedback_id": feedback.feedback_id, "cycle_id": feedback.cycle_id},
+            {
+                "feedback_id": feedback.feedback_id,
+                "cycle_id": feedback.cycle_id,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
+            },
             prefix="cognitive-feedback:",
         )
         return cls(
@@ -208,7 +216,7 @@ class CognitiveFeedbackResult:
 
 
 class CognitiveFeedbackBoundary:
-    __slots__ = ("_event_bus", "_event_publisher", "_last_context", "_lock", "_pending_requests", "_results", "_started", "_subscriber_id", "cognition")
+    __slots__ = ("_event_bus", "_event_publisher", "_inflight", "_last_context", "_lock", "_pending_requests", "_results", "_started", "_subscriber_id", "cognition")
 
     def __init__(
         self,
@@ -229,6 +237,7 @@ class CognitiveFeedbackBoundary:
         self._last_context: EventPropagationContext | None = None
         self._lock = RLock()
         self._pending_requests: set[str] = set()
+        self._inflight: dict[str, tuple[ThreadEvent, int, bool]] = {}
         self._results: dict[str, CognitiveFeedbackResult] = {}
         self._started = False
         self._subscriber_id = _text("subscriber_id", subscriber_id)
@@ -272,18 +281,49 @@ class CognitiveFeedbackBoundary:
         context: EventPropagationContext,
         created_at: datetime | None = None,
     ) -> CognitiveFeedbackResult:
-        request = CognitiveFeedbackRequest.from_feedback(feedback, context=context, created_at=created_at)
+        request = CognitiveFeedbackRequest.from_feedback(
+            feedback,
+            context=context,
+            created_at=created_at,
+        )
+        current_thread = get_ident()
         with self._lock:
             existing = self._results.get(request.request_id)
             publisher = self._event_publisher
             event_bus = self._event_bus
-        if existing is not None:
-            return existing
-        if publisher is None or event_bus is None:
-            return self._execute(request, context)
-        with self._lock:
-            self._pending_requests.add(request.request_id)
+            inflight = self._inflight.get(request.request_id)
+            if inflight is not None:
+                waiter, owner_thread, _executing = inflight
+                if owner_thread == current_thread:
+                    raise RuntimeError(
+                        f"feedback request re-entry detected: {request.request_id}"
+                    )
+                leader = False
+            elif existing is not None:
+                return existing
+            else:
+                waiter = ThreadEvent()
+                self._inflight[request.request_id] = (
+                    waiter,
+                    current_thread,
+                    False,
+                )
+                if publisher is not None and event_bus is not None:
+                    self._pending_requests.add(request.request_id)
+                leader = True
+
+        if not leader:
+            waiter.wait()
+            resolved = self.get(request.request_id)
+            if resolved is None:
+                raise RuntimeError(
+                    f"feedback result not produced: {request.request_id}"
+                )
+            return resolved
+
         try:
+            if publisher is None or event_bus is None:
+                return self._execute(request, context)
             request_context = self._publish(
                 "CognitiveFeedbackRequested",
                 EventType.START,
@@ -294,6 +334,10 @@ class CognitiveFeedbackBoundary:
         finally:
             with self._lock:
                 self._pending_requests.discard(request.request_id)
+                current = self._inflight.get(request.request_id)
+                if current is not None and current[0] is waiter:
+                    self._inflight.pop(request.request_id, None)
+                    waiter.set()
 
     def _configure(self) -> None:
         publisher = self._event_publisher
@@ -335,7 +379,68 @@ class CognitiveFeedbackBoundary:
         except Exception as exc:
             error("Cognitive feedback boundary event handling failed", {"error": str(exc)})
 
-    def _execute(self, request: CognitiveFeedbackRequest, context: EventPropagationContext) -> CognitiveFeedbackResult:
+    def _execute(
+        self,
+        request: CognitiveFeedbackRequest,
+        context: EventPropagationContext,
+    ) -> CognitiveFeedbackResult:
+        current_thread = get_ident()
+        with self._lock:
+            existing = self._results.get(request.request_id)
+            inflight = self._inflight.get(request.request_id)
+            if inflight is None:
+                if existing is not None:
+                    return existing
+                waiter = ThreadEvent()
+                self._inflight[request.request_id] = (
+                    waiter,
+                    current_thread,
+                    True,
+                )
+                owns_reservation = True
+                leader = True
+            else:
+                waiter, owner_thread, executing = inflight
+                if owner_thread == current_thread:
+                    if executing:
+                        raise RuntimeError(
+                            f"feedback request re-entry detected: {request.request_id}"
+                        )
+                    self._inflight[request.request_id] = (
+                        waiter,
+                        owner_thread,
+                        True,
+                    )
+                    owns_reservation = False
+                    leader = True
+                else:
+                    owns_reservation = False
+                    leader = False
+
+        if not leader:
+            waiter.wait()
+            resolved = self.get(request.request_id)
+            if resolved is None:
+                raise RuntimeError(
+                    f"feedback result not produced: {request.request_id}"
+                )
+            return resolved
+
+        try:
+            return self._execute_once(request, context)
+        finally:
+            if owns_reservation:
+                with self._lock:
+                    current = self._inflight.get(request.request_id)
+                    if current is not None and current[0] is waiter:
+                        self._inflight.pop(request.request_id, None)
+                        waiter.set()
+
+    def _execute_once(
+        self,
+        request: CognitiveFeedbackRequest,
+        context: EventPropagationContext,
+    ) -> CognitiveFeedbackResult:
         with self._lock:
             existing = self._results.get(request.request_id)
             if existing is not None:

@@ -232,7 +232,14 @@ class RecoveryStrategyBoundary:
         if not candidates:
             raise ValueError("strategy candidates must not be empty")
         request_id = short_id(
-            {"failure_id": snapshot.trace_id, "candidates": candidates},
+            {
+                "failure_id": snapshot.trace_id,
+                "candidates": candidates,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
+            },
             prefix="recovery-strategy:",
         )
         with self._lock:
