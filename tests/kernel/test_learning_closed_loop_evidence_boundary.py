@@ -16,7 +16,8 @@ from cognition.contracts import (
 )
 from foundation.Enums.category import Category
 from foundation.Enums.event import EventType
-from foundation.version import EVENT_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION
+from foundation.utils.hash import short_id
+from foundation.version import EVENT_SCHEMA_VERSION, LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION
 from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
 from infrastructure.events.catalog import CanonicalEventCatalog
@@ -91,7 +92,7 @@ def test_successful_cycle_records_integrity_protected_terminal_evidence() -> Non
     assert outcome.evidence.kind == "learning.closed_loop"
     assert outcome.evidence.source == "kernel.learning_feedback_loop"
     assert outcome.evidence.subject_id == report.result_id
-    assert outcome.evidence.version == EVIDENCE_SCHEMA_VERSION
+    assert outcome.evidence.version == LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION
     assert outcome.evidence.payload["event_schema_version"] == EVENT_SCHEMA_VERSION
     assert outcome.evidence.payload["status"] == ClosedLoopStatus.COMPLETED.value
     assert outcome.evidence.payload["cycle_success"] is True
@@ -681,3 +682,112 @@ def test_closed_loop_evidence_does_not_link_optimization_records_across_tenants(
     assert outcome.evidence.payload["related_optimization_evidence_ids"] == [
         "optimization:tenant-a"
     ]
+
+
+def test_cross_coordinator_replay_restores_report_from_shared_evidence_store() -> None:
+    first_kernel = SH3Kernel()
+    result = _result("result:cross-coordinator-replay")
+    first_report = first_kernel.learning_feedback_loop.run(
+        result,
+        optimize=False,
+        recover=True,
+    )
+    store = first_kernel.learning_closed_loop_evidence_boundary.evidence_store
+    first_evidence = first_kernel.learning_closed_loop_evidence_boundary.get(
+        first_report.cycle_id
+    )
+    assert first_evidence is not None and first_evidence.recorded
+    assert (
+        first_evidence.evidence is not None
+        and first_evidence.evidence.version == LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION
+    )
+
+    second_kernel = SH3Kernel()
+    second_boundary = LearningClosedLoopEvidenceBoundary(store)
+    second_coordinator = LearningClosedLoopCoordinator(
+        second_kernel,
+        closed_loop_evidence_boundary=second_boundary,
+    )
+    restored = second_coordinator.run(
+        result,
+        optimize=False,
+        recover=True,
+    )
+
+    assert restored.to_dict() == first_report.to_dict()
+    assert second_coordinator.records() == (restored,)
+    assert second_kernel.learning_loop.records() == ()
+    restored_evidence = second_boundary.get(restored.cycle_id)
+    assert restored_evidence is not None and restored_evidence.recorded
+    assert restored_evidence.evidence == first_evidence.evidence
+    assert sum(
+        record.kind == "learning.closed_loop"
+        and record.payload.get("cycle_id") == restored.cycle_id
+        for record in store.records()
+    ) == 1
+
+    with pytest.raises(ValueError, match="options conflict"):
+        second_coordinator.run(result, optimize=True, recover=True)
+    mismatched_context = EventPropagationContext.create(
+        correlation_id=result.correlation_id,
+        causation_id=result.result_id,
+        trace_id=result.trace_id,
+        tenant_id="tenant:cross-instance-mismatch",
+    )
+    with pytest.raises(ValueError, match="propagation context conflicts"):
+        second_coordinator.run(
+            result,
+            optimize=False,
+            recover=True,
+            context=mismatched_context,
+        )
+    assert second_kernel.learning_loop.records() == ()
+
+
+def test_cross_coordinator_replay_fails_closed_for_evidence_missing_replay_options() -> None:
+    result = _result("result:legacy-evidence-no-options")
+    cycle_id = f"learning-cycle:{result.result_id}"
+    evidence_id = short_id(cycle_id, prefix="learning-closed-loop:")
+    store = EvidenceStore()
+    legacy_record = EvidenceRecord.create(
+        evidence_id=evidence_id,
+        kind="learning.closed_loop",
+        source="kernel.learning_feedback_loop",
+        subject_id=result.result_id,
+        version=LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION,
+        trace_id=result.trace_id,
+        collected_at=NOW.isoformat(),
+        payload={
+            "cycle_id": cycle_id,
+            "result_id": result.result_id,
+            "goal_id": result.goal_id,
+            "status": ClosedLoopStatus.COMPLETED.value,
+            "cycle_success": True,
+            "fully_successful": True,
+            "recovered": False,
+            "learning_result": {},
+            "optimization_result": None,
+            "healing_result": None,
+            "feedback": [],
+            "failure_detail": {},
+            "success_semantics": {},
+            "related_optimization_evidence_ids": [],
+            "event_schema_version": EVENT_SCHEMA_VERSION,
+            "correlation_id": result.correlation_id,
+            "causation_id": result.causation_id,
+            "trace_id": result.trace_id,
+            "tenant_id": result.tenant_id,
+        },
+    )
+    store.register(legacy_record)
+    kernel = SH3Kernel()
+    coordinator = LearningClosedLoopCoordinator(
+        kernel,
+        closed_loop_evidence_boundary=LearningClosedLoopEvidenceBoundary(store),
+    )
+
+    with pytest.raises(ValueError, match="cycle_options"):
+        coordinator.run(result, optimize=False)
+
+    assert kernel.learning_loop.records() == ()
+    assert coordinator.records() == ()

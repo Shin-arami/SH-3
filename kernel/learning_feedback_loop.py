@@ -55,6 +55,8 @@ class LearningClosedLoopReport:
     healing_result: Any = None
     feedback: tuple[CognitiveFeedback, ...] = ()
     failure_detail: Mapping[str, str] = field(default_factory=dict)
+    optimize: bool = True
+    recover: bool = True
 
     def __post_init__(self) -> None:
         for name, value in (("cycle_id", self.cycle_id), ("result_id", self.result_id), ("goal_id", self.goal_id), ("correlation_id", self.correlation_id)):
@@ -62,6 +64,10 @@ class LearningClosedLoopReport:
                 raise ValueError(f"{name} must not be empty")
         if not isinstance(self.status, ClosedLoopStatus):
             raise TypeError("status must be ClosedLoopStatus")
+        if not isinstance(self.optimize, bool):
+            raise TypeError("optimize must be bool")
+        if not isinstance(self.recover, bool):
+            raise TypeError("recover must be bool")
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ValueError("created_at must be timezone-aware")
         for field_name, field_value in (("causation_id", self.causation_id), ("trace_id", self.trace_id), ("tenant_id", self.tenant_id)):
@@ -103,6 +109,8 @@ class LearningClosedLoopReport:
             "healing_result": self.healing_result,
             "feedback": [item.to_dict() for item in self.feedback],
             "failure_detail": dict(self.failure_detail),
+            "optimize": self.optimize,
+            "recover": self.recover,
         }
 
 
@@ -315,6 +323,7 @@ class LearningClosedLoopCoordinator:
         convergence_failure_detail: dict[str, str] | None = None
         next_partial_count = 0
         existing_report: LearningClosedLoopReport | None = None
+        restored_from_store = False
 
         with self._lock:
             configured_options = self._cycle_options.get(cycle_id)
@@ -334,67 +343,116 @@ class LearningClosedLoopCoordinator:
                     )
                 leader = False
             elif existing is not None:
+                if context is not None and (
+                    existing.correlation_id != context.correlation_id
+                    or existing.trace_id != context.trace_id
+                    or existing.tenant_id != context.tenant_id
+                ):
+                    raise ValueError(
+                        f"closed-loop propagation context conflicts for {cycle_id}"
+                    )
                 existing_report = existing
                 leader = False
             else:
-                previous_state = self._goal_lifecycle_states.get(result.goal_id)
-                if previous_state in (
-                    CognitiveLifecycleState.COMPLETED,
-                    CognitiveLifecycleState.FAILED,
-                    CognitiveLifecycleState.TERMINATED,
-                ):
-                    raise ValueError(
-                        "closed-loop goal is already in a terminal lifecycle state: "
-                        f"goal_id={result.goal_id}, state={previous_state.value}"
+                persisted_report = self._closed_loop_evidence_boundary.restore_report(cycle_id)
+                if persisted_report is not None:
+                    if (
+                        persisted_report.result_id != result.result_id
+                        or persisted_report.goal_id != result.goal_id
+                    ):
+                        raise ValueError(
+                            f"persisted closed-loop identity conflicts for {cycle_id}"
+                        )
+                    requested_context = context or EventPropagationContext.create(
+                        correlation_id=result.correlation_id,
+                        causation_id=result.result_id,
+                        trace_id=result.trace_id,
+                        tenant_id=result.tenant_id,
                     )
+                    if (
+                        persisted_report.correlation_id != requested_context.correlation_id
+                        or persisted_report.trace_id != requested_context.trace_id
+                        or persisted_report.tenant_id != requested_context.tenant_id
+                    ):
+                        raise ValueError(
+                            f"persisted closed-loop propagation context conflicts for {cycle_id}"
+                        )
+                    if (persisted_report.optimize, persisted_report.recover) != options:
+                        raise ValueError(
+                            f"closed-loop cycle options conflict for {cycle_id}: "
+                            f"requested={options!r}, "
+                            f"established={(persisted_report.optimize, persisted_report.recover)!r}"
+                        )
+                    existing_report = persisted_report
+                    restored_from_store = True
+                    self._cycles[cycle_id] = persisted_report
+                    self._cycle_options[cycle_id] = options
+                    self._goal_lifecycle_states[result.goal_id] = (
+                        CognitiveLifecycleState.FAILED
+                        if persisted_report.status is ClosedLoopStatus.FAILED
+                        else result.lifecycle_state
+                    )
+                    leader = False
+                else:
+                    previous_state = self._goal_lifecycle_states.get(result.goal_id)
+                    if previous_state in (
+                        CognitiveLifecycleState.COMPLETED,
+                        CognitiveLifecycleState.FAILED,
+                        CognitiveLifecycleState.TERMINATED,
+                    ):
+                        raise ValueError(
+                            "closed-loop goal is already in a terminal lifecycle state: "
+                            f"goal_id={result.goal_id}, state={previous_state.value}"
+                        )
 
-                goal_inflight = self._goal_inflight.get(result.goal_id)
-                if goal_inflight is not None:
-                    active_cycle_id, owner_thread = goal_inflight
-                    if owner_thread == current_thread:
+                    goal_inflight = self._goal_inflight.get(result.goal_id)
+                    if goal_inflight is not None:
+                        active_cycle_id, owner_thread = goal_inflight
+                        if owner_thread == current_thread:
+                            raise RuntimeError(
+                                "closed-loop goal re-entry detected: "
+                                f"{result.goal_id} ({active_cycle_id})"
+                            )
                         raise RuntimeError(
-                            "closed-loop goal re-entry detected: "
+                            "closed-loop goal already has an in-flight cycle: "
                             f"{result.goal_id} ({active_cycle_id})"
                         )
-                    raise RuntimeError(
-                        "closed-loop goal already has an in-flight cycle: "
-                        f"{result.goal_id} ({active_cycle_id})"
-                    )
 
-                next_partial_count = self._goal_partial_counts.get(
-                    result.goal_id,
-                    0,
-                )
-                if result.status is CognitiveResultStatus.PARTIAL:
-                    next_partial_count += 1
-                    if next_partial_count >= self._max_partial_cycles:
-                        convergence_error = (
-                            f"maximum partial cycles reached for goal "
-                            f"{result.goal_id}: "
-                            f"{next_partial_count}/{self._max_partial_cycles}"
+                    next_partial_count = self._goal_partial_counts.get(
+                        result.goal_id,
+                        0,
+                    )
+                    if result.status is CognitiveResultStatus.PARTIAL:
+                        next_partial_count += 1
+                        if next_partial_count >= self._max_partial_cycles:
+                            convergence_error = (
+                                f"maximum partial cycles reached for goal "
+                                f"{result.goal_id}: "
+                                f"{next_partial_count}/{self._max_partial_cycles}"
+                            )
+                            convergence_failure_detail = {
+                                "failure_kind": "convergence_limit",
+                                "convergence_error_type": (
+                                    "ClosedLoopConvergenceLimitError"
+                                ),
+                                "convergence_error": convergence_error,
+                                "partial_cycles": str(next_partial_count),
+                                "max_partial_cycles": str(self._max_partial_cycles),
+                            }
+
+                    waiter = ThreadEvent()
+                    self._inflight[cycle_id] = (waiter, current_thread)
+                    self._goal_inflight[result.goal_id] = (cycle_id, current_thread)
+                    self._cycle_options[cycle_id] = options
+                    if convergence_failure_detail is not None:
+                        self._cycle_failure_details[cycle_id] = (
+                            convergence_failure_detail
                         )
-                        convergence_failure_detail = {
-                            "failure_kind": "convergence_limit",
-                            "convergence_error_type": (
-                                "ClosedLoopConvergenceLimitError"
-                            ),
-                            "convergence_error": convergence_error,
-                            "partial_cycles": str(next_partial_count),
-                            "max_partial_cycles": str(self._max_partial_cycles),
-                        }
-
-                waiter = ThreadEvent()
-                self._inflight[cycle_id] = (waiter, current_thread)
-                self._goal_inflight[result.goal_id] = (cycle_id, current_thread)
-                self._cycle_options[cycle_id] = options
-                if convergence_failure_detail is not None:
-                    self._cycle_failure_details[cycle_id] = (
-                        convergence_failure_detail
-                    )
-                leader = True
+                    leader = True
 
         if existing_report is not None:
-            self._retry_finalization(existing_report)
+            if not restored_from_store:
+                self._retry_finalization(existing_report)
             return existing_report
 
         if not leader:
@@ -766,6 +824,8 @@ class LearningClosedLoopCoordinator:
             healing_result=healing_result,
             feedback=tuple(feedback),
             failure_detail=failure_detail,
+            optimize=optimize,
+            recover=recover,
         )
         with self._lock:
             self._cycles[cycle_id] = report

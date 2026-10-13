@@ -8,12 +8,12 @@ from threading import RLock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-from cognition.feedback import CognitiveFeedbackKind
+from cognition.feedback import CognitiveFeedback, CognitiveFeedbackKind
 from foundation.Enums.category import Category
 from foundation.Enums.event import EventType
 from foundation.utils.hash import short_id
 from foundation.utils.logging import error
-from foundation.version import EVENT_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION
+from foundation.version import EVENT_SCHEMA_VERSION, LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION
 from infrastructure.event_bus import EventPublisher
 from infrastructure.events import Event, EventPropagationContext
 from infrastructure.security import EvidenceRecord, EvidenceStore
@@ -133,8 +133,124 @@ class LearningClosedLoopEvidenceBoundary:
             return tuple(self._results.values())
 
     def get(self, cycle_id: str) -> LearningClosedLoopEvidenceResult | None:
+        _text("cycle_id", cycle_id)
         with self._lock:
-            return self._results.get(cycle_id)
+            existing = self._results.get(cycle_id)
+            if existing is not None:
+                return existing
+        report = self.restore_report(cycle_id)
+        if report is None:
+            return None
+        record = self._store.get(short_id(cycle_id, prefix="learning-closed-loop:"))
+        if record is None:
+            return None
+        outcome = LearningClosedLoopEvidenceResult(
+            cycle_id=cycle_id,
+            recorded=True,
+            evidence=record,
+            created_at=datetime.fromisoformat(record.collected_at),
+            correlation_id=report.correlation_id,
+            causation_id=report.causation_id,
+            trace_id=report.trace_id,
+            tenant_id=report.tenant_id,
+            metadata={
+                "status": report.status.value,
+                "related_optimization_evidence": len(
+                    record.payload.get("related_optimization_evidence_ids", ())
+                ),
+                "restored_from_store": True,
+            },
+        )
+        with self._lock:
+            existing = self._results.setdefault(cycle_id, outcome)
+            return existing
+
+    def restore_report(self, cycle_id: str) -> LearningClosedLoopReport | None:
+        """Restore a completed report from a verified, shared evidence store.
+
+        EvidenceStore is process-local unless an external persistence adapter keeps
+        the same records available. Missing replay metadata fails closed rather than
+        silently executing a cycle whose prior outcome cannot be reconstructed.
+        """
+        from kernel.learning_feedback_loop import ClosedLoopStatus, LearningClosedLoopReport
+
+        _text("cycle_id", cycle_id)
+        record = self._store.get(short_id(cycle_id, prefix="learning-closed-loop:"))
+        if record is None:
+            return None
+        if not record.verify():
+            raise ValueError(f"persisted closed-loop evidence integrity failed: {cycle_id}")
+        if record.kind != "learning.closed_loop" or record.source != "kernel.learning_feedback_loop":
+            raise ValueError(f"persisted evidence does not identify a closed-loop report: {cycle_id}")
+        if record.version != LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported persisted closed-loop evidence version for {cycle_id}: {record.version}"
+            )
+        payload = record.payload
+        if payload.get("cycle_id") != cycle_id:
+            raise ValueError(f"persisted closed-loop cycle identity mismatch: {cycle_id}")
+        options = payload.get("cycle_options")
+        if not isinstance(options, Mapping) or not isinstance(options.get("optimize"), bool) or not isinstance(options.get("recover"), bool):
+            raise ValueError(
+                f"persisted closed-loop evidence is missing valid cycle_options: {cycle_id}; refusing to re-execute"
+            )
+        status_value = payload.get("status")
+        try:
+            status = ClosedLoopStatus(_text("status", status_value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"persisted closed-loop status is invalid: {cycle_id}") from exc
+        if payload.get("cycle_success") is not (status is not ClosedLoopStatus.FAILED):
+            raise ValueError(f"persisted closed-loop cycle_success is inconsistent: {cycle_id}")
+        if payload.get("fully_successful") is not (status is ClosedLoopStatus.COMPLETED):
+            raise ValueError(f"persisted closed-loop fully_successful is inconsistent: {cycle_id}")
+        if payload.get("recovered") is not (status is ClosedLoopStatus.RECOVERED):
+            raise ValueError(f"persisted closed-loop recovered is inconsistent: {cycle_id}")
+        feedback_data = payload.get("feedback")
+        if not isinstance(feedback_data, (list, tuple)):
+            raise ValueError(f"persisted closed-loop feedback is invalid: {cycle_id}")
+        try:
+            feedback = tuple(
+                CognitiveFeedback.from_dict(item)
+                for item in feedback_data
+                if isinstance(item, Mapping)
+            )
+            if len(feedback) != len(feedback_data):
+                raise ValueError("feedback entry is not a mapping")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError(f"persisted closed-loop feedback cannot be restored: {cycle_id}") from exc
+        learning_result = payload.get("learning_result")
+        optimization_result = payload.get("optimization_result")
+        failure_detail = payload.get("failure_detail", {})
+        if not isinstance(learning_result, Mapping):
+            raise ValueError(f"persisted learning_result is invalid: {cycle_id}")
+        if optimization_result is not None and not isinstance(optimization_result, Mapping):
+            raise ValueError(f"persisted optimization_result is invalid: {cycle_id}")
+        if not isinstance(failure_detail, Mapping):
+            raise ValueError(f"persisted failure_detail is invalid: {cycle_id}")
+        if record.subject_id != payload.get("result_id"):
+            raise ValueError(f"persisted closed-loop subject identity mismatch: {cycle_id}")
+        try:
+            created_at = datetime.fromisoformat(record.collected_at)
+        except ValueError as exc:
+            raise ValueError(f"persisted closed-loop timestamp is invalid: {cycle_id}") from exc
+        return LearningClosedLoopReport(
+            cycle_id=cycle_id,
+            result_id=_text("result_id", payload.get("result_id")),
+            goal_id=_text("goal_id", payload.get("goal_id")),
+            status=status,
+            created_at=created_at,
+            correlation_id=_text("correlation_id", payload.get("correlation_id")),
+            causation_id=payload.get("causation_id"),
+            trace_id=payload.get("trace_id"),
+            tenant_id=payload.get("tenant_id"),
+            learning_result=learning_result,
+            optimization_result=optimization_result,
+            healing_result=payload.get("healing_result"),
+            feedback=feedback,
+            failure_detail=failure_detail,
+            optimize=options["optimize"],
+            recover=options["recover"],
+        )
 
     def set_event_publisher(self, publisher: EventPublisher | None) -> None:
         if publisher is not None and not isinstance(publisher, EventPublisher):
@@ -338,6 +454,7 @@ class LearningClosedLoopEvidenceBoundary:
             "healing_result": report.healing_result,
             "feedback": [item.to_dict() for item in feedback],
             "failure_detail": dict(report.failure_detail),
+            "cycle_options": {"optimize": report.optimize, "recover": report.recover},
             "success_semantics": {
                 "learning": None if learning is None else learning.success,
                 "optimization": None if optimization is None else optimization.success,
@@ -356,7 +473,7 @@ class LearningClosedLoopEvidenceBoundary:
             kind="learning.closed_loop",
             source="kernel.learning_feedback_loop",
             subject_id=report.result_id,
-            version=EVIDENCE_SCHEMA_VERSION,
+            version=LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION,
             trace_id=context.trace_id,
             collected_at=created_at.isoformat(),
             payload=payload,
