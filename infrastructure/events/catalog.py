@@ -703,7 +703,16 @@ CANONICAL_EVENT_DEFINITIONS: Final[
         EventType.FAILURE,
         "learning.closed-loop",
         ("cycle_id", "result_id", "success", "status"),
-        ("error_type", "error"),
+        (
+            "error_type",
+            "error",
+            "evidence_error",
+            "evidence_error_type",
+            "evidence_failure_kind",
+            "reconciliation_reason",
+            "reconciles_terminal_status",
+            "reconciles_terminal_event_id",
+        ),
     ),
     _definition(
         "LearningClosedLoopEvidenceRecorded",

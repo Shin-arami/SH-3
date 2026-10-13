@@ -815,6 +815,12 @@ class LearningClosedLoopCoordinator:
             "status": ClosedLoopStatus.FAILED.value,
         }
         failure_payload.update(failure_detail)
+        failure_payload["reconciliation_reason"] = "evidence_persistence"
+        failure_payload["reconciles_terminal_status"] = report.status.value
+        if propagation.causation_id is not None:
+            failure_payload["reconciles_terminal_event_id"] = (
+                propagation.causation_id
+            )
         failure_context = self._publish(
             "LearningClosedLoopFailed",
             EventType.FAILURE,

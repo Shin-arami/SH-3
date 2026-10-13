@@ -430,6 +430,107 @@ def test_evidence_write_failure_marks_cycle_failed_and_retries_without_reexecuti
     assert len(store.records()) == 1
 
 
+def test_terminal_state_reconciliation_is_explicit_and_replay_safe() -> None:
+    class FailThreeTimesEvidenceStore(EvidenceStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def register(self, record: EvidenceRecord) -> EvidenceRecord:
+            self.calls += 1
+            if self.calls <= 3:
+                raise ValueError("temporary evidence store failure")
+            return super().register(record)
+
+    bus = EventBus()
+    publisher = EventBusPublisher(bus)
+    events: list[Event] = []
+    bus.subscribe(
+        EventSubscription(
+            subscriber_id="terminal-state-reconciliation-audit",
+            handler=events.append,
+            priority=-100,
+        )
+    )
+    store = FailThreeTimesEvidenceStore()
+    evidence_boundary = LearningClosedLoopEvidenceBoundary(store, publisher)
+    coordinator = LearningClosedLoopCoordinator(
+        SH3Kernel(),
+        event_publisher=publisher,
+        closed_loop_evidence_boundary=evidence_boundary,
+    )
+    result = _result("result:terminal-state-reconciliation")
+
+    first = coordinator.run(result, optimize=False)
+
+    terminal_events = tuple(
+        event
+        for event in events
+        if event.name in {"LearningClosedLoopCompleted", "LearningClosedLoopFailed"}
+        and event.payload.get("cycle_id") == first.cycle_id
+    )
+    assert len(terminal_events) == 2
+    provisional, reconciled = terminal_events
+    assert provisional.name == "LearningClosedLoopCompleted"
+    assert provisional.payload["status"] == ClosedLoopStatus.COMPLETED.value
+    assert reconciled.name == "LearningClosedLoopFailed"
+    assert reconciled.payload["status"] == ClosedLoopStatus.FAILED.value
+    assert reconciled.payload["success"] is False
+    assert reconciled.payload["reconciliation_reason"] == "evidence_persistence"
+    assert (
+        reconciled.payload["reconciles_terminal_status"]
+        == provisional.payload["status"]
+    )
+    assert (
+        reconciled.payload["reconciles_terminal_event_id"]
+        == provisional.metadata.event_id
+    )
+    assert reconciled.causation_id == provisional.metadata.event_id
+    CanonicalEventCatalog().validate(reconciled)
+
+    assert first.status is ClosedLoopStatus.FAILED
+    assert store.calls == 3
+    pending = evidence_boundary.get(first.cycle_id)
+    assert pending is not None and not pending.recorded
+    assert pending.metadata["status"] == ClosedLoopStatus.FAILED.value
+
+    second = coordinator.run(result, optimize=False)
+    third = coordinator.run(result, optimize=False)
+
+    assert second is first and third is first
+    assert first.status is ClosedLoopStatus.FAILED
+    assert store.calls == 4
+    recorded = evidence_boundary.get(first.cycle_id)
+    assert recorded is not None and recorded.recorded and recorded.evidence is not None
+    evidence = recorded.evidence
+    assert evidence.payload["status"] == first.status.value
+    assert evidence.payload["cycle_success"] is False
+    assert evidence.payload["fully_successful"] is False
+    assert evidence.payload["failure_detail"]["evidence_error"] == (
+        "temporary evidence store failure"
+    )
+    assert evidence.verify()
+    assert store.get(evidence.evidence_id) == evidence
+    assert len(store.records()) == 1
+
+    terminal_events_after_replay = tuple(
+        event
+        for event in events
+        if event.name in {"LearningClosedLoopCompleted", "LearningClosedLoopFailed"}
+        and event.payload.get("cycle_id") == first.cycle_id
+    )
+    evidence_recorded_events = tuple(
+        event
+        for event in events
+        if event.name == "LearningClosedLoopEvidenceRecorded"
+        and event.payload.get("cycle_id") == first.cycle_id
+    )
+    assert terminal_events_after_replay == terminal_events
+    assert len(evidence_recorded_events) == 1
+    assert evidence_recorded_events[0].payload["status"] == first.status.value
+    assert evidence_recorded_events[0].payload["success"] is False
+
+
 def test_evidence_failure_is_reported_as_typed_boundary_result() -> None:
     class FailingEvidenceStore(EvidenceStore):
         def register(self, record: EvidenceRecord) -> EvidenceRecord:

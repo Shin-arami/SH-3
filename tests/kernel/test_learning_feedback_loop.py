@@ -97,6 +97,72 @@ def test_closed_loop_is_idempotent_for_same_result() -> None:
     assert kernel.learning_feedback_loop.records() == (first,)
 
 
+def test_terminal_state_replay_keeps_report_event_and_evidence_consistent() -> None:
+    bus = EventBus()
+    publisher = EventBusPublisher(bus)
+    events: list[Event] = []
+    bus.subscribe(
+        EventSubscription(
+            subscriber_id="terminal-state-replay-audit",
+            handler=events.append,
+            priority=-100,
+        )
+    )
+    kernel = SH3Kernel(event_publisher=publisher)
+    result = _result(result_id="result:terminal-replay-safety")
+
+    first = kernel.learning_feedback_loop.run(result, optimize=False)
+    initial_terminal_count = sum(
+        event.name in {"LearningClosedLoopCompleted", "LearningClosedLoopFailed"}
+        and event.payload.get("cycle_id") == first.cycle_id
+        for event in events
+    )
+    initial_evidence_event_count = sum(
+        event.name == "LearningClosedLoopEvidenceRecorded"
+        and event.payload.get("cycle_id") == first.cycle_id
+        for event in events
+    )
+    second = kernel.learning_feedback_loop.run(result, optimize=False)
+
+    assert second is first
+    assert len(kernel.learning_feedback_loop.records()) == 1
+    terminal_events = tuple(
+        event
+        for event in events
+        if event.name in {"LearningClosedLoopCompleted", "LearningClosedLoopFailed"}
+        and event.payload.get("cycle_id") == first.cycle_id
+    )
+    evidence_events = tuple(
+        event
+        for event in events
+        if event.name == "LearningClosedLoopEvidenceRecorded"
+        and event.payload.get("cycle_id") == first.cycle_id
+    )
+    assert initial_terminal_count == len(terminal_events) == 1
+    assert initial_evidence_event_count == len(evidence_events) == 1
+    assert terminal_events[0].payload["status"] == first.status.value
+    assert terminal_events[0].payload["success"] is (
+        first.status is not ClosedLoopStatus.FAILED
+    )
+
+    outcome = kernel.learning_closed_loop_evidence_boundary.get(first.cycle_id)
+    assert outcome is not None and outcome.recorded and outcome.evidence is not None
+    evidence = outcome.evidence
+    assert evidence.payload["status"] == first.status.value
+    assert evidence.payload["cycle_success"] is (
+        first.status is not ClosedLoopStatus.FAILED
+    )
+    assert evidence.payload["fully_successful"] is (
+        first.status is ClosedLoopStatus.COMPLETED
+    )
+    assert evidence.verify()
+    assert sum(
+        record.kind == "learning.closed_loop"
+        and record.payload.get("cycle_id") == first.cycle_id
+        for record in kernel.learning_closed_loop_evidence_boundary.evidence_store.records()
+    ) == 1
+
+
 def test_closed_loop_without_optimization_preserves_learning_feedback() -> None:
     kernel = SH3Kernel()
     report = kernel.learning_feedback_loop.run(_result(), optimize=False)
