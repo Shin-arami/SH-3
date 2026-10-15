@@ -154,6 +154,7 @@ def test_expired_replay_claim_is_fenced_and_completed_claim_is_durable(
         second.owner_token,
         second.generation,
         "learning-closed-loop:terminal",
+        now=instant + timedelta(seconds=7),
     )
     reopened = SQLiteReplayClaimStore(database).claim(
         "learning-cycle:recover",
@@ -163,6 +164,156 @@ def test_expired_replay_claim_is_fenced_and_completed_claim_is_durable(
 
     assert reopened.status is ReplayClaimStatus.COMPLETED
     assert reopened.evidence_id == "learning-closed-loop:terminal"
+
+
+
+def test_replay_claim_lease_renewal_extends_deadline_without_changing_generation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "evidence.sqlite3"
+    instant = datetime(2026, 10, 14, tzinfo=UTC)
+    owner_store = SQLiteReplayClaimStore(database)
+    owner = owner_store.claim(
+        "learning-cycle:renew",
+        "sha256:renew-input",
+        lease_seconds=5.0,
+        now=instant,
+    )
+    assert owner.owner_token is not None
+
+    renewed = owner_store.renew(
+        owner.cycle_id,
+        owner.fingerprint,
+        owner.owner_token,
+        owner.generation,
+        lease_seconds=10.0,
+        now=instant + timedelta(seconds=4),
+    )
+    assert renewed.generation == owner.generation
+    assert renewed.attempts == owner.attempts
+    assert renewed.lease_expires_at == instant.timestamp() + 14.0
+    unchanged_deadline = owner_store.renew(
+        owner.cycle_id,
+        owner.fingerprint,
+        owner.owner_token,
+        owner.generation,
+        lease_seconds=2.0,
+        now=instant + timedelta(seconds=5),
+    )
+    assert unchanged_deadline.lease_expires_at == renewed.lease_expires_at
+
+    contender_store = SQLiteReplayClaimStore(database)
+    contender = contender_store.claim(
+        owner.cycle_id,
+        owner.fingerprint,
+        now=instant + timedelta(seconds=6),
+    )
+    assert contender.status is ReplayClaimStatus.BUSY
+
+    recovered = contender_store.claim(
+        owner.cycle_id,
+        owner.fingerprint,
+        now=instant + timedelta(seconds=15),
+    )
+    assert recovered.status is ReplayClaimStatus.CLAIMED
+    assert recovered.generation == owner.generation + 1
+    with pytest.raises(ReplayClaimOwnershipError):
+        owner_store.complete(
+            owner.cycle_id,
+            owner.fingerprint,
+            owner.owner_token,
+            owner.generation,
+            "learning-closed-loop:stale-owner",
+            now=instant + timedelta(seconds=15),
+        )
+
+
+def test_expired_lease_cannot_be_renewed_completed_or_released(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteReplayClaimStore(tmp_path / "evidence.sqlite3")
+    instant = datetime(2026, 10, 14, tzinfo=UTC)
+    claim = store.claim(
+        "learning-cycle:expired",
+        "sha256:expired-input",
+        lease_seconds=2.0,
+        now=instant,
+    )
+    assert claim.owner_token is not None
+    expired_at = instant + timedelta(seconds=3)
+
+    with pytest.raises(ReplayClaimOwnershipError, match="lease expired"):
+        store.renew(
+            claim.cycle_id,
+            claim.fingerprint,
+            claim.owner_token,
+            claim.generation,
+            lease_seconds=5.0,
+            now=expired_at,
+        )
+    with pytest.raises(ReplayClaimOwnershipError, match="lease expired"):
+        store.complete(
+            claim.cycle_id,
+            claim.fingerprint,
+            claim.owner_token,
+            claim.generation,
+            "learning-closed-loop:expired-owner",
+            now=expired_at,
+        )
+    assert not store.release(
+        claim.cycle_id,
+        claim.owner_token,
+        claim.generation,
+        now=expired_at,
+    )
+
+    takeover = store.claim(
+        claim.cycle_id,
+        claim.fingerprint,
+        lease_seconds=5.0,
+        now=expired_at,
+    )
+    assert takeover.status is ReplayClaimStatus.CLAIMED
+    assert takeover.generation == claim.generation + 1
+
+
+def test_replay_claim_renewal_rejects_wrong_identity_and_owner(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteReplayClaimStore(tmp_path / "evidence.sqlite3")
+    instant = datetime(2026, 10, 14, tzinfo=UTC)
+    claim = store.claim(
+        "learning-cycle:renew-owner",
+        "sha256:renew-owner-input",
+        lease_seconds=30.0,
+        now=instant,
+    )
+    assert claim.owner_token is not None
+
+    with pytest.raises(ReplayClaimConflictError, match="fingerprint conflicts"):
+        store.renew(
+            claim.cycle_id,
+            "sha256:different-input",
+            claim.owner_token,
+            claim.generation,
+            now=instant + timedelta(seconds=1),
+        )
+    with pytest.raises(ReplayClaimOwnershipError, match="ownership was lost"):
+        store.renew(
+            claim.cycle_id,
+            claim.fingerprint,
+            "not-the-owner",
+            claim.generation,
+            now=instant + timedelta(seconds=1),
+        )
+    with pytest.raises(ReplayClaimOwnershipError, match="ownership was lost"):
+        store.renew(
+            claim.cycle_id,
+            claim.fingerprint,
+            claim.owner_token,
+            claim.generation + 1,
+            now=instant + timedelta(seconds=1),
+        )
 
 
 def test_replay_claim_rejects_changed_fingerprint(tmp_path: Path) -> None:

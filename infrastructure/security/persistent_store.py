@@ -579,6 +579,106 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
                 self._rollback(connection)
                 raise
 
+    def renew(
+        self,
+        cycle_id: str,
+        fingerprint: str,
+        owner_token: str,
+        generation: int,
+        *,
+        lease_seconds: float = 3600.0,
+        now: datetime | None = None,
+    ) -> ReplayClaim:
+        """Atomically extend an active lease without changing its fencing generation.
+
+        Renewal is only permitted before the current lease expires. Once expired,
+        the owner must not revive its claim; a new claim increments the generation.
+        """
+        _text("cycle_id", cycle_id)
+        _text("fingerprint", fingerprint)
+        _text("owner_token", owner_token)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("generation must be a positive integer")
+        if isinstance(lease_seconds, bool) or not isinstance(
+            lease_seconds, (int, float)
+        ):
+            raise TypeError("lease_seconds must be a real number")
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be finite and greater than zero")
+        current_time = self._now_timestamp(now)
+        requested_lease_until = current_time + float(lease_seconds)
+        with self._connection() as connection:
+            self._begin(connection)
+            try:
+                row = connection.execute(
+                    "SELECT fingerprint, state, generation, attempts, owner_token, "
+                    "lease_expires_at, evidence_id FROM sh3_replay_claims "
+                    "WHERE cycle_id = ?",
+                    (cycle_id,),
+                ).fetchone()
+                if row is None:
+                    raise ReplayClaimOwnershipError(
+                        f"replay claim is missing for {cycle_id}"
+                    )
+                (
+                    stored_fingerprint,
+                    state,
+                    stored_generation,
+                    attempts,
+                    stored_owner,
+                    stored_lease,
+                    evidence_id,
+                ) = row
+                if stored_fingerprint != fingerprint:
+                    raise ReplayClaimConflictError(
+                        f"replay fingerprint conflicts for {cycle_id}"
+                    )
+                if (
+                    state != ReplayClaimStatus.CLAIMED.value
+                    or stored_owner != owner_token
+                    or stored_generation != generation
+                ):
+                    raise ReplayClaimOwnershipError(
+                        f"replay claim ownership was lost for {cycle_id}"
+                    )
+                if stored_lease is None or float(stored_lease) <= current_time:
+                    raise ReplayClaimOwnershipError(
+                        f"replay claim lease expired for {cycle_id}"
+                    )
+                lease_until = max(float(stored_lease), requested_lease_until)
+                cursor = connection.execute(
+                    "UPDATE sh3_replay_claims SET lease_expires_at = ?, updated_at = ? "
+                    "WHERE cycle_id = ? AND fingerprint = ? AND state = 'claimed' "
+                    "AND owner_token = ? AND generation = ? AND lease_expires_at > ?",
+                    (
+                        lease_until,
+                        current_time,
+                        cycle_id,
+                        fingerprint,
+                        owner_token,
+                        generation,
+                        current_time,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ReplayClaimOwnershipError(
+                        f"replay claim ownership was lost for {cycle_id}"
+                    )
+                self._commit(connection)
+                return ReplayClaim(
+                    cycle_id=cycle_id,
+                    fingerprint=fingerprint,
+                    status=ReplayClaimStatus.CLAIMED,
+                    generation=generation,
+                    attempts=attempts,
+                    owner_token=owner_token,
+                    lease_expires_at=lease_until,
+                    evidence_id=evidence_id,
+                )
+            except Exception:
+                self._rollback(connection)
+                raise
+
     def complete(
         self,
         cycle_id: str,
@@ -586,6 +686,8 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
         owner_token: str,
         generation: int,
         evidence_id: str,
+        *,
+        now: datetime | None = None,
     ) -> None:
         _text("cycle_id", cycle_id)
         _text("fingerprint", fingerprint)
@@ -593,20 +695,27 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
         _text("evidence_id", evidence_id)
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
             raise ValueError("generation must be a positive integer")
-        now = datetime.now(UTC).timestamp()
+        current_time = self._now_timestamp(now)
         with self._connection() as connection:
             self._begin(connection)
             try:
                 row = connection.execute(
-                    "SELECT fingerprint, state, generation, owner_token, evidence_id "
-                    "FROM sh3_replay_claims WHERE cycle_id = ?",
+                    "SELECT fingerprint, state, generation, owner_token, evidence_id, "
+                    "lease_expires_at FROM sh3_replay_claims WHERE cycle_id = ?",
                     (cycle_id,),
                 ).fetchone()
                 if row is None:
                     raise ReplayClaimOwnershipError(
                         f"replay claim is missing for {cycle_id}"
                     )
-                stored_fingerprint, state, stored_generation, stored_owner, stored_evidence = row
+                (
+                    stored_fingerprint,
+                    state,
+                    stored_generation,
+                    stored_owner,
+                    stored_evidence,
+                    stored_lease,
+                ) = row
                 if stored_fingerprint != fingerprint:
                     raise ReplayClaimConflictError(
                         f"replay fingerprint conflicts for {cycle_id}"
@@ -626,11 +735,15 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
                     raise ReplayClaimOwnershipError(
                         f"replay claim ownership was lost for {cycle_id}"
                     )
+                if stored_lease is None or float(stored_lease) <= current_time:
+                    raise ReplayClaimOwnershipError(
+                        f"replay claim lease expired for {cycle_id}"
+                    )
                 connection.execute(
                     "UPDATE sh3_replay_claims SET state = 'completed', owner_token = NULL, "
                     "lease_expires_at = NULL, evidence_id = ?, updated_at = ? "
                     "WHERE cycle_id = ?",
-                    (evidence_id, now, cycle_id),
+                    (evidence_id, current_time, cycle_id),
                 )
                 self._commit(connection)
             except Exception:
@@ -642,20 +755,23 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
         cycle_id: str,
         owner_token: str,
         generation: int,
+        *,
+        now: datetime | None = None,
     ) -> bool:
         _text("cycle_id", cycle_id)
         _text("owner_token", owner_token)
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
             raise ValueError("generation must be a positive integer")
-        now = datetime.now(UTC).timestamp()
+        current_time = self._now_timestamp(now)
         with self._connection() as connection:
             self._begin(connection)
             try:
                 cursor = connection.execute(
                     "UPDATE sh3_replay_claims SET state = 'released', owner_token = NULL, "
                     "lease_expires_at = NULL, updated_at = ? WHERE cycle_id = ? "
-                    "AND state = 'claimed' AND owner_token = ? AND generation = ?",
-                    (now, cycle_id, owner_token, generation),
+                    "AND state = 'claimed' AND owner_token = ? AND generation = ? "
+                    "AND lease_expires_at > ?",
+                    (current_time, cycle_id, owner_token, generation, current_time),
                 )
                 self._commit(connection)
                 return cursor.rowcount == 1
