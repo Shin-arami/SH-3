@@ -16,6 +16,11 @@ from foundation.utils.hash import short_id
 from foundation.utils.logging import error, info
 from infrastructure.event_bus import EventPublisher
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security import EvidenceStore
+from infrastructure.security.persistent_store import (
+    SQLiteEvidenceStore,
+    SQLiteReplayClaimStore,
+)
 from runtime.context_manager import ContextManager
 from runtime.core import RuntimeCore
 
@@ -53,7 +58,20 @@ class SH3Kernel:
         self,
         *,
         event_publisher: EventPublisher | None = None,
+        evidence_store: EvidenceStore | None = None,
+        replay_claim_store: SQLiteReplayClaimStore | None = None,
     ) -> None:
+        if evidence_store is not None and not isinstance(evidence_store, EvidenceStore):
+            raise TypeError("evidence_store must be EvidenceStore or None")
+        if replay_claim_store is not None and not isinstance(
+            replay_claim_store, SQLiteReplayClaimStore
+        ):
+            raise TypeError("replay_claim_store must be SQLiteReplayClaimStore or None")
+        if replay_claim_store is not None:
+            if not isinstance(evidence_store, SQLiteEvidenceStore):
+                raise ValueError("replay_claim_store requires SQLiteEvidenceStore")
+            if replay_claim_store.database_path != evidence_store.database_path:
+                raise ValueError("evidence and replay claims must share one SQLite database")
         self._event_publisher = event_publisher
         self._last_event_id: str | None = None
         self._propagation_context: EventPropagationContext | None = None
@@ -99,6 +117,7 @@ class SH3Kernel:
             event_publisher=event_publisher,
         )
         self.optimizer_evidence_boundary = OptimizationEvidenceBoundary(
+            evidence_store=evidence_store,
             event_publisher=event_publisher,
         )
         self.learning_closed_loop_evidence_boundary = LearningClosedLoopEvidenceBoundary(
@@ -139,6 +158,7 @@ class SH3Kernel:
             recovery_execution_boundary=self.recovery_execution_boundary,
             feedback_boundary=self.feedback_boundary,
             closed_loop_evidence_boundary=self.learning_closed_loop_evidence_boundary,
+            replay_claim_store=replay_claim_store,
         )
         self.kernel_id = short_id("sh3-kernel")
 

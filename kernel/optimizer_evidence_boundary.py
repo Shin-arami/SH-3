@@ -109,7 +109,9 @@ class OptimizationEvidenceBoundary:
             raise TypeError("evidence_store must be EvidenceStore or None")
         if event_publisher is not None and not isinstance(event_publisher, EventPublisher):
             raise TypeError("event_publisher must be EventPublisher or None")
-        self._store = evidence_store or EvidenceStore()
+        self._store = (
+            evidence_store if evidence_store is not None else EvidenceStore()
+        )
         self._event_publisher = event_publisher
         self._event_bus: EventBus | None = None
         self._lock = RLock()

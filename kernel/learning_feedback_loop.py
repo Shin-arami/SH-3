@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -18,6 +21,12 @@ from foundation.Enums.event import EventType
 from foundation.utils.logging import error
 from infrastructure.event_bus import EventBus, EventPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security.persistent_store import (
+    ReplayClaimBusyError,
+    ReplayClaimCompletedError,
+    ReplayClaimStatus,
+    SQLiteReplayClaimStore,
+)
 from kernel.cognitive_learning_boundary import CognitiveLearningBoundary
 from kernel.learning_closed_loop_evidence_boundary import LearningClosedLoopEvidenceBoundary
 from kernel.learning_optimizer_boundary import LearningOptimizerBoundary
@@ -135,6 +144,8 @@ class LearningClosedLoopCoordinator:
         "_optimizer_boundary",
         "_recovery_execution_boundary",
         "_recovery_strategy_boundary",
+        "_replay_claim_lease_seconds",
+        "_replay_claim_store",
         "_started",
         "kernel",
     )
@@ -151,6 +162,8 @@ class LearningClosedLoopCoordinator:
         recovery_execution_boundary: RecoveryExecutionBoundary | None = None,
         feedback_boundary: CognitiveFeedbackBoundary | None = None,
         closed_loop_evidence_boundary: LearningClosedLoopEvidenceBoundary | None = None,
+        replay_claim_store: SQLiteReplayClaimStore | None = None,
+        replay_claim_lease_seconds: float = 3600.0,
         max_partial_cycles: int = 3,
     ) -> None:
         if kernel is None:
@@ -163,6 +176,16 @@ class LearningClosedLoopCoordinator:
             raise ValueError("max_partial_cycles must be >= 1")
         if event_publisher is not None and not isinstance(event_publisher, EventPublisher):
             raise TypeError("event_publisher must be EventPublisher or None")
+        if replay_claim_store is not None and not isinstance(
+            replay_claim_store, SQLiteReplayClaimStore
+        ):
+            raise TypeError("replay_claim_store must be SQLiteReplayClaimStore or None")
+        if isinstance(replay_claim_lease_seconds, bool) or not isinstance(
+            replay_claim_lease_seconds, (int, float)
+        ):
+            raise TypeError("replay_claim_lease_seconds must be a real number")
+        if not math.isfinite(replay_claim_lease_seconds) or replay_claim_lease_seconds <= 0:
+            raise ValueError("replay_claim_lease_seconds must be finite and greater than zero")
         self.kernel = kernel
         self._event_publisher = event_publisher
         self._event_bus: EventBus | None = None
@@ -206,6 +229,8 @@ class LearningClosedLoopCoordinator:
         self._goal_lifecycle_states: dict[str, CognitiveLifecycleState] = {}
         self._started = False
         self._max_partial_cycles = max_partial_cycles
+        self._replay_claim_store = replay_claim_store
+        self._replay_claim_lease_seconds = float(replay_claim_lease_seconds)
         self._goal_partial_counts: dict[str, int] = {}
         self._cycle_failure_details: dict[str, dict[str, str]] = {}
         self._configure()
@@ -320,6 +345,29 @@ class LearningClosedLoopCoordinator:
         cycle_id = f"learning-cycle:{result.result_id}"
         options = (optimize, recover)
         current_thread = get_ident()
+        requested_correlation = context.correlation_id if context is not None else result.correlation_id
+        requested_trace = context.trace_id if context is not None else result.trace_id
+        requested_tenant = context.tenant_id if context is not None else result.tenant_id
+        fingerprint_payload = {
+            "result_id": result.result_id,
+            "goal_id": result.goal_id,
+            "result_status": result.status.value,
+            "lifecycle_state": result.lifecycle_state.value,
+            "result_version": result.version,
+            "created_at": result.created_at.isoformat(),
+            "optimize": optimize,
+            "recover": recover,
+            "correlation_id": requested_correlation,
+            "trace_id": requested_trace,
+            "tenant_id": requested_tenant,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        claim_owner_token: str | None = None
+        claim_generation: int | None = None
         convergence_failure_detail: dict[str, str] | None = None
         next_partial_count = 0
         existing_report: LearningClosedLoopReport | None = None
@@ -392,6 +440,19 @@ class LearningClosedLoopCoordinator:
                         if persisted_report.status is ClosedLoopStatus.FAILED
                         else result.lifecycle_state
                     )
+                    if self._replay_claim_store is not None:
+                        restored_evidence = self._closed_loop_evidence_boundary.get(cycle_id)
+                        if (
+                            restored_evidence is None
+                            or not restored_evidence.recorded
+                            or restored_evidence.evidence is None
+                        ):
+                            raise ReplayClaimCompletedError(
+                                f"terminal report has no restorable evidence for {cycle_id}"
+                            )
+                        self._replay_claim_store.reconcile_completed(
+                            cycle_id, fingerprint, restored_evidence.evidence.evidence_id
+                        )
                     leader = False
                 else:
                     previous_state = self._goal_lifecycle_states.get(result.goal_id)
@@ -440,6 +501,24 @@ class LearningClosedLoopCoordinator:
                                 "max_partial_cycles": str(self._max_partial_cycles),
                             }
 
+                    if self._replay_claim_store is not None:
+                        claim = self._replay_claim_store.claim(
+                            cycle_id,
+                            fingerprint,
+                            lease_seconds=self._replay_claim_lease_seconds,
+                        )
+                        if claim.status is ReplayClaimStatus.BUSY:
+                            raise ReplayClaimBusyError(
+                                f"closed-loop cycle is claimed by another worker: {cycle_id}"
+                            )
+                        if claim.status is ReplayClaimStatus.COMPLETED:
+                            raise ReplayClaimCompletedError(
+                                f"completed claim exists without a restorable report for {cycle_id}; retry replay"
+                            )
+                        claim_owner_token = claim.owner_token
+                        claim_generation = claim.generation
+                        if claim_owner_token is None:
+                            raise RuntimeError("claimed replay cycle has no owner token")
                     waiter = ThreadEvent()
                     self._inflight[cycle_id] = (waiter, current_thread)
                     self._goal_inflight[result.goal_id] = (cycle_id, current_thread)
@@ -483,7 +562,33 @@ class LearningClosedLoopCoordinator:
                     or report.status is ClosedLoopStatus.FAILED
                     else result.lifecycle_state
                 )
+            if self._replay_claim_store is not None and claim_owner_token is not None and claim_generation is not None:
+                stored_evidence = self._closed_loop_evidence_boundary.get(cycle_id)
+                if (
+                    stored_evidence is not None
+                    and stored_evidence.recorded
+                    and stored_evidence.evidence is not None
+                ):
+                    self._replay_claim_store.complete(
+                        cycle_id,
+                        fingerprint,
+                        claim_owner_token,
+                        claim_generation,
+                        stored_evidence.evidence.evidence_id,
+                    )
+                else:
+                    self._replay_claim_store.release(
+                        cycle_id, claim_owner_token, claim_generation
+                    )
+                claim_owner_token = None
             return report
+        except Exception:
+            if self._replay_claim_store is not None and claim_owner_token is not None and claim_generation is not None:
+                with suppress(Exception):
+                    self._replay_claim_store.release(
+                        cycle_id, claim_owner_token, claim_generation
+                    )
+            raise
         finally:
             with self._lock:
                 self._cycle_failure_details.pop(cycle_id, None)

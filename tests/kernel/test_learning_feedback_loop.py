@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +19,11 @@ from cognition.feedback_boundary import (
 )
 from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security.persistent_store import (
+    ReplayClaimStatus,
+    SQLiteEvidenceStore,
+    SQLiteReplayClaimStore,
+)
 from kernel.core import SH3Kernel
 from kernel.learning_feedback_loop import (
     ClosedLoopStatus,
@@ -562,3 +568,40 @@ def test_partial_cycle_limit_must_be_positive_integer() -> None:
             SH3Kernel(),
             max_partial_cycles=True,
         )
+
+
+def test_persistent_evidence_and_atomic_claim_replay_after_kernel_recreation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sh3-persistent-evidence.sqlite3"
+    evidence_store = SQLiteEvidenceStore(database)
+    first_kernel = SH3Kernel(
+        evidence_store=evidence_store,
+        replay_claim_store=SQLiteReplayClaimStore(database),
+    )
+    assert first_kernel.optimizer_evidence_boundary.evidence_store is evidence_store
+    assert first_kernel.learning_closed_loop_evidence_boundary.evidence_store is evidence_store
+    result = _result(result_id="result:persistent-cross-kernel")
+    original = first_kernel.learning_feedback_loop.run(
+        result,
+        optimize=False,
+        recover=True,
+    )
+    completed_claim = SQLiteReplayClaimStore(database).get(original.cycle_id)
+    assert completed_claim is not None
+    assert completed_claim.status is ReplayClaimStatus.COMPLETED
+
+    second_kernel = SH3Kernel(
+        evidence_store=SQLiteEvidenceStore(database),
+        replay_claim_store=SQLiteReplayClaimStore(database),
+    )
+    replayed = second_kernel.learning_feedback_loop.run(
+        result,
+        optimize=False,
+        recover=True,
+    )
+
+    assert replayed.to_dict() == original.to_dict()
+    assert second_kernel.learning_loop.records() == ()
+    assert second_kernel.learning_feedback_loop.records() == (replayed,)
+    assert SQLiteReplayClaimStore(database).get(original.cycle_id) == completed_claim
