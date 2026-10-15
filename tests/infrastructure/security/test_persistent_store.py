@@ -440,6 +440,36 @@ def test_concurrent_conflicting_reconciliation_fails_closed(
     assert final_claim.evidence_id in accepted_ids
 
 
+
+def test_durability_acceptance_fingerprint_conflict_survives_store_recreation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "durability-fingerprint.sqlite3"
+    cycle_id = "learning-cycle:durability-fingerprint-acceptance"
+    original_fingerprint = "sha256:durability-original-input"
+    first_store = SQLiteReplayClaimStore(database)
+    first_claim = first_store.claim(
+        cycle_id,
+        original_fingerprint,
+        lease_seconds=60.0,
+    )
+    assert first_claim.status is ReplayClaimStatus.CLAIMED
+
+    reopened_store = SQLiteReplayClaimStore(database)
+    with pytest.raises(ReplayClaimConflictError, match="fingerprint conflicts"):
+        reopened_store.claim(
+            cycle_id,
+            "sha256:durability-changed-input",
+            lease_seconds=60.0,
+        )
+
+    persisted = reopened_store.get(cycle_id)
+    assert persisted == first_claim
+    assert persisted is not None
+    assert persisted.status is ReplayClaimStatus.CLAIMED
+    assert persisted.fingerprint == original_fingerprint
+
+
 def test_replay_claim_rejects_changed_fingerprint(tmp_path: Path) -> None:
     store = SQLiteReplayClaimStore(tmp_path / "evidence.sqlite3")
     store.claim("learning-cycle:identity", "sha256:original")

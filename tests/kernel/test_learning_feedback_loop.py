@@ -20,6 +20,7 @@ from cognition.feedback_boundary import (
 from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
 from infrastructure.security.persistent_store import (
+    ReplayClaimCompletedError,
     ReplayClaimStatus,
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
@@ -683,3 +684,58 @@ def test_persistent_evidence_and_atomic_claim_replay_after_kernel_recreation(
     assert second_kernel.learning_loop.records() == ()
     assert second_kernel.learning_feedback_loop.records() == (replayed,)
     assert SQLiteReplayClaimStore(database).get(original.cycle_id) == completed_claim
+
+
+def test_durability_acceptance_fails_closed_when_completed_evidence_is_missing(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "durability-missing-evidence.sqlite3"
+    first_evidence_store = SQLiteEvidenceStore(database)
+    first_kernel = SH3Kernel(
+        evidence_store=first_evidence_store,
+        replay_claim_store=SQLiteReplayClaimStore(database),
+    )
+    result = _result(result_id="result:durability-missing-evidence")
+    original = first_kernel.learning_feedback_loop.run(
+        result,
+        optimize=False,
+        recover=True,
+    )
+
+    claim_store = SQLiteReplayClaimStore(database)
+    completed_claim = claim_store.get(original.cycle_id)
+    assert completed_claim is not None
+    assert completed_claim.status is ReplayClaimStatus.COMPLETED
+    assert completed_claim.evidence_id is not None
+
+    # Simulate terminal evidence loss while preserving the completed replay claim.
+    first_evidence_store.clear()
+    assert SQLiteEvidenceStore(database).records() == ()
+    recovered_kernel = SH3Kernel(
+        evidence_store=SQLiteEvidenceStore(database),
+        replay_claim_store=SQLiteReplayClaimStore(database),
+    )
+
+    with pytest.raises(ReplayClaimCompletedError, match="without a restorable report"):
+        recovered_kernel.learning_feedback_loop.run(
+            result,
+            optimize=False,
+            recover=True,
+        )
+
+    assert recovered_kernel.learning_loop.records() == ()
+    assert recovered_kernel.learning_feedback_loop.records() == ()
+    assert SQLiteReplayClaimStore(database).get(original.cycle_id) == completed_claim
+
+
+def test_durability_acceptance_rejects_separate_evidence_and_claim_databases(
+    tmp_path: Path,
+) -> None:
+    evidence_database = tmp_path / "evidence.sqlite3"
+    claim_database = tmp_path / "claims.sqlite3"
+
+    with pytest.raises(ValueError, match="must share one SQLite database"):
+        SH3Kernel(
+            evidence_store=SQLiteEvidenceStore(evidence_database),
+            replay_claim_store=SQLiteReplayClaimStore(claim_database),
+        )
