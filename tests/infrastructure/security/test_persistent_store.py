@@ -316,6 +316,130 @@ def test_replay_claim_renewal_rejects_wrong_identity_and_owner(
         )
 
 
+
+def test_concurrent_recovery_claim_after_expiry_has_single_fenced_owner(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "recovery-race.sqlite3"
+    instant = datetime(2026, 10, 14, tzinfo=UTC)
+    first_store = SQLiteReplayClaimStore(database)
+    previous_owner = first_store.claim(
+        "learning-cycle:expiry-race",
+        "sha256:expiry-race-input",
+        lease_seconds=5.0,
+        now=instant,
+    )
+    assert previous_owner.owner_token is not None
+
+    stores = [SQLiteReplayClaimStore(database) for _ in range(16)]
+    recovery_time = instant + timedelta(seconds=6)
+
+    def attempt(index: int) -> ReplayClaim:
+        return stores[index].claim(
+            "learning-cycle:expiry-race",
+            "sha256:expiry-race-input",
+            lease_seconds=60.0,
+            now=recovery_time,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+        claims = tuple(executor.map(attempt, range(len(stores))))
+
+    winners = tuple(item for item in claims if item.status is ReplayClaimStatus.CLAIMED)
+    busy = tuple(item for item in claims if item.status is ReplayClaimStatus.BUSY)
+    assert len(winners) == 1
+    assert len(busy) == len(stores) - 1
+    assert {item.generation for item in claims} == {previous_owner.generation + 1}
+    winner = winners[0]
+    assert winner.owner_token is not None
+
+    with pytest.raises(ReplayClaimOwnershipError, match="ownership was lost"):
+        first_store.complete(
+            previous_owner.cycle_id,
+            previous_owner.fingerprint,
+            previous_owner.owner_token,
+            previous_owner.generation,
+            "learning-closed-loop:stale-expiry-race",
+            now=recovery_time,
+        )
+
+
+def test_concurrent_same_evidence_reconciliation_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "recovery-reconcile.sqlite3"
+    instant = datetime(2026, 10, 14, tzinfo=UTC)
+    cycle_id = "learning-cycle:crash-window-idempotent"
+    fingerprint = "sha256:crash-window-input"
+    evidence_id = "learning-closed-loop:crash-window-terminal"
+    initial = SQLiteReplayClaimStore(database).claim(
+        cycle_id,
+        fingerprint,
+        lease_seconds=60.0,
+        now=instant,
+    )
+    assert initial.status is ReplayClaimStatus.CLAIMED
+
+    stores = [SQLiteReplayClaimStore(database) for _ in range(12)]
+
+    def reconcile(index: int) -> None:
+        stores[index].reconcile_completed(cycle_id, fingerprint, evidence_id)
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+        tuple(executor.map(reconcile, range(len(stores))))
+
+    completed = SQLiteReplayClaimStore(database).get(cycle_id)
+    assert completed is not None
+    assert completed.status is ReplayClaimStatus.COMPLETED
+    assert completed.evidence_id == evidence_id
+    assert completed.generation == initial.generation
+    assert completed.attempts == initial.attempts
+    replay = SQLiteReplayClaimStore(database).claim(
+        cycle_id,
+        fingerprint,
+        now=instant + timedelta(seconds=1),
+    )
+    assert replay.status is ReplayClaimStatus.COMPLETED
+    assert replay.evidence_id == evidence_id
+
+
+def test_concurrent_conflicting_reconciliation_fails_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "recovery-conflict.sqlite3"
+    cycle_id = "learning-cycle:crash-window-conflict"
+    fingerprint = "sha256:crash-window-conflict-input"
+    SQLiteReplayClaimStore(database).claim(cycle_id, fingerprint, lease_seconds=60.0)
+    stores = [SQLiteReplayClaimStore(database) for _ in range(12)]
+    evidence_ids = (
+        "learning-closed-loop:terminal-a",
+        "learning-closed-loop:terminal-b",
+    )
+    requests = tuple(
+        (index, evidence_ids[index % len(evidence_ids)])
+        for index in range(len(stores))
+    )
+
+    def reconcile(request: tuple[int, str]) -> tuple[str, bool]:
+        index, evidence_id = request
+        try:
+            stores[index].reconcile_completed(cycle_id, fingerprint, evidence_id)
+        except ReplayClaimConflictError:
+            return evidence_id, False
+        return evidence_id, True
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+        outcomes = tuple(executor.map(reconcile, requests))
+
+    accepted_ids = {evidence_id for evidence_id, accepted in outcomes if accepted}
+    assert len(accepted_ids) == 1
+    assert any(not accepted for _, accepted in outcomes)
+    final_claim = SQLiteReplayClaimStore(database).get(cycle_id)
+    assert final_claim is not None
+    assert final_claim.status is ReplayClaimStatus.COMPLETED
+    assert final_claim.evidence_id in accepted_ids
+
+
 def test_replay_claim_rejects_changed_fingerprint(tmp_path: Path) -> None:
     store = SQLiteReplayClaimStore(tmp_path / "evidence.sqlite3")
     store.claim("learning-cycle:identity", "sha256:original")

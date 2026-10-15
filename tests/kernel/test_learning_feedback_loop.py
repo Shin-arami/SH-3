@@ -570,6 +570,84 @@ def test_partial_cycle_limit_must_be_positive_integer() -> None:
         )
 
 
+
+def test_crash_after_terminal_evidence_before_claim_completion_is_reconciled(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "crash-window.sqlite3"
+    result = _result(result_id="result:crash-window-recovery")
+
+    class CrashBeforeClaimCompletionStore(SQLiteReplayClaimStore):
+        __slots__ = ()
+
+        def complete(
+            self,
+            cycle_id: str,
+            fingerprint: str,
+            owner_token: str,
+            generation: int,
+            evidence_id: str,
+            *,
+            now: datetime | None = None,
+        ) -> None:
+            raise RuntimeError("simulated process crash before claim completion")
+
+        def release(
+            self,
+            cycle_id: str,
+            owner_token: str,
+            generation: int,
+            *,
+            now: datetime | None = None,
+        ) -> bool:
+            return False
+
+    first_kernel = SH3Kernel(
+        evidence_store=SQLiteEvidenceStore(database),
+        replay_claim_store=CrashBeforeClaimCompletionStore(database),
+    )
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        first_kernel.learning_feedback_loop.run(
+            result,
+            optimize=False,
+            recover=True,
+        )
+
+    evidence_store = SQLiteEvidenceStore(database)
+    terminal_records = tuple(
+        record
+        for record in evidence_store.records()
+        if record.kind == "learning.closed_loop"
+    )
+    assert len(terminal_records) == 1
+    terminal_evidence = terminal_records[0]
+    cycle_id_value = terminal_evidence.payload.get("cycle_id")
+    assert isinstance(cycle_id_value, str)
+    cycle_id = cycle_id_value
+
+    before_recovery = SQLiteReplayClaimStore(database).get(cycle_id)
+    assert before_recovery is not None
+    assert before_recovery.status is ReplayClaimStatus.CLAIMED
+
+    recovered_kernel = SH3Kernel(
+        evidence_store=SQLiteEvidenceStore(database),
+        replay_claim_store=SQLiteReplayClaimStore(database),
+    )
+    replayed = recovered_kernel.learning_feedback_loop.run(
+        result,
+        optimize=False,
+        recover=True,
+    )
+
+    assert replayed.cycle_id == cycle_id
+    assert replayed.result_id == result.result_id
+    assert recovered_kernel.learning_loop.records() == ()
+    final_claim = SQLiteReplayClaimStore(database).get(cycle_id)
+    assert final_claim is not None
+    assert final_claim.status is ReplayClaimStatus.COMPLETED
+    assert final_claim.evidence_id == terminal_evidence.evidence_id
+
+
 def test_persistent_evidence_and_atomic_claim_replay_after_kernel_recreation(
     tmp_path: Path,
 ) -> None:
