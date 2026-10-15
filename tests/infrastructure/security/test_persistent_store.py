@@ -470,6 +470,157 @@ def test_durability_acceptance_fingerprint_conflict_survives_store_recreation(
     assert persisted.fingerprint == original_fingerprint
 
 
+
+def test_failure_matrix_concurrent_conflicting_evidence_registration_has_one_canonical_record(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "failure-matrix-evidence-conflict.sqlite3"
+    evidence_id = "learning-closed-loop:failure-matrix-race"
+    stores = tuple(SQLiteEvidenceStore(database) for _ in range(8))
+
+    def register_variant(index: int) -> bool:
+        candidate = _evidence(
+            evidence_id=evidence_id,
+            payload={"cycle_id": f"cycle:writer-{index}", "writer": index},
+        )
+        try:
+            stores[index].register(candidate)
+        except ValueError as exc:
+            assert "identifier conflicts" in str(exc)
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+        accepted = tuple(executor.map(register_variant, range(len(stores))))
+
+    assert sum(accepted) == 1
+    persisted = SQLiteEvidenceStore(database).get(evidence_id)
+    assert persisted is not None
+    assert persisted.verify()
+    writer = persisted.payload["writer"]
+    assert isinstance(writer, int)
+    assert writer in range(len(stores))
+    assert SQLiteEvidenceStore(database).count() == 1
+
+
+def test_failure_matrix_evidence_row_integrity_column_tampering_fails_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "failure-matrix-row-integrity.sqlite3"
+    store = SQLiteEvidenceStore(database)
+    evidence = _evidence(evidence_id="learning-closed-loop:failure-matrix-integrity")
+    store.register(evidence)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE sh3_evidence_records SET integrity = ? WHERE evidence_id = ?",
+            ("sha256:tampered-row-integrity", evidence.evidence_id),
+        )
+
+    with pytest.raises(PersistentEvidenceIntegrityError, match="row integrity"):
+        SQLiteEvidenceStore(database).get(evidence.evidence_id)
+
+
+def test_failure_matrix_evidence_write_lock_timeout_is_atomic_and_retryable(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "failure-matrix-evidence-lock.sqlite3"
+    store = SQLiteEvidenceStore(database, timeout_seconds=0.05)
+    evidence = _evidence(evidence_id="learning-closed-loop:failure-matrix-write-lock")
+    blocker = sqlite3.connect(database, timeout=0.05, isolation_level=None)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            store.register(evidence)
+        blocker.execute("ROLLBACK")
+    finally:
+        blocker.close()
+
+    assert SQLiteEvidenceStore(database).get(evidence.evidence_id) is None
+    persisted = store.register(evidence)
+    assert persisted.to_dict() == evidence.to_dict()
+    assert store.count() == 1
+
+
+def test_failure_matrix_claim_creation_lock_timeout_does_not_persist_partial_claim(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "failure-matrix-claim-lock.sqlite3"
+    instant = datetime(2026, 10, 15, tzinfo=UTC)
+    store = SQLiteReplayClaimStore(database, timeout_seconds=0.05)
+    blocker = sqlite3.connect(database, timeout=0.05, isolation_level=None)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            store.claim(
+                "learning-cycle:failure-matrix-claim-lock",
+                "sha256:failure-matrix-claim-lock-input",
+                lease_seconds=60.0,
+                now=instant,
+            )
+        blocker.execute("ROLLBACK")
+    finally:
+        blocker.close()
+
+    cycle_id = "learning-cycle:failure-matrix-claim-lock"
+    assert SQLiteReplayClaimStore(database).get(cycle_id) is None
+    recovered = store.claim(
+        cycle_id,
+        "sha256:failure-matrix-claim-lock-input",
+        lease_seconds=60.0,
+        now=instant,
+    )
+    assert recovered.status is ReplayClaimStatus.CLAIMED
+    assert recovered.generation == 1
+    assert recovered.attempts == 1
+
+
+def test_failure_matrix_claim_completion_lock_failure_preserves_retryable_owner(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "failure-matrix-complete-lock.sqlite3"
+    instant = datetime(2026, 10, 15, tzinfo=UTC)
+    store = SQLiteReplayClaimStore(database, timeout_seconds=0.05)
+    claim = store.claim(
+        "learning-cycle:failure-matrix-complete-lock",
+        "sha256:failure-matrix-complete-lock-input",
+        lease_seconds=60.0,
+        now=instant,
+    )
+    assert claim.owner_token is not None
+
+    blocker = sqlite3.connect(database, timeout=0.05, isolation_level=None)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            store.complete(
+                claim.cycle_id,
+                claim.fingerprint,
+                claim.owner_token,
+                claim.generation,
+                "learning-closed-loop:failure-matrix-terminal",
+                now=instant + timedelta(seconds=1),
+            )
+        blocker.execute("ROLLBACK")
+    finally:
+        blocker.close()
+
+    after_failure = SQLiteReplayClaimStore(database).get(claim.cycle_id)
+    assert after_failure == claim
+    store.complete(
+        claim.cycle_id,
+        claim.fingerprint,
+        claim.owner_token,
+        claim.generation,
+        "learning-closed-loop:failure-matrix-terminal",
+        now=instant + timedelta(seconds=2),
+    )
+    completed = SQLiteReplayClaimStore(database).get(claim.cycle_id)
+    assert completed is not None
+    assert completed.status is ReplayClaimStatus.COMPLETED
+    assert completed.evidence_id == "learning-closed-loop:failure-matrix-terminal"
+
+
 def test_replay_claim_rejects_changed_fingerprint(tmp_path: Path) -> None:
     store = SQLiteReplayClaimStore(tmp_path / "evidence.sqlite3")
     store.claim("learning-cycle:identity", "sha256:original")
