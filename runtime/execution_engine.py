@@ -102,7 +102,14 @@ class RuntimeExecutionEngine:
 
     @property
     def event_publisher(self) -> EventPublisher | None:
-        return self._event_publisher
+        with self._lock:
+            return self._event_publisher
+
+    def set_event_publisher(self, event_publisher: EventPublisher | None) -> None:
+        if event_publisher is not None and not isinstance(event_publisher, EventPublisher):
+            raise TypeError("event_publisher must be EventPublisher or None")
+        with self._lock:
+            self._event_publisher = event_publisher
 
     @property
     def observability(self) -> RuntimeExecutionObservability:

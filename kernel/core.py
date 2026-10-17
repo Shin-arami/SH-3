@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 from cognition.core import CognitionCore
+from cognition.execution_boundary import CognitiveExecutionBoundary
 from cognition.feedback_boundary import CognitiveFeedbackBoundary
 from cognition.memory import MemoryCore
 from cognition.planner import Planner
@@ -23,6 +24,7 @@ from infrastructure.security.persistent_store import (
 )
 from runtime.context_manager import ContextManager
 from runtime.core import RuntimeCore
+from runtime.execution_engine import RuntimeExecutionEngine
 
 __all__ = ["SH3Kernel"]
 
@@ -78,7 +80,22 @@ class SH3Kernel:
 
         self.runtime = RuntimeCore(event_publisher=event_publisher)
         self.context_manager = ContextManager()
-        self.cognition = CognitionCore(self.context_manager, event_publisher=event_publisher)
+        if evidence_store is None:
+            # Preserve the legacy in-memory construction path by default.
+            self.cognition = CognitionCore(
+                self.context_manager, event_publisher=event_publisher
+            )
+        else:
+            # Persistent kernels share their evidence boundary with cognition and runtime.
+            execution_engine = RuntimeExecutionEngine(
+                event_publisher=event_publisher, evidence_store=evidence_store
+            )
+            self.cognition = CognitionCore(
+                self.context_manager,
+                execution_boundary=CognitiveExecutionBoundary(execution_engine),
+                event_publisher=event_publisher,
+                evidence_store=evidence_store,
+            )
         self.planner = Planner()
         self.policy = PolicyEngine()
         self.memory = MemoryCore()
@@ -173,6 +190,9 @@ class SH3Kernel:
         self._event_publisher = publisher
         self.runtime.set_event_publisher(publisher)
         self.cognition.set_event_publisher(publisher)
+        execution_backend = self.cognition.execution_boundary.backend
+        if isinstance(execution_backend, RuntimeExecutionEngine):
+            execution_backend.set_event_publisher(publisher)
         self.learning_loop.set_event_publisher(publisher)
         self.meta_controller.set_event_publisher(publisher)
         self.system_optimizer.set_event_publisher(publisher)
