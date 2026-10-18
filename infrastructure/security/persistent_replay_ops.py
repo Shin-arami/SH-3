@@ -131,6 +131,52 @@ def _require_columns(
 
 
 
+def _require_replay_claim_state_schema(connection: sqlite3.Connection) -> None:
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (_CLAIM_TABLE,),
+    ).fetchone()
+    table_sql = "" if table_row is None or table_row[0] is None else str(table_row[0])
+    normalized_sql = "".join(table_sql.lower().split())
+    required_check = "statetextnotnullcheck(statein('claimed','completed','released'))"
+    if required_check not in normalized_sql:
+        raise PersistentReplayReadinessError(
+            "database table sh3_replay_claims does not enforce the required replay claim states"
+        )
+
+    index_rows = connection.execute(
+        "PRAGMA index_list(sh3_replay_claims)"
+    ).fetchall()
+    index_row = next(
+        (
+            row
+            for row in index_rows
+            if str(row["name"]) == "sh3_replay_claims_state_idx"
+        ),
+        None,
+    )
+    if index_row is None:
+        raise PersistentReplayReadinessError(
+            "database is missing required index sh3_replay_claims_state_idx"
+        )
+    if bool(index_row["unique"]) or bool(index_row["partial"]):
+        raise PersistentReplayReadinessError(
+            "index sh3_replay_claims_state_idx must be non-unique and non-partial"
+        )
+
+    index_columns = tuple(
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA index_info(sh3_replay_claims_state_idx)"
+        ).fetchall()
+    )
+    if index_columns != ("state", "lease_expires_at"):
+        raise PersistentReplayReadinessError(
+            "index sh3_replay_claims_state_idx must use ordered columns "
+            "(state, lease_expires_at)"
+        )
+
+
 def _required_text(name: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
@@ -263,6 +309,7 @@ def check_database(
                         "updated_at",
                     },
                 )
+                _require_replay_claim_state_schema(connection)
 
                 evidence_links: dict[str, tuple[str, str, object, str, object]] = {}
                 evidence_count = 0
