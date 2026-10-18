@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from foundation.utils.hash import short_id
@@ -18,6 +18,7 @@ from infrastructure.security import EvidenceRecord
 
 __all__ = [
     "DatabaseReadinessReport",
+    "PendingEvidenceReconciliation",
     "PersistentReplayReadinessError",
     "backup_database",
     "check_database",
@@ -48,6 +49,54 @@ class PersistentReplayReadinessError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class PendingEvidenceReconciliation:
+    """Minimal read-only details for a terminal-evidence/claim finalize gap."""
+
+    cycle_id: str = field(repr=False)
+    claim_state: str
+    generation: int
+    attempts: int
+    evidence_id: str
+    lease_expires_at: float | None
+    lease_expired: bool | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cycle_id, str) or not self.cycle_id.strip():
+            raise ValueError("cycle_id must not be empty")
+        if not isinstance(self.claim_state, str) or self.claim_state not in {
+            "claimed",
+            "released",
+        }:
+            raise ValueError("claim_state must be claimed or released")
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 1
+        ):
+            raise ValueError("generation must be a positive integer")
+        if (
+            isinstance(self.attempts, bool)
+            or not isinstance(self.attempts, int)
+            or self.attempts < 0
+        ):
+            raise ValueError("attempts must be a non-negative integer")
+        if not isinstance(self.evidence_id, str) or not self.evidence_id.strip():
+            raise ValueError("evidence_id must not be empty")
+        if self.claim_state == "claimed":
+            lease_expiry = self.lease_expires_at
+            if (
+                isinstance(lease_expiry, bool)
+                or not isinstance(lease_expiry, (int, float))
+                or not math.isfinite(float(lease_expiry))
+                or not isinstance(self.lease_expired, bool)
+            ):
+                raise ValueError("claimed detail requires lease information")
+            object.__setattr__(self, "lease_expires_at", float(lease_expiry))
+        elif self.lease_expires_at is not None or self.lease_expired is not None:
+            raise ValueError("released detail cannot contain lease information")
+
+
+@dataclass(frozen=True, slots=True)
 class DatabaseReadinessReport:
     database_path: Path
     sqlite_version: str
@@ -56,6 +105,7 @@ class DatabaseReadinessReport:
     replay_claim_count: int
     expired_claim_count: int
     pending_evidence_reconciliation_count: int = 0
+    pending_evidence_reconciliations: tuple[PendingEvidenceReconciliation, ...] = field(default=(), repr=False)
 
 
 def _timeout(value: float) -> float:
@@ -425,13 +475,15 @@ def check_database(
                 replay_claim_count = 0
                 expired_claim_count = 0
                 pending_evidence_reconciliation_count = 0
+                pending_evidence_reconciliations: list[PendingEvidenceReconciliation] = []
                 claim_rows = connection.execute(
                     "SELECT cycle_id, fingerprint, state, generation, attempts, "
                     "owner_token, lease_expires_at, evidence_id "
                     "FROM sh3_replay_claims ORDER BY cycle_id"
                 )
                 for row in claim_rows:
-                    if _validate_claim(row, now):
+                    claim_is_expired = _validate_claim(row, now)
+                    if claim_is_expired:
                         expired_claim_count += 1
                     cycle_id = str(row["cycle_id"])
                     state = str(row["state"])
@@ -456,6 +508,24 @@ def check_database(
                                 evidence_links,
                                 claim_state="pending",
                             )
+                            raw_lease = row["lease_expires_at"]
+                            if state == "claimed":
+                                lease_expires_at = float(raw_lease)
+                                lease_expired: bool | None = lease_expires_at <= now
+                            else:
+                                lease_expires_at = None
+                                lease_expired = None
+                            pending_evidence_reconciliations.append(
+                                PendingEvidenceReconciliation(
+                                    cycle_id=cycle_id,
+                                    claim_state=state,
+                                    generation=int(row["generation"]),
+                                    attempts=int(row["attempts"]),
+                                    evidence_id=candidate_evidence_id,
+                                    lease_expires_at=lease_expires_at,
+                                    lease_expired=lease_expired,
+                                )
+                            )
                             pending_evidence_reconciliation_count += 1
                     replay_claim_count += 1
 
@@ -479,6 +549,7 @@ def check_database(
         replay_claim_count=replay_claim_count,
         expired_claim_count=expired_claim_count,
         pending_evidence_reconciliation_count=pending_evidence_reconciliation_count,
+        pending_evidence_reconciliations=tuple(pending_evidence_reconciliations),
     )
 
 
@@ -611,7 +682,12 @@ def restore_database(
     )
 
 
-def _print_report(report: DatabaseReadinessReport, *, action: str) -> None:
+def _print_report(
+    report: DatabaseReadinessReport,
+    *,
+    action: str,
+    include_pending_details: bool = False,
+) -> None:
     print(f"{action}: PASS")
     print(f"database={report.database_path}")
     print(f"sqlite_version={report.sqlite_version}")
@@ -629,6 +705,27 @@ def _print_report(report: DatabaseReadinessReport, *, action: str) -> None:
             "marked completed; it may be an active finalize window or require "
             "reconciliation after interruption"
         )
+    if include_pending_details:
+        for index, pending in enumerate(
+            report.pending_evidence_reconciliations, start=1
+        ):
+            lease_expired = (
+                "unknown"
+                if pending.lease_expired is None
+                else str(pending.lease_expired).lower()
+            )
+            lease_expires_at = (
+                "none"
+                if pending.lease_expires_at is None
+                else f"{pending.lease_expires_at:.6f}"
+            )
+            print(f"pending[{index}].cycle_id={pending.cycle_id}")
+            print(f"pending[{index}].claim_state={pending.claim_state}")
+            print(f"pending[{index}].generation={pending.generation}")
+            print(f"pending[{index}].attempts={pending.attempts}")
+            print(f"pending[{index}].lease_expired={lease_expired}")
+            print(f"pending[{index}].lease_expires_at={lease_expires_at}")
+            print(f"pending[{index}].evidence_id={pending.evidence_id}")
     if report.expired_claim_count:
         print(
             "warning=expired claims are present; verify that no stale worker can "
@@ -648,6 +745,11 @@ def _parser() -> argparse.ArgumentParser:
     check_parser.add_argument("--database", type=Path, required=True)
     check_parser.add_argument(
         "--timeout-seconds", type=float, default=_DEFAULT_TIMEOUT_SECONDS
+    )
+    check_parser.add_argument(
+        "--include-pending-cycle-ids",
+        action="store_true",
+        help="print pending cycle identifiers; they may reveal application identifiers",
     )
 
     backup_parser = subparsers.add_parser(
@@ -678,7 +780,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.database,
                 timeout_seconds=args.timeout_seconds,
             )
-            _print_report(report, action="CHECK")
+            _print_report(
+                report,
+                action="CHECK",
+                include_pending_details=args.include_pending_cycle_ids,
+            )
         elif args.command == "backup":
             report = backup_database(
                 args.database,
