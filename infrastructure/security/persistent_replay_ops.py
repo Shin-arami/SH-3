@@ -96,13 +96,37 @@ def _require_columns(
     connection: sqlite3.Connection,
     table: str,
     required: set[str],
+    *,
+    primary_key: str,
+    not_null: set[str],
 ) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-    actual = {str(row["name"]) for row in rows}
+    actual = {str(row["name"]): row for row in rows}
     if not required.issubset(actual):
-        missing = ", ".join(sorted(required - actual))
+        missing = ", ".join(sorted(required - set(actual)))
         raise PersistentReplayReadinessError(
             f"database schema is missing required columns in {table}: {missing}"
+        )
+
+    primary_keys = tuple(
+        str(row["name"])
+        for row in sorted(rows, key=lambda item: int(item["pk"]))
+        if int(row["pk"]) > 0
+    )
+    if primary_keys != (primary_key,):
+        raise PersistentReplayReadinessError(
+            f"database table {table} must use {primary_key} as its sole primary key"
+        )
+
+    nullable = sorted(
+        column
+        for column in not_null
+        if not bool(actual[column]["notnull"])
+    )
+    if nullable:
+        raise PersistentReplayReadinessError(
+            f"database schema requires NOT NULL columns in {table}: "
+            + ", ".join(nullable)
         )
 
 
@@ -218,8 +242,27 @@ def check_database(
                         "database is missing SH-3 table(s): "
                         + ", ".join(sorted(missing_tables))
                     )
-                _require_columns(connection, _EVIDENCE_TABLE, _EVIDENCE_COLUMNS)
-                _require_columns(connection, _CLAIM_TABLE, _CLAIM_COLUMNS)
+                _require_columns(
+                    connection,
+                    _EVIDENCE_TABLE,
+                    _EVIDENCE_COLUMNS,
+                    primary_key="evidence_id",
+                    not_null=_EVIDENCE_COLUMNS,
+                )
+                _require_columns(
+                    connection,
+                    _CLAIM_TABLE,
+                    _CLAIM_COLUMNS,
+                    primary_key="cycle_id",
+                    not_null={
+                        "cycle_id",
+                        "fingerprint",
+                        "state",
+                        "generation",
+                        "attempts",
+                        "updated_at",
+                    },
+                )
 
                 evidence_links: dict[str, tuple[str, str, object, str, object]] = {}
                 evidence_count = 0
