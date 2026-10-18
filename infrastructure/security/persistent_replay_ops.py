@@ -55,6 +55,7 @@ class DatabaseReadinessReport:
     evidence_count: int
     replay_claim_count: int
     expired_claim_count: int
+    pending_evidence_reconciliation_count: int = 0
 
 
 def _timeout(value: float) -> float:
@@ -181,6 +182,54 @@ def _required_text(name: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value
+
+def _validate_terminal_evidence_link(
+    cycle_id: str,
+    evidence_id: str,
+    evidence_links: Mapping[str, tuple[str, str, object, str, object]],
+    *,
+    claim_state: str,
+) -> None:
+    evidence_link = evidence_links.get(evidence_id)
+    if evidence_link is None:
+        raise PersistentReplayReadinessError(
+            f"{claim_state} replay claim references missing evidence: {cycle_id}"
+        )
+    (
+        evidence_kind,
+        evidence_source,
+        evidence_cycle_id,
+        evidence_subject_id,
+        evidence_result_id,
+    ) = evidence_link
+    if (
+        evidence_kind != "learning.closed_loop"
+        or evidence_source != "kernel.learning_feedback_loop"
+    ):
+        raise PersistentReplayReadinessError(
+            f"{claim_state} replay claim does not reference terminal "
+            f"closed-loop evidence: {cycle_id}"
+        )
+    if evidence_cycle_id != cycle_id:
+        raise PersistentReplayReadinessError(
+            f"{claim_state} replay claim evidence cycle identity "
+            f"mismatch: {cycle_id}"
+        )
+    if evidence_id != short_id(cycle_id, prefix="learning-closed-loop:"):
+        raise PersistentReplayReadinessError(
+            f"{claim_state} replay claim evidence identifier is not "
+            f"canonical for cycle: {cycle_id}"
+        )
+    if (
+        not isinstance(evidence_result_id, str)
+        or not evidence_result_id.strip()
+        or evidence_subject_id != evidence_result_id
+    ):
+        raise PersistentReplayReadinessError(
+            f"{claim_state} replay claim evidence result identity "
+            f"mismatch: {cycle_id}"
+        )
+
 
 def _validate_claim(row: sqlite3.Row, now: float) -> bool:
     cycle_id = row["cycle_id"]
@@ -375,6 +424,7 @@ def check_database(
                 now = time.time()
                 replay_claim_count = 0
                 expired_claim_count = 0
+                pending_evidence_reconciliation_count = 0
                 claim_rows = connection.execute(
                     "SELECT cycle_id, fingerprint, state, generation, attempts, "
                     "owner_token, lease_expires_at, evidence_id "
@@ -383,51 +433,30 @@ def check_database(
                 for row in claim_rows:
                     if _validate_claim(row, now):
                         expired_claim_count += 1
-                    if row["state"] == "completed":
-                        cycle_id = str(row["cycle_id"])
-                        evidence_id = row["evidence_id"]
-                        evidence_link = evidence_links.get(evidence_id)
-                        if evidence_link is None:
-                            raise PersistentReplayReadinessError(
-                                "completed replay claim references missing evidence: "
-                                f"{cycle_id}"
-                            )
-                        (
-                            evidence_kind,
-                            evidence_source,
-                            evidence_cycle_id,
-                            evidence_subject_id,
-                            evidence_result_id,
-                        ) = evidence_link
-                        if (
-                            evidence_kind != "learning.closed_loop"
-                            or evidence_source != "kernel.learning_feedback_loop"
-                        ):
-                            raise PersistentReplayReadinessError(
-                                "completed replay claim does not reference terminal "
-                                f"closed-loop evidence: {cycle_id}"
-                            )
-                        if evidence_cycle_id != cycle_id:
-                            raise PersistentReplayReadinessError(
-                                "completed replay claim evidence cycle identity "
-                                f"mismatch: {cycle_id}"
-                            )
-                        if evidence_id != short_id(
+                    cycle_id = str(row["cycle_id"])
+                    state = str(row["state"])
+                    if state == "completed":
+                        _validate_terminal_evidence_link(
+                            cycle_id,
+                            str(row["evidence_id"]),
+                            evidence_links,
+                            claim_state="completed",
+                        )
+                    else:
+                        # Evidence and claim completion use separate transactions.
+                        # A canonical record here may be a live finalize window or
+                        # a crash that the next run can reconcile safely.
+                        candidate_evidence_id = short_id(
                             cycle_id, prefix="learning-closed-loop:"
-                        ):
-                            raise PersistentReplayReadinessError(
-                                "completed replay claim evidence identifier is not "
-                                f"canonical for cycle: {cycle_id}"
+                        )
+                        if candidate_evidence_id in evidence_links:
+                            _validate_terminal_evidence_link(
+                                cycle_id,
+                                candidate_evidence_id,
+                                evidence_links,
+                                claim_state="pending",
                             )
-                        if (
-                            not isinstance(evidence_result_id, str)
-                            or not evidence_result_id.strip()
-                            or evidence_subject_id != evidence_result_id
-                        ):
-                            raise PersistentReplayReadinessError(
-                                "completed replay claim evidence result identity "
-                                f"mismatch: {cycle_id}"
-                            )
+                            pending_evidence_reconciliation_count += 1
                     replay_claim_count += 1
 
                 journal_row = connection.execute("PRAGMA journal_mode").fetchone()
@@ -449,6 +478,7 @@ def check_database(
         evidence_count=evidence_count,
         replay_claim_count=replay_claim_count,
         expired_claim_count=expired_claim_count,
+        pending_evidence_reconciliation_count=pending_evidence_reconciliation_count,
     )
 
 
@@ -589,6 +619,16 @@ def _print_report(report: DatabaseReadinessReport, *, action: str) -> None:
     print(f"evidence_records={report.evidence_count}")
     print(f"replay_claims={report.replay_claim_count}")
     print(f"expired_claims={report.expired_claim_count}")
+    print(
+        "pending_evidence_reconciliation="
+        f"{report.pending_evidence_reconciliation_count}"
+    )
+    if report.pending_evidence_reconciliation_count:
+        print(
+            "warning=canonical terminal evidence exists for a claim not yet "
+            "marked completed; it may be an active finalize window or require "
+            "reconciliation after interruption"
+        )
     if report.expired_claim_count:
         print(
             "warning=expired claims are present; verify that no stale worker can "
