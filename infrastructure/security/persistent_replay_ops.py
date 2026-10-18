@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from foundation.utils.hash import short_id
 from infrastructure.security import EvidenceRecord
 
 __all__ = [
@@ -220,6 +221,7 @@ def check_database(
                 _require_columns(connection, _EVIDENCE_TABLE, _EVIDENCE_COLUMNS)
                 _require_columns(connection, _CLAIM_TABLE, _CLAIM_COLUMNS)
 
+                evidence_links: dict[str, tuple[str, str, object, str, object]] = {}
                 evidence_count = 0
                 evidence_rows = connection.execute(
                     "SELECT evidence_id, record_json, integrity "
@@ -271,6 +273,13 @@ def check_database(
                             f"evidence row {evidence_count + 1} key does not "
                             "match its record"
                         )
+                    evidence_links[record.evidence_id] = (
+                        record.kind,
+                        record.source,
+                        record.payload.get("cycle_id"),
+                        record.subject_id,
+                        record.payload.get("result_id"),
+                    )
                     evidence_count += 1
 
                 now = time.time()
@@ -284,6 +293,51 @@ def check_database(
                 for row in claim_rows:
                     if _validate_claim(row, now):
                         expired_claim_count += 1
+                    if row["state"] == "completed":
+                        cycle_id = str(row["cycle_id"])
+                        evidence_id = row["evidence_id"]
+                        evidence_link = evidence_links.get(evidence_id)
+                        if evidence_link is None:
+                            raise PersistentReplayReadinessError(
+                                "completed replay claim references missing evidence: "
+                                f"{cycle_id}"
+                            )
+                        (
+                            evidence_kind,
+                            evidence_source,
+                            evidence_cycle_id,
+                            evidence_subject_id,
+                            evidence_result_id,
+                        ) = evidence_link
+                        if (
+                            evidence_kind != "learning.closed_loop"
+                            or evidence_source != "kernel.learning_feedback_loop"
+                        ):
+                            raise PersistentReplayReadinessError(
+                                "completed replay claim does not reference terminal "
+                                f"closed-loop evidence: {cycle_id}"
+                            )
+                        if evidence_cycle_id != cycle_id:
+                            raise PersistentReplayReadinessError(
+                                "completed replay claim evidence cycle identity "
+                                f"mismatch: {cycle_id}"
+                            )
+                        if evidence_id != short_id(
+                            cycle_id, prefix="learning-closed-loop:"
+                        ):
+                            raise PersistentReplayReadinessError(
+                                "completed replay claim evidence identifier is not "
+                                f"canonical for cycle: {cycle_id}"
+                            )
+                        if (
+                            not isinstance(evidence_result_id, str)
+                            or not evidence_result_id.strip()
+                            or evidence_subject_id != evidence_result_id
+                        ):
+                            raise PersistentReplayReadinessError(
+                                "completed replay claim evidence result identity "
+                                f"mismatch: {cycle_id}"
+                            )
                     replay_claim_count += 1
 
                 journal_row = connection.execute("PRAGMA journal_mode").fetchone()
