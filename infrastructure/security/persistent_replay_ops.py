@@ -42,6 +42,7 @@ _CLAIM_COLUMNS = {
 }
 _CLAIM_STATES = {"claimed", "completed", "released"}
 _DEFAULT_TIMEOUT_SECONDS = 5.0
+_EXIT_PENDING_RECONCILIATION_POLICY_GATE = 2
 
 
 class PersistentReplayReadinessError(RuntimeError):
@@ -751,6 +752,14 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print pending cycle identifiers; they may reveal application identifiers",
     )
+    check_parser.add_argument(
+        "--fail-on-pending-reconciliation",
+        action="store_true",
+        help=(
+            "exit with code 2 when terminal evidence exists beside a "
+            "non-completed claim"
+        ),
+    )
 
     backup_parser = subparsers.add_parser(
         "backup", help="create and verify a consistent online backup"
@@ -785,6 +794,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 action="CHECK",
                 include_pending_details=args.include_pending_cycle_ids,
             )
+            if args.fail_on_pending_reconciliation:
+                pending_count = report.pending_evidence_reconciliation_count
+                if pending_count:
+                    print("PENDING_RECONCILIATION_GATE: FAIL", file=sys.stderr)
+                    print(
+                        "ERROR: --fail-on-pending-reconciliation requires zero "
+                        "pending evidence reconciliations; "
+                        f"found {pending_count}",
+                        file=sys.stderr,
+                    )
+                    return _EXIT_PENDING_RECONCILIATION_POLICY_GATE
+                print("PENDING_RECONCILIATION_GATE: PASS")
         elif args.command == "backup":
             report = backup_database(
                 args.database,
