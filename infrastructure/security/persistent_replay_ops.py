@@ -43,6 +43,7 @@ _CLAIM_COLUMNS = {
 _CLAIM_STATES = {"claimed", "completed", "released"}
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _EXIT_PENDING_RECONCILIATION_POLICY_GATE = 2
+_EXIT_EXPIRED_CLAIM_POLICY_GATE = 3
 
 
 class PersistentReplayReadinessError(RuntimeError):
@@ -760,6 +761,13 @@ def _parser() -> argparse.ArgumentParser:
             "non-completed claim"
         ),
     )
+    check_parser.add_argument(
+        "--fail-on-expired-claims",
+        action="store_true",
+        help=(
+            "exit with code 3 when one or more replay claim leases have expired"
+        ),
+    )
 
     backup_parser = subparsers.add_parser(
         "backup", help="create and verify a consistent online backup"
@@ -794,6 +802,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 action="CHECK",
                 include_pending_details=args.include_pending_cycle_ids,
             )
+            policy_gate_exit_code = 0
             if args.fail_on_pending_reconciliation:
                 pending_count = report.pending_evidence_reconciliation_count
                 if pending_count:
@@ -804,8 +813,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"found {pending_count}",
                         file=sys.stderr,
                     )
-                    return _EXIT_PENDING_RECONCILIATION_POLICY_GATE
-                print("PENDING_RECONCILIATION_GATE: PASS")
+                    policy_gate_exit_code = _EXIT_PENDING_RECONCILIATION_POLICY_GATE
+                else:
+                    print("PENDING_RECONCILIATION_GATE: PASS")
+            if args.fail_on_expired_claims:
+                expired_count = report.expired_claim_count
+                if expired_count:
+                    print("EXPIRED_CLAIM_GATE: FAIL", file=sys.stderr)
+                    print(
+                        "ERROR: --fail-on-expired-claims requires zero expired "
+                        f"replay claim leases; found {expired_count}",
+                        file=sys.stderr,
+                    )
+                    if policy_gate_exit_code == 0:
+                        policy_gate_exit_code = _EXIT_EXPIRED_CLAIM_POLICY_GATE
+                else:
+                    print("EXPIRED_CLAIM_GATE: PASS")
+            if policy_gate_exit_code:
+                return policy_gate_exit_code
         elif args.command == "backup":
             report = backup_database(
                 args.database,
