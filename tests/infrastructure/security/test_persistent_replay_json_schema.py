@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from foundation.utils.hash import short_id
+from infrastructure.security import EvidenceRecord
 from infrastructure.security.persistent_replay_ops import main
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
@@ -260,3 +263,128 @@ def test_schema_enforces_policy_gate_exit_code_consistency() -> None:
     for gates, exit_code in invalid_cases:
         report = dict(base, policy_gates=gates, exit_code=exit_code)
         assert _validate_schema(report, schema, schema), (gates, exit_code)
+
+
+# PART11_40_RUNTIME_POLICY_GATE_SCHEMA_CONTRACT
+
+def _initialize_expired_claim(path: Path) -> None:
+    _initialize_database(path)
+    SQLiteReplayClaimStore(path).claim(
+        "learning-cycle:part11-40-expired-claim",
+        "sha256:part11-40-expired-claim",
+        lease_seconds=5.0,
+        now=datetime.now(UTC) - timedelta(seconds=60),
+    )
+
+
+def _initialize_claim_with_terminal_evidence(path: Path, *, expired: bool) -> None:
+    _initialize_database(path)
+    cycle_id = (
+        "learning-cycle:part11-40-expired-pending"
+        if expired
+        else "learning-cycle:part11-40-active-pending"
+    )
+    result_id = f"result:{cycle_id}"
+    now = datetime.now(UTC)
+    claimed_at = now - timedelta(seconds=60) if expired else now
+    lease_seconds = 5.0 if expired else 300.0
+    SQLiteReplayClaimStore(path).claim(
+        cycle_id,
+        f"sha256:{cycle_id}",
+        lease_seconds=lease_seconds,
+        now=claimed_at,
+    )
+    evidence = EvidenceRecord.create(
+        evidence_id=short_id(cycle_id, prefix="learning-closed-loop:"),
+        kind="learning.closed_loop",
+        source="kernel.learning_feedback_loop",
+        subject_id=result_id,
+        version="1.1.0",
+        trace_id=f"trace:{cycle_id}",
+        collected_at=datetime.now(UTC).isoformat(),
+        payload={"cycle_id": cycle_id, "result_id": result_id, "status": "completed"},
+    )
+    SQLiteEvidenceStore(path).register(evidence)
+
+
+def _run_schema_checked_json_check(
+    database: Path,
+    flags: tuple[str, ...],
+    *,
+    expected_exit_code: int,
+    expected_gates: dict[str, str],
+    schema: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+) -> str:
+    exit_code = main(["check", "--database", str(database), "--json", *flags])
+    captured = capsys.readouterr()
+    assert exit_code == expected_exit_code
+    assert captured.out.count("\n") == 1
+    report = _read_report(captured.out)
+    assert report["exit_code"] == exit_code
+    assert report["policy_gates"] == expected_gates
+    _assert_report_matches_schema(report, schema)
+    return captured.err
+
+
+def test_runtime_policy_gate_reports_conform_to_schema_for_pass_and_pending_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    schema = _load_schema()
+    clean_database = tmp_path / "runtime-gates-pass.sqlite3"
+    _initialize_database(clean_database)
+    stderr = _run_schema_checked_json_check(
+        clean_database,
+        ("--fail-on-pending-reconciliation", "--fail-on-expired-claims"),
+        expected_exit_code=0,
+        expected_gates={"pending_reconciliation": "pass", "expired_claims": "pass"},
+        schema=schema,
+        capsys=capsys,
+    )
+    assert stderr == ""
+
+    pending_database = tmp_path / "runtime-pending-active.sqlite3"
+    _initialize_claim_with_terminal_evidence(pending_database, expired=False)
+    stderr = _run_schema_checked_json_check(
+        pending_database,
+        ("--fail-on-pending-reconciliation", "--fail-on-expired-claims"),
+        expected_exit_code=2,
+        expected_gates={"pending_reconciliation": "fail", "expired_claims": "pass"},
+        schema=schema,
+        capsys=capsys,
+    )
+    assert "PENDING_RECONCILIATION_GATE: FAIL" in stderr
+    assert "EXPIRED_CLAIM_GATE: FAIL" not in stderr
+
+
+def test_runtime_policy_gate_reports_conform_to_schema_for_expired_and_combined_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    schema = _load_schema()
+    expired_database = tmp_path / "runtime-expired-only.sqlite3"
+    _initialize_expired_claim(expired_database)
+    stderr = _run_schema_checked_json_check(
+        expired_database,
+        ("--fail-on-expired-claims",),
+        expected_exit_code=3,
+        expected_gates={"expired_claims": "fail"},
+        schema=schema,
+        capsys=capsys,
+    )
+    assert "EXPIRED_CLAIM_GATE: FAIL" in stderr
+    assert "PENDING_RECONCILIATION_GATE: FAIL" not in stderr
+
+    combined_database = tmp_path / "runtime-both-gates-fail.sqlite3"
+    _initialize_claim_with_terminal_evidence(combined_database, expired=True)
+    stderr = _run_schema_checked_json_check(
+        combined_database,
+        ("--fail-on-pending-reconciliation", "--fail-on-expired-claims"),
+        expected_exit_code=2,
+        expected_gates={"pending_reconciliation": "fail", "expired_claims": "fail"},
+        schema=schema,
+        capsys=capsys,
+    )
+    assert "PENDING_RECONCILIATION_GATE: FAIL" in stderr
+    assert "EXPIRED_CLAIM_GATE: FAIL" in stderr
