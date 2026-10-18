@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "persistent-replay-report-v1.schema.json",
+  "title": "SH-3 Persistent Replay Operations Report v1",
+  "description": "Stable machine-readable result envelope for check, backup, and restore commands.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/success"
+    },
+    {
+      "$ref": "#/$defs/error"
+    }
+  ],
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "policyGates": {
+      "type": "object",
+      "properties": {
+        "pending_reconciliation": {
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        },
+        "expired_claims": {
+          "enum": [
+            "pass",
+            "fail"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "pendingReconciliation": {
+      "type": "object",
+      "required": [
+        "cycle_id",
+        "claim_state",
+        "generation",
+        "attempts",
+        "lease_expired",
+        "lease_expires_at",
+        "evidence_id"
+      ],
+      "properties": {
+        "cycle_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "claim_state": {
+          "enum": [
+            "claimed",
+            "released"
+          ]
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempts": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "lease_expired": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "lease_expires_at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "evidence_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "additionalProperties": false
+    },
+    "success": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "action",
+        "database",
+        "sqlite_version",
+        "journal_mode",
+        "integrity_status",
+        "evidence_records",
+        "replay_claims",
+        "expired_claims",
+        "pending_evidence_reconciliation",
+        "policy_gates",
+        "exit_code"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "action": {
+          "enum": [
+            "check",
+            "backup",
+            "restore"
+          ]
+        },
+        "database": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sqlite_version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "journal_mode": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "integrity_status": {
+          "const": "pass"
+        },
+        "evidence_records": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "replay_claims": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "expired_claims": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "pending_evidence_reconciliation": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "policy_gates": {
+          "$ref": "#/$defs/policyGates"
+        },
+        "exit_code": {
+          "type": "integer",
+          "enum": [
+            0,
+            2,
+            3
+          ]
+        },
+        "pending_reconciliations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pendingReconciliation"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "action",
+        "integrity_status",
+        "policy_gates",
+        "error",
+        "exit_code"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "action": {
+          "enum": [
+            "check",
+            "backup",
+            "restore"
+          ]
+        },
+        "integrity_status": {
+          "const": "error"
+        },
+        "policy_gates": {
+          "type": "object",
+          "maxProperties": 0,
+          "additionalProperties": false
+        },
+        "error": {
+          "type": "object",
+          "required": [
+            "code",
+            "type"
+          ],
+          "properties": {
+            "code": {
+              "enum": [
+                "readiness_check_failed",
+                "destination_exists",
+                "database_not_found",
+                "permission_denied",
+                "sqlite_error",
+                "invalid_argument",
+                "operating_system_error"
+              ]
+            },
+            "type": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          },
+          "additionalProperties": false
+        },
+        "exit_code": {
+          "type": "integer",
+          "const": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
