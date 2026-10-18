@@ -771,6 +771,8 @@ def _print_report(
 def _json_error_code(error: Exception) -> str:
     if isinstance(error, PersistentReplayReadinessError):
         return "readiness_check_failed"
+    if isinstance(error, FileExistsError):
+        return "destination_exists"
     if isinstance(error, FileNotFoundError):
         return "database_not_found"
     if isinstance(error, PermissionError):
@@ -847,6 +849,11 @@ def _parser() -> argparse.ArgumentParser:
     backup_parser.add_argument(
         "--timeout-seconds", type=float, default=_DEFAULT_TIMEOUT_SECONDS
     )
+    backup_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="write a machine-readable JSON operation report to stdout",
+    )
 
     restore_parser = subparsers.add_parser(
         "restore", help="restore to a new destination without overwriting"
@@ -855,6 +862,11 @@ def _parser() -> argparse.ArgumentParser:
     restore_parser.add_argument("--destination", type=Path, required=True)
     restore_parser.add_argument(
         "--timeout-seconds", type=float, default=_DEFAULT_TIMEOUT_SECONDS
+    )
+    restore_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="write a machine-readable JSON operation report to stdout",
     )
     return parser
 
@@ -922,27 +934,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.destination,
                 timeout_seconds=args.timeout_seconds,
             )
-            _print_report(report, action="BACKUP")
+            _print_report(report, action="BACKUP", json_output=args.json)
         else:
             report = restore_database(
                 args.backup,
                 args.destination,
                 timeout_seconds=args.timeout_seconds,
             )
-            _print_report(report, action="RESTORE")
+            _print_report(report, action="RESTORE", json_output=args.json)
     except (OSError, ValueError, sqlite3.Error) as exc:
-        if args.command == "check" and args.json:
+        if args.json:
             _print_json_error(
-                action="check",
+                action=args.command,
                 error_code=_json_error_code(exc),
                 error_type=type(exc).__name__,
             )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except PersistentReplayReadinessError as exc:
-        if args.command == "check" and args.json:
+        if args.json:
             _print_json_error(
-                action="check",
+                action=args.command,
                 error_code=_json_error_code(exc),
                 error_type=type(exc).__name__,
             )
