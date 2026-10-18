@@ -689,7 +689,40 @@ def _print_report(
     *,
     action: str,
     include_pending_details: bool = False,
+    json_output: bool = False,
+    policy_gates: Mapping[str, str] | None = None,
+    exit_code: int = 0,
 ) -> None:
+    if json_output:
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "action": action.lower(),
+            "database": str(report.database_path),
+            "sqlite_version": report.sqlite_version,
+            "journal_mode": report.journal_mode,
+            "integrity_status": "pass",
+            "evidence_records": report.evidence_count,
+            "replay_claims": report.replay_claim_count,
+            "expired_claims": report.expired_claim_count,
+            "pending_evidence_reconciliation": report.pending_evidence_reconciliation_count,
+            "policy_gates": dict(policy_gates or {}),
+            "exit_code": exit_code,
+        }
+        if include_pending_details:
+            payload["pending_reconciliations"] = [
+                {
+                    "cycle_id": pending.cycle_id,
+                    "claim_state": pending.claim_state,
+                    "generation": pending.generation,
+                    "attempts": pending.attempts,
+                    "lease_expired": pending.lease_expired,
+                    "lease_expires_at": pending.lease_expires_at,
+                    "evidence_id": pending.evidence_id,
+                }
+                for pending in report.pending_evidence_reconciliations
+            ]
+        print(json.dumps(payload, sort_keys=True))
+        return
     print(f"{action}: PASS")
     print(f"database={report.database_path}")
     print(f"sqlite_version={report.sqlite_version}")
@@ -749,6 +782,11 @@ def _parser() -> argparse.ArgumentParser:
         "--timeout-seconds", type=float, default=_DEFAULT_TIMEOUT_SECONDS
     )
     check_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="write a machine-readable JSON readiness report to stdout",
+    )
+    check_parser.add_argument(
         "--include-pending-cycle-ids",
         action="store_true",
         help="print pending cycle identifiers; they may reveal application identifiers",
@@ -797,37 +835,52 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.database,
                 timeout_seconds=args.timeout_seconds,
             )
+            policy_gate_exit_code = 0
+            policy_gate_results: dict[str, str] = {}
+            if args.fail_on_pending_reconciliation:
+                pending_count = report.pending_evidence_reconciliation_count
+                if pending_count:
+                    policy_gate_results["pending_reconciliation"] = "fail"
+                    policy_gate_exit_code = _EXIT_PENDING_RECONCILIATION_POLICY_GATE
+                else:
+                    policy_gate_results["pending_reconciliation"] = "pass"
+            if args.fail_on_expired_claims:
+                expired_count = report.expired_claim_count
+                if expired_count:
+                    policy_gate_results["expired_claims"] = "fail"
+                    if policy_gate_exit_code == 0:
+                        policy_gate_exit_code = _EXIT_EXPIRED_CLAIM_POLICY_GATE
+                else:
+                    policy_gate_results["expired_claims"] = "pass"
+
             _print_report(
                 report,
                 action="CHECK",
                 include_pending_details=args.include_pending_cycle_ids,
+                json_output=args.json,
+                policy_gates=policy_gate_results,
+                exit_code=policy_gate_exit_code,
             )
-            policy_gate_exit_code = 0
             if args.fail_on_pending_reconciliation:
-                pending_count = report.pending_evidence_reconciliation_count
-                if pending_count:
+                if policy_gate_results["pending_reconciliation"] == "fail":
                     print("PENDING_RECONCILIATION_GATE: FAIL", file=sys.stderr)
                     print(
                         "ERROR: --fail-on-pending-reconciliation requires zero "
                         "pending evidence reconciliations; "
-                        f"found {pending_count}",
+                        f"found {report.pending_evidence_reconciliation_count}",
                         file=sys.stderr,
                     )
-                    policy_gate_exit_code = _EXIT_PENDING_RECONCILIATION_POLICY_GATE
-                else:
+                elif not args.json:
                     print("PENDING_RECONCILIATION_GATE: PASS")
             if args.fail_on_expired_claims:
-                expired_count = report.expired_claim_count
-                if expired_count:
+                if policy_gate_results["expired_claims"] == "fail":
                     print("EXPIRED_CLAIM_GATE: FAIL", file=sys.stderr)
                     print(
                         "ERROR: --fail-on-expired-claims requires zero expired "
-                        f"replay claim leases; found {expired_count}",
+                        f"replay claim leases; found {report.expired_claim_count}",
                         file=sys.stderr,
                     )
-                    if policy_gate_exit_code == 0:
-                        policy_gate_exit_code = _EXIT_EXPIRED_CLAIM_POLICY_GATE
-                else:
+                elif not args.json:
                     print("EXPIRED_CLAIM_GATE: PASS")
             if policy_gate_exit_code:
                 return policy_gate_exit_code
