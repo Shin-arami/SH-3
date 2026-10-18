@@ -768,6 +768,38 @@ def _print_report(
         )
 
 
+def _json_error_code(error: Exception) -> str:
+    if isinstance(error, PersistentReplayReadinessError):
+        return "readiness_check_failed"
+    if isinstance(error, FileNotFoundError):
+        return "database_not_found"
+    if isinstance(error, PermissionError):
+        return "permission_denied"
+    if isinstance(error, sqlite3.Error):
+        return "sqlite_error"
+    if isinstance(error, ValueError):
+        return "invalid_argument"
+    return "operating_system_error"
+
+
+def _print_json_error(
+    *,
+    action: str,
+    error_code: str,
+    error_type: str,
+    exit_code: int = 1,
+) -> None:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "action": action,
+        "integrity_status": "error",
+        "policy_gates": {},
+        "error": {"code": error_code, "type": error_type},
+        "exit_code": exit_code,
+    }
+    print(json.dumps(payload, sort_keys=True))
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Check, back up, and restore SH-3 persistent replay SQLite storage."
@@ -899,9 +931,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _print_report(report, action="RESTORE")
     except (OSError, ValueError, sqlite3.Error) as exc:
+        if args.command == "check" and args.json:
+            _print_json_error(
+                action="check",
+                error_code=_json_error_code(exc),
+                error_type=type(exc).__name__,
+            )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except PersistentReplayReadinessError as exc:
+        if args.command == "check" and args.json:
+            _print_json_error(
+                action="check",
+                error_code=_json_error_code(exc),
+                error_type=type(exc).__name__,
+            )
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     return 0
