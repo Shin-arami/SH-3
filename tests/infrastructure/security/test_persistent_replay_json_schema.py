@@ -75,6 +75,21 @@ def _validate_schema(
         return [] if matches == 1 else [f"{path}: expected exactly one oneOf schema to match; got {matches}"]
 
     errors: list[str] = []
+    # JSON Schema conditional keywords used by the published contract.
+    if "allOf" in schema:
+        for subschema in schema["allOf"]:
+            errors.extend(_validate_schema(instance, subschema, root_schema, path))
+    if "if" in schema:
+        condition = schema["if"]
+        if isinstance(condition, dict):
+            branch = "then" if not _validate_schema(instance, condition, root_schema, path) else "else"
+            selected = schema.get(branch)
+            if isinstance(selected, dict):
+                errors.extend(_validate_schema(instance, selected, root_schema, path))
+    if "not" in schema:
+        forbidden = schema["not"]
+        if isinstance(forbidden, dict) and not _validate_schema(instance, forbidden, root_schema, path):
+            errors.append(f"{path}: instance matches a forbidden schema")
     if "type" in schema and not _schema_type_matches(instance, schema["type"]):
         return [f"{path}: does not match type {schema['type']!r}"]
     if "const" in schema and instance != schema["const"]:
@@ -201,3 +216,47 @@ def test_published_schema_rejects_unversioned_fields_and_invalid_exit_code() -> 
 
     invalid_extra = dict(sample, undocumented_future_field=True)
     assert _validate_schema(invalid_extra, success_schema, schema)
+
+
+def test_schema_enforces_policy_gate_exit_code_consistency() -> None:
+    schema = _load_schema()
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "action": "check",
+        "database": "state.sqlite3",
+        "sqlite_version": "3.45.0",
+        "journal_mode": "wal",
+        "integrity_status": "pass",
+        "evidence_records": 0,
+        "replay_claims": 0,
+        "expired_claims": 0,
+        "pending_evidence_reconciliation": 0,
+        "policy_gates": {},
+        "exit_code": 0,
+    }
+    valid_cases = (
+        ({}, 0),
+        ({"pending_reconciliation": "pass"}, 0),
+        ({"expired_claims": "pass"}, 0),
+        ({"pending_reconciliation": "pass", "expired_claims": "pass"}, 0),
+        ({"pending_reconciliation": "fail"}, 2),
+        ({"pending_reconciliation": "fail", "expired_claims": "fail"}, 2),
+        ({"expired_claims": "fail"}, 3),
+        ({"pending_reconciliation": "pass", "expired_claims": "fail"}, 3),
+    )
+    for gates, exit_code in valid_cases:
+        report = dict(base, policy_gates=gates, exit_code=exit_code)
+        assert not _validate_schema(report, schema, schema), (gates, exit_code)
+
+    invalid_cases = (
+        ({"pending_reconciliation": "fail"}, 0),
+        ({"expired_claims": "fail"}, 0),
+        ({"expired_claims": "fail"}, 2),
+        ({"pending_reconciliation": "pass"}, 2),
+        ({}, 2),
+        ({}, 3),
+        ({"pending_reconciliation": "fail", "expired_claims": "fail"}, 3),
+    )
+    for gates, exit_code in invalid_cases:
+        report = dict(base, policy_gates=gates, exit_code=exit_code)
+        assert _validate_schema(report, schema, schema), (gates, exit_code)

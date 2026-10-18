@@ -1,3 +1,4 @@
+
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "persistent-replay-report-v1.schema.json",
@@ -154,7 +155,104 @@
           }
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "exit_code": {
+                "const": 0
+              }
+            },
+            "required": [
+              "exit_code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "policy_gates": {
+                "properties": {
+                  "pending_reconciliation": {
+                    "const": "pass"
+                  },
+                  "expired_claims": {
+                    "const": "pass"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "exit_code": {
+                "const": 2
+              }
+            },
+            "required": [
+              "exit_code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "policy_gates": {
+                "required": [
+                  "pending_reconciliation"
+                ],
+                "properties": {
+                  "pending_reconciliation": {
+                    "const": "fail"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "exit_code": {
+                "const": 3
+              }
+            },
+            "required": [
+              "exit_code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "policy_gates": {
+                "required": [
+                  "expired_claims"
+                ],
+                "properties": {
+                  "expired_claims": {
+                    "const": "fail"
+                  }
+                }
+              }
+            },
+            "not": {
+              "required": [
+                "policy_gates"
+              ],
+              "properties": {
+                "policy_gates": {
+                  "required": [
+                    "pending_reconciliation"
+                  ],
+                  "properties": {
+                    "pending_reconciliation": {
+                      "const": "fail"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "error": {
       "type": "object",
