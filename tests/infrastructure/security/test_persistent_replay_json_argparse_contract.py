@@ -62,3 +62,34 @@ def test_argparse_usage_errors_are_not_operation_json_envelopes(
     assert result.stderr.lower().startswith("usage:")
     assert "error:" in result.stderr.lower()
     assert "traceback" not in result.stderr.lower()
+
+# PART11_51_PARSE_ERROR_DISCLOSURE_INVARIANCE
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("check", "--json"),
+        (
+            "check",
+            "--database",
+            "private-parse-error.sqlite3",
+            "--json",
+            "--timeout-seconds",
+            "not-a-number",
+        ),
+    ),
+    ids=("missing-required-database", "invalid-timeout-conversion"),
+)
+def test_argparse_usage_error_is_invariant_under_pending_identifier_disclosure(
+    arguments: tuple[str, ...],
+) -> None:
+    redacted = _run_cli(*arguments)
+    disclosed = _run_cli(*arguments, "--include-pending-cycle-ids")
+
+    assert redacted.returncode == disclosed.returncode == 2
+    assert redacted.stdout == disclosed.stdout == ""
+    assert redacted.stderr == disclosed.stderr
+    assert redacted.stderr.lower().startswith("usage:")
+    assert "error:" in redacted.stderr.lower()
+    assert "traceback" not in redacted.stderr.lower()
+    assert "private-parse-error.sqlite3" not in redacted.stderr
