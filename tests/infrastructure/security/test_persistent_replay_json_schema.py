@@ -450,3 +450,55 @@ def test_published_schema_accepts_redacted_and_explicit_pending_identifier_repor
     assert details[0]["evidence_id"] == evidence_id
     assert details[0]["lease_expired"] is True
     _assert_report_matches_schema(disclosed_report, schema)
+
+# PART11_46_JSON_POLICY_GATE_DISCLOSURE_INVARIANCE
+
+def test_pending_identifier_disclosure_does_not_change_policy_gate_result(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    schema = _load_schema()
+    database = tmp_path / "policy-gate-disclosure-invariance.sqlite3"
+    _initialize_claim_with_terminal_evidence(database, expired=False)
+    cycle_id = "learning-cycle:part11-40-active-pending"
+    evidence_id = short_id(cycle_id, prefix="learning-closed-loop:")
+    arguments = [
+        "check",
+        "--database",
+        str(database),
+        "--json",
+        "--fail-on-pending-reconciliation",
+    ]
+
+    assert main(arguments) == 2
+    redacted_capture = capsys.readouterr()
+    assert redacted_capture.out.count("\n") == 1
+    assert cycle_id not in redacted_capture.out
+    assert evidence_id not in redacted_capture.out
+    assert "PENDING_RECONCILIATION_GATE: FAIL" in redacted_capture.err
+    redacted_report = _read_report(redacted_capture.out)
+    assert redacted_report["pending_evidence_reconciliation"] == 1
+    assert redacted_report["policy_gates"] == {"pending_reconciliation": "fail"}
+    assert redacted_report["exit_code"] == 2
+    assert "pending_reconciliations" not in redacted_report
+    _assert_report_matches_schema(redacted_report, schema)
+
+    assert main([*arguments, "--include-pending-cycle-ids"]) == 2
+    disclosed_capture = capsys.readouterr()
+    assert disclosed_capture.out.count("\n") == 1
+    assert disclosed_capture.err == redacted_capture.err
+    disclosed_report = _read_report(disclosed_capture.out)
+    assert disclosed_report["pending_evidence_reconciliation"] == 1
+    assert disclosed_report["policy_gates"] == {"pending_reconciliation": "fail"}
+    assert disclosed_report["exit_code"] == 2
+    details = disclosed_report["pending_reconciliations"]
+    assert len(details) == 1
+    assert details[0]["cycle_id"] == cycle_id
+    assert details[0]["evidence_id"] == evidence_id
+    assert details[0]["lease_expired"] is False
+    assert redacted_report == {
+        key: value
+        for key, value in disclosed_report.items()
+        if key != "pending_reconciliations"
+    }
+    _assert_report_matches_schema(disclosed_report, schema)
