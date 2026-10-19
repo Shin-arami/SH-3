@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
@@ -149,3 +151,56 @@ def test_restore_process_reports_existing_destination_without_overwrite(
     assert result.stderr.startswith("ERROR:")
     assert str(destination) in result.stderr
     assert destination.read_bytes() == original_content
+
+# PART11_52_BACKUP_RESTORE_TIMEOUT_ERROR_PROCESS_CONTRACT
+
+@pytest.mark.parametrize("action", ("backup", "restore"))
+@pytest.mark.parametrize("timeout_value", ("0", "nan", "inf"))
+def test_backup_restore_process_rejects_invalid_timeout_with_stable_json_error(
+    tmp_path: Path,
+    action: str,
+    timeout_value: str,
+) -> None:
+    source = tmp_path / f"private-{action}-source.sqlite3"
+    destination = tmp_path / f"private-{action}-destination.sqlite3"
+    if action == "backup":
+        arguments = (
+            "backup",
+            "--database",
+            str(source),
+            "--destination",
+            str(destination),
+            "--timeout-seconds",
+            timeout_value,
+            "--json",
+        )
+    else:
+        arguments = (
+            "restore",
+            "--backup",
+            str(source),
+            "--destination",
+            str(destination),
+            "--timeout-seconds",
+            timeout_value,
+            "--json",
+        )
+
+    result = _run_cli(*arguments)
+
+    assert result.returncode == 1, result.stderr
+    assert result.stdout.count("\n") == 1
+    assert result.stderr == (
+        "ERROR: timeout_seconds must be finite and greater than zero\n"
+    )
+    assert _read_report(result.stdout) == {
+        "schema_version": 1,
+        "action": action,
+        "integrity_status": "error",
+        "policy_gates": {},
+        "error": {"code": "invalid_argument", "type": "ValueError"},
+        "exit_code": 1,
+    }
+    for private_path in (source, destination):
+        assert str(private_path) not in result.stdout + result.stderr
+        assert not private_path.exists()
