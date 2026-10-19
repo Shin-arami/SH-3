@@ -93,3 +93,48 @@ def test_argparse_usage_error_is_invariant_under_pending_identifier_disclosure(
     assert "error:" in redacted.stderr.lower()
     assert "traceback" not in redacted.stderr.lower()
     assert "private-parse-error.sqlite3" not in redacted.stderr
+
+# PART11_53_DISCLOSURE_FLAG_CHECK_COMMAND_SCOPE
+
+@pytest.mark.parametrize("command", ("backup", "restore"), ids=("backup", "restore"))
+def test_pending_identifier_disclosure_option_is_rejected_for_non_check_commands(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    source = tmp_path / f"private-{command}-source.sqlite3"
+    destination = tmp_path / f"private-{command}-destination.sqlite3"
+    if command == "backup":
+        arguments = (
+            "backup",
+            "--database",
+            str(source),
+            "--destination",
+            str(destination),
+            "--json",
+            "--include-pending-cycle-ids",
+        )
+    else:
+        arguments = (
+            "restore",
+            "--backup",
+            str(source),
+            "--destination",
+            str(destination),
+            "--json",
+            "--include-pending-cycle-ids",
+        )
+
+    result = _run_cli(*arguments)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.startswith(
+        "usage: persistent_replay_ops.py "
+    )
+    assert "unrecognized arguments:" in result.stderr
+    assert "--include-pending-cycle-ids" in result.stderr
+    assert "traceback" not in result.stderr.lower()
+    assert str(source) not in result.stderr
+    assert str(destination) not in result.stderr
+    assert not source.exists()
+    assert not destination.exists()
