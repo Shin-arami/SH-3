@@ -181,3 +181,64 @@ def test_module_cli_policy_gate_results_are_invariant_under_identifier_disclosur
         for key, value in disclosed_report.items()
         if key != "pending_reconciliations"
     }
+
+# PART11_48_JSON_EXPIRED_CLAIM_GATE_PROCESS_DISCLOSURE_INVARIANCE
+
+def test_module_cli_expired_claim_gate_result_is_invariant_under_identifier_disclosure(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "expired-gate-disclosure-process.sqlite3"
+    cycle_id, evidence_id = _database_with_pending_terminal_evidence(database)
+    arguments = (
+        "check",
+        "--database",
+        str(database),
+        "--json",
+        "--fail-on-expired-claims",
+    )
+
+    redacted = _run_cli(*arguments)
+    assert redacted.returncode == 3
+    assert redacted.stdout.count("\n") == 1
+    assert "EXPIRED_CLAIM_GATE: FAIL" in redacted.stderr
+    assert "PENDING_RECONCILIATION_GATE" not in redacted.stderr
+    assert cycle_id not in redacted.stdout + redacted.stderr
+    assert evidence_id not in redacted.stdout + redacted.stderr
+
+    redacted_report = _read_report(redacted.stdout)
+    assert redacted_report["action"] == "check"
+    assert redacted_report["exit_code"] == redacted.returncode
+    assert redacted_report["pending_evidence_reconciliation"] == 1
+    assert redacted_report["expired_claims"] == 1
+    assert redacted_report["policy_gates"] == {"expired_claims": "fail"}
+    assert "pending_reconciliations" not in redacted_report
+
+    disclosed = _run_cli(*arguments, "--include-pending-cycle-ids")
+    assert disclosed.returncode == redacted.returncode
+    assert disclosed.stdout.count("\n") == 1
+    assert disclosed.stderr == redacted.stderr
+    assert "PENDING_RECONCILIATION_GATE" not in disclosed.stderr
+    assert cycle_id not in disclosed.stderr
+    assert evidence_id not in disclosed.stderr
+
+    disclosed_report = _read_report(disclosed.stdout)
+    assert disclosed_report["action"] == "check"
+    assert disclosed_report["exit_code"] == disclosed.returncode
+    assert disclosed_report["pending_evidence_reconciliation"] == 1
+    assert disclosed_report["expired_claims"] == 1
+    assert disclosed_report["policy_gates"] == {"expired_claims": "fail"}
+    details = disclosed_report["pending_reconciliations"]
+    assert len(details) == 1
+    assert details[0]["cycle_id"] == cycle_id
+    assert details[0]["evidence_id"] == evidence_id
+    assert details[0]["claim_state"] == "claimed"
+    assert details[0]["generation"] == 1
+    assert details[0]["attempts"] == 1
+    assert details[0]["lease_expired"] is True
+    assert cycle_id in disclosed.stdout
+    assert evidence_id in disclosed.stdout
+    assert redacted_report == {
+        key: value
+        for key, value in disclosed_report.items()
+        if key != "pending_reconciliations"
+    }
