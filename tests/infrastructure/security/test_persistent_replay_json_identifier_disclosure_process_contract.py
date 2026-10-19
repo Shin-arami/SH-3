@@ -242,3 +242,57 @@ def test_module_cli_expired_claim_gate_result_is_invariant_under_identifier_disc
         for key, value in disclosed_report.items()
         if key != "pending_reconciliations"
     }
+
+# PART11_49_JSON_ERROR_REPORT_DISCLOSURE_INVARIANCE
+
+def test_module_cli_readiness_error_report_is_invariant_under_identifier_disclosure(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private-readiness-error.sqlite3"
+    SQLiteEvidenceStore(database)
+    cycle_id = "learning-cycle:error-disclosure-invariance"
+    result_id = "result:error-disclosure-invariance"
+    evidence_id = short_id(cycle_id, prefix="learning-closed-loop:")
+    evidence = EvidenceRecord.create(
+        evidence_id=evidence_id,
+        kind="learning.closed_loop",
+        source="kernel.learning_feedback_loop",
+        subject_id=result_id,
+        version="1.1.0",
+        trace_id=f"trace:{cycle_id}",
+        collected_at=datetime.now(UTC).isoformat(),
+        payload={"cycle_id": cycle_id, "result_id": result_id, "status": "completed"},
+    )
+    SQLiteEvidenceStore(database).register(evidence)
+    arguments = ("check", "--database", str(database), "--json")
+
+    redacted = _run_cli(*arguments)
+    assert redacted.returncode == 1
+    assert redacted.stdout.count("\n") == 1
+    assert redacted.stderr.startswith("ERROR:")
+    assert cycle_id not in redacted.stdout + redacted.stderr
+    assert evidence_id not in redacted.stdout + redacted.stderr
+    redacted_report = _read_report(redacted.stdout)
+    assert redacted_report == {
+        "action": "check",
+        "error": {
+            "code": "readiness_check_failed",
+            "type": "PersistentReplayReadinessError",
+        },
+        "exit_code": 1,
+        "integrity_status": "error",
+        "policy_gates": {},
+        "schema_version": 1,
+    }
+    assert "pending_reconciliations" not in redacted_report
+
+    disclosed = _run_cli(*arguments, "--include-pending-cycle-ids")
+    assert disclosed.returncode == redacted.returncode
+    assert disclosed.stdout.count("\n") == 1
+    assert disclosed.stdout == redacted.stdout
+    assert disclosed.stderr == redacted.stderr
+    assert cycle_id not in disclosed.stdout + disclosed.stderr
+    assert evidence_id not in disclosed.stdout + disclosed.stderr
+    disclosed_report = _read_report(disclosed.stdout)
+    assert disclosed_report == redacted_report
+    assert "pending_reconciliations" not in disclosed_report
