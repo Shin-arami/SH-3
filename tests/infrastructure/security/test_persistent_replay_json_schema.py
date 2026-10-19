@@ -388,3 +388,65 @@ def test_runtime_policy_gate_reports_conform_to_schema_for_expired_and_combined_
     )
     assert "PENDING_RECONCILIATION_GATE: FAIL" in stderr
     assert "EXPIRED_CLAIM_GATE: FAIL" in stderr
+
+# PART11_45_JSON_SCHEMA_IDENTIFIER_DISCLOSURE_CONTRACT
+
+def test_published_schema_accepts_redacted_and_explicit_pending_identifier_reports(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    schema = _load_schema()
+    database = tmp_path / "schema-pending-identifiers.sqlite3"
+    _initialize_database(database)
+    cycle_id = "learning-cycle:schema-identifier-disclosure"
+    result_id = "result:schema-identifier-disclosure"
+    SQLiteReplayClaimStore(database).claim(
+        cycle_id,
+        "sha256:schema-identifier-disclosure",
+        lease_seconds=5.0,
+        now=datetime.now(UTC) - timedelta(seconds=60),
+    )
+    evidence_id = short_id(cycle_id, prefix="learning-closed-loop:")
+    evidence = EvidenceRecord.create(
+        evidence_id=evidence_id,
+        kind="learning.closed_loop",
+        source="kernel.learning_feedback_loop",
+        subject_id=result_id,
+        version="1.1.0",
+        trace_id=f"trace:{cycle_id}",
+        collected_at=datetime.now(UTC).isoformat(),
+        payload={"cycle_id": cycle_id, "result_id": result_id, "status": "completed"},
+    )
+    SQLiteEvidenceStore(database).register(evidence)
+
+    assert main(["check", "--database", str(database), "--json"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    redacted_report = _read_report(captured.out)
+    assert redacted_report["pending_evidence_reconciliation"] == 1
+    assert "pending_reconciliations" not in redacted_report
+    assert cycle_id not in captured.out
+    assert evidence_id not in captured.out
+    _assert_report_matches_schema(redacted_report, schema)
+
+    assert main(
+        [
+            "check",
+            "--database",
+            str(database),
+            "--json",
+            "--include-pending-cycle-ids",
+        ]
+    ) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    disclosed_report = _read_report(captured.out)
+    assert disclosed_report["pending_evidence_reconciliation"] == 1
+    details = disclosed_report["pending_reconciliations"]
+    assert len(details) == 1
+    assert details[0]["cycle_id"] == cycle_id
+    assert details[0]["evidence_id"] == evidence_id
+    assert details[0]["lease_expired"] is True
+    _assert_report_matches_schema(disclosed_report, schema)
