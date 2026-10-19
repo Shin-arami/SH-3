@@ -296,3 +296,42 @@ def test_module_cli_readiness_error_report_is_invariant_under_identifier_disclos
     disclosed_report = _read_report(disclosed.stdout)
     assert disclosed_report == redacted_report
     assert "pending_reconciliations" not in disclosed_report
+
+# PART11_50_JSON_ARGUMENT_VALIDATION_ERROR_DISCLOSURE_INVARIANCE
+
+def test_module_cli_invalid_timeout_error_is_invariant_under_identifier_disclosure(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private-invalid-timeout-database.sqlite3"
+    expected_report = {
+        "schema_version": 1,
+        "action": "check",
+        "integrity_status": "error",
+        "policy_gates": {},
+        "error": {"code": "invalid_argument", "type": "ValueError"},
+        "exit_code": 1,
+    }
+
+    for timeout_value in ("0", "nan", "inf"):
+        arguments = (
+            "check",
+            "--database",
+            str(database),
+            "--timeout-seconds",
+            timeout_value,
+            "--json",
+        )
+        redacted = _run_cli(*arguments)
+        assert redacted.returncode == 1, timeout_value
+        assert redacted.stdout.count("\n") == 1, timeout_value
+        assert redacted.stderr.startswith("ERROR:"), timeout_value
+        assert str(database) not in redacted.stdout + redacted.stderr
+        redacted_report = _read_report(redacted.stdout)
+        assert redacted_report == expected_report, timeout_value
+
+        disclosed = _run_cli(*arguments, "--include-pending-cycle-ids")
+        assert disclosed.returncode == redacted.returncode, timeout_value
+        assert disclosed.stdout == redacted.stdout, timeout_value
+        assert disclosed.stderr == redacted.stderr, timeout_value
+        assert str(database) not in disclosed.stdout + disclosed.stderr
+        assert _read_report(disclosed.stdout) == redacted_report, timeout_value
