@@ -653,6 +653,8 @@ def _create_verified_snapshot(
             ) from exc
         return check_database(destination, timeout_seconds=timeout)
     finally:
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(f"{temporary}{suffix}").unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
 
 
