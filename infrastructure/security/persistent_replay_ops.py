@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from foundation.utils.hash import short_id
@@ -639,7 +639,7 @@ def _create_verified_snapshot(
     temporary = Path(temporary_name)
     try:
         _backup_to_temporary(source, temporary, timeout_seconds=timeout)
-        check_database(temporary, timeout_seconds=timeout)
+        snapshot_report = check_database(temporary, timeout_seconds=timeout)
         try:
             os.link(temporary, destination)
         except FileExistsError:
@@ -651,7 +651,7 @@ def _create_verified_snapshot(
                 "could not publish the verified snapshot without overwriting; "
                 "check destination permissions and same-filesystem hard-link support"
             ) from exc
-        return check_database(destination, timeout_seconds=timeout)
+        return replace(snapshot_report, database_path=destination)
     finally:
         for suffix in ("-wal", "-shm", "-journal"):
             Path(f"{temporary}{suffix}").unlink(missing_ok=True)
