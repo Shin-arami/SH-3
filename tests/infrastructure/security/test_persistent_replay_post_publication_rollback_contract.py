@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -47,10 +48,12 @@ def test_published_snapshot_report_uses_prevalidated_inode_without_reopening_des
         database_path: str | os.PathLike[str],
         *,
         timeout_seconds: float = 5.0,
+        _connection: sqlite3.Connection | None = None,
     ) -> replay_ops.DatabaseReadinessReport:
         report = original_check_database(
             database_path,
             timeout_seconds=timeout_seconds,
+            _connection=_connection,
         )
         checked_paths.append(Path(database_path).resolve())
         checked_reports.append(report)

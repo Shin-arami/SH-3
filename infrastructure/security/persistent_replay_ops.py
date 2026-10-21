@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -352,12 +352,18 @@ def check_database(
     database_path: str | os.PathLike[str],
     *,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    _connection: sqlite3.Connection | None = None,
 ) -> DatabaseReadinessReport:
     """Run read-only SQLite and SH-3 evidence/claim consistency checks."""
     timeout = _timeout(timeout_seconds)
     path = _existing_database(database_path)
     try:
-        with _readonly_connection(path, timeout_seconds=timeout) as connection:
+        connection_context = (
+            _readonly_connection(path, timeout_seconds=timeout)
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with connection_context as connection:
             connection.execute("BEGIN")
             try:
                 integrity_rows = tuple(
@@ -586,19 +592,22 @@ def _backup_to_temporary(
     destination: Path,
     *,
     timeout_seconds: float,
+    source_connection: sqlite3.Connection | None = None,
 ) -> None:
-    source_connection: sqlite3.Connection | None = None
+    owns_source_connection = source_connection is None
+    active_source_connection = source_connection
     destination_connection: sqlite3.Connection | None = None
     try:
-        source_connection = sqlite3.connect(
-            f"{source.as_uri()}?mode=ro",
-            uri=True,
-            timeout=timeout_seconds,
-            isolation_level=None,
-        )
-        source_connection.execute(
-            f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}"
-        )
+        if active_source_connection is None:
+            active_source_connection = sqlite3.connect(
+                f"{source.as_uri()}?mode=ro",
+                uri=True,
+                timeout=timeout_seconds,
+                isolation_level=None,
+            )
+            active_source_connection.execute(
+                f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}"
+            )
         destination_connection = sqlite3.connect(
             destination,
             timeout=timeout_seconds,
@@ -607,7 +616,7 @@ def _backup_to_temporary(
         destination_connection.execute(
             f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}"
         )
-        source_connection.backup(destination_connection, pages=256, sleep=0.05)
+        active_source_connection.backup(destination_connection, pages=256, sleep=0.05)
     except sqlite3.Error as exc:
         raise PersistentReplayReadinessError(
             f"SQLite online backup failed from {source.name}: {exc}"
@@ -615,8 +624,8 @@ def _backup_to_temporary(
     finally:
         if destination_connection is not None:
             destination_connection.close()
-        if source_connection is not None:
-            source_connection.close()
+        if owns_source_connection and active_source_connection is not None:
+            active_source_connection.close()
 
 
 def _source_file_identity(path: Path) -> tuple[int, int]:
@@ -650,42 +659,56 @@ def _create_verified_snapshot(
     timeout = _timeout(timeout_seconds)
     source = _existing_database(source_path)
     source_identity = _source_file_identity(source)
-    check_database(source, timeout_seconds=timeout)
-    _require_source_identity(source, source_identity, phase="during preflight")
-    destination = _prepare_destination(destination_path, source)
 
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".partial",
-        dir=destination.parent,
-    )
-    os.close(file_descriptor)
-    temporary = Path(temporary_name)
-    try:
-        _require_source_identity(
-            source, source_identity, phase="before snapshot creation"
+    # Keep one read-only SQLite connection for source preflight and online backup.
+    # A pathname replacement cannot silently redirect the backup to a second file.
+    with _readonly_connection(source, timeout_seconds=timeout) as source_connection:
+        _require_source_identity(source, source_identity, phase="before preflight")
+        check_database(
+            source,
+            timeout_seconds=timeout,
+            _connection=source_connection,
         )
-        _backup_to_temporary(source, temporary, timeout_seconds=timeout)
-        _require_source_identity(
-            source, source_identity, phase="during snapshot creation"
+        _require_source_identity(source, source_identity, phase="during preflight")
+        destination = _prepare_destination(destination_path, source)
+
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".partial",
+            dir=destination.parent,
         )
-        snapshot_report = check_database(temporary, timeout_seconds=timeout)
+        os.close(file_descriptor)
+        temporary = Path(temporary_name)
         try:
-            os.link(temporary, destination)
-        except FileExistsError:
-            raise FileExistsError(
-                f"refusing to overwrite existing destination: {destination}"
-            ) from None
-        except OSError as exc:
-            raise PersistentReplayReadinessError(
-                "could not publish the verified snapshot without overwriting; "
-                "check destination permissions and same-filesystem hard-link support"
-            ) from exc
-        return replace(snapshot_report, database_path=destination)
-    finally:
-        for suffix in ("-wal", "-shm", "-journal"):
-            Path(f"{temporary}{suffix}").unlink(missing_ok=True)
-        temporary.unlink(missing_ok=True)
+            _require_source_identity(
+                source, source_identity, phase="before snapshot creation"
+            )
+            _backup_to_temporary(
+                source,
+                temporary,
+                timeout_seconds=timeout,
+                source_connection=source_connection,
+            )
+            _require_source_identity(
+                source, source_identity, phase="during snapshot creation"
+            )
+            snapshot_report = check_database(temporary, timeout_seconds=timeout)
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                raise FileExistsError(
+                    f"refusing to overwrite existing destination: {destination}"
+                ) from None
+            except OSError as exc:
+                raise PersistentReplayReadinessError(
+                    "could not publish the verified snapshot without overwriting; "
+                    "check destination permissions and same-filesystem hard-link support"
+                ) from exc
+            return replace(snapshot_report, database_path=destination)
+        finally:
+            for suffix in ("-wal", "-shm", "-journal"):
+                Path(f"{temporary}{suffix}").unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
 
 
 def backup_database(

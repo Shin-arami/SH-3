@@ -6,13 +6,13 @@ Part 11-60 closes the destructive post-publication rollback race. This part addr
 
 ## Contract
 
-Deterministic tests exercise both `backup` and `restore` while replacing the source pathname with a different, valid database during snapshot creation.
+Deterministic tests exercise both `backup` and `restore` while injecting an observable source-identity drift during snapshot creation. The injected identity drift is platform-neutral and does not rename an open SQLite file.
 
 - Capture the resolved source file identity before readiness preflight.
 - Recheck the identity after preflight and immediately before snapshot creation.
 - Recheck the identity after the online snapshot returns and before snapshot verification/publication.
 - If a checkpoint observes a different source identity, fail closed using the existing readiness-error envelope.
-- Do not publish the destination or write to the source file; clean the temporary snapshot. The race test restores the intentionally displaced source inode in its own `finally` block and verifies its original bytes.
+- Do not publish the destination or write to the source file; clean the temporary snapshot. The fault-injection test verifies the source bytes remain unchanged and the destination is never published.
 - Keep the published CLI arguments and JSON Schema unchanged.
 
 ## Scope note
