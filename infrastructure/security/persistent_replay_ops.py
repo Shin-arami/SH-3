@@ -622,10 +622,12 @@ def _backup_to_temporary(
             f"SQLite online backup failed from {source.name}: {exc}"
         ) from exc
     finally:
-        if destination_connection is not None:
-            destination_connection.close()
-        if owns_source_connection and active_source_connection is not None:
-            active_source_connection.close()
+        try:
+            if destination_connection is not None:
+                destination_connection.close()
+        finally:
+            if owns_source_connection and active_source_connection is not None:
+                active_source_connection.close()
 
 
 def _source_file_identity(path: Path) -> tuple[int, int]:
