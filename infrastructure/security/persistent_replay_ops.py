@@ -619,6 +619,28 @@ def _backup_to_temporary(
             source_connection.close()
 
 
+def _source_file_identity(path: Path) -> tuple[int, int]:
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise PersistentReplayReadinessError(
+            "source database file identity could not be verified"
+        ) from exc
+    return metadata.st_dev, metadata.st_ino
+
+
+def _require_source_identity(
+    source: Path,
+    expected: tuple[int, int],
+    *,
+    phase: str,
+) -> None:
+    if _source_file_identity(source) != expected:
+        raise PersistentReplayReadinessError(
+            f"source database file identity changed {phase}"
+        )
+
+
 def _create_verified_snapshot(
     source_path: str | os.PathLike[str],
     destination_path: str | os.PathLike[str],
@@ -627,7 +649,9 @@ def _create_verified_snapshot(
 ) -> DatabaseReadinessReport:
     timeout = _timeout(timeout_seconds)
     source = _existing_database(source_path)
+    source_identity = _source_file_identity(source)
     check_database(source, timeout_seconds=timeout)
+    _require_source_identity(source, source_identity, phase="during preflight")
     destination = _prepare_destination(destination_path, source)
 
     file_descriptor, temporary_name = tempfile.mkstemp(
@@ -638,7 +662,13 @@ def _create_verified_snapshot(
     os.close(file_descriptor)
     temporary = Path(temporary_name)
     try:
+        _require_source_identity(
+            source, source_identity, phase="before snapshot creation"
+        )
         _backup_to_temporary(source, temporary, timeout_seconds=timeout)
+        _require_source_identity(
+            source, source_identity, phase="during snapshot creation"
+        )
         snapshot_report = check_database(temporary, timeout_seconds=timeout)
         try:
             os.link(temporary, destination)
