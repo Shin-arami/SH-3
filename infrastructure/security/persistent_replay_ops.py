@@ -708,9 +708,22 @@ def _create_verified_snapshot(
                 ) from exc
             return replace(snapshot_report, database_path=destination)
         finally:
-            for suffix in ("-wal", "-shm", "-journal"):
-                Path(f"{temporary}{suffix}").unlink(missing_ok=True)
-            temporary.unlink(missing_ok=True)
+            active_exception = sys.exc_info()[1]
+            cleanup_errors: list[OSError] = []
+            cleanup_paths = (*tuple(Path(f"{temporary}{suffix}") for suffix in ("-wal", "-shm", "-journal")), temporary)
+            for cleanup_path in cleanup_paths:
+                try:
+                    cleanup_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    cleanup_errors.append(exc)
+            if cleanup_errors:
+                if active_exception is not None:
+                    active_exception.add_note(
+                        "temporary snapshot cleanup had "
+                        f"{len(cleanup_errors)} failure(s); remaining cleanup was attempted"
+                    )
+                else:
+                    raise cleanup_errors[0]
 
 
 def backup_database(
