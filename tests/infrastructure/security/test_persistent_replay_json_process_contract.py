@@ -78,7 +78,7 @@ def test_module_cli_success_reports_are_single_json_objects_for_all_commands(
     restored = tmp_path / "restored.sqlite3"
     _initialize_database(source)
 
-    commands = (
+    commands: tuple[tuple[list[str], str, Path, dict[str, str]], ...] = (
         (
             ["check", "--database", str(source), "--json", "--fail-on-expired-claims"],
             "check",
