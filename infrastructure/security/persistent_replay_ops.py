@@ -710,21 +710,34 @@ def _create_verified_snapshot(
         finally:
             active_exception = sys.exc_info()[1]
             cleanup_errors: list[OSError] = []
-            cleanup_paths = (*tuple(Path(f"{temporary}{suffix}") for suffix in ("-wal", "-shm", "-journal")), temporary)
+            cleanup_paths = (
+                *(Path(f"{temporary}{suffix}") for suffix in ("-wal", "-shm", "-journal")),
+                temporary,
+            )
             for cleanup_path in cleanup_paths:
                 try:
                     cleanup_path.unlink(missing_ok=True)
                 except OSError as exc:
                     cleanup_errors.append(exc)
             if cleanup_errors:
+                cleanup_summary = (
+                    "temporary snapshot cleanup was incomplete "
+                    f"({len(cleanup_errors)} item(s)); one or more temporary artifacts may remain."
+                )
+                recovery_guidance = (
+                    "After restoring filesystem access, inspect matching .partial files "
+                    "and SQLite sidecars before retrying."
+                )
                 if active_exception is not None:
-                    active_exception.add_note(
-                        "temporary snapshot cleanup had "
-                        f"{len(cleanup_errors)} failure(s); remaining cleanup was attempted"
-                    )
+                    active_exception.add_note(f"{cleanup_summary} {recovery_guidance}")
                 else:
-                    raise cleanup_errors[0]
-
+                    raise OSError(
+                        "snapshot was published, but "
+                        "temporary cleanup was incomplete "
+                        f"({len(cleanup_errors)} item(s)); one or more temporary artifacts may remain. "
+                        "Verify the destination before retrying. "
+                        f"{recovery_guidance}"
+                    ) from cleanup_errors[0]
 
 def backup_database(
     database_path: str | os.PathLike[str],
@@ -870,6 +883,15 @@ def _print_json_error(
         "exit_code": exit_code,
     }
     print(json.dumps(payload, sort_keys=True))
+
+
+def _print_error_diagnostics(error: Exception) -> None:
+    print(f"ERROR: {error}", file=sys.stderr)
+    notes = getattr(error, "__notes__", ())
+    if isinstance(notes, list):
+        for note in notes:
+            if isinstance(note, str):
+                print(f"DETAIL: {note}", file=sys.stderr)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1019,7 +1041,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 error_code=_json_error_code(exc),
                 error_type=type(exc).__name__,
             )
-        print(f"ERROR: {exc}", file=sys.stderr)
+        _print_error_diagnostics(exc)
         return 1
     except PersistentReplayReadinessError as exc:
         if args.json:
@@ -1028,7 +1050,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 error_code=_json_error_code(exc),
                 error_type=type(exc).__name__,
             )
-        print(f"ERROR: {exc}", file=sys.stderr)
+        _print_error_diagnostics(exc)
         return 1
     return 0
 

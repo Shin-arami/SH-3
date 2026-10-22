@@ -81,9 +81,13 @@ def test_sidecar_cleanup_failure_does_not_block_remaining_cleanup_or_mask_primar
     assert cleanup_attempts[1].endswith(".partial-shm")
     assert cleanup_attempts[2].endswith(".partial-journal")
     assert cleanup_attempts[3].endswith(".partial")
-    assert exc_info.value.__notes__ == [
-        "temporary snapshot cleanup had 1 failure(s); remaining cleanup was attempted"
-    ]
+    assert len(exc_info.value.__notes__) == 1
+    cleanup_note = exc_info.value.__notes__[0]
+    assert "temporary snapshot cleanup was incomplete (1 item(s))" in cleanup_note
+    assert (
+        "inspect matching .partial files and SQLite sidecars before retrying."
+        in cleanup_note
+    )
 
     assert source.is_file()
     assert source.read_bytes() == source_bytes_before
