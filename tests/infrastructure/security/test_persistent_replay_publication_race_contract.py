@@ -93,7 +93,8 @@ def test_destination_created_during_publication_is_not_overwritten(
     }
     assert str(destination) not in captured.out
     assert captured.err.startswith("ERROR: refusing to overwrite existing destination:")
-    assert str(destination) in captured.err
+    assert "[absolute path]" in captured.err
+    assert str(destination) not in captured.err
     assert "traceback" not in captured.err.lower()
     assert source.is_file()
     assert source.read_bytes() == source_before

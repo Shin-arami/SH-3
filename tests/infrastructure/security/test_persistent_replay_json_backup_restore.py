@@ -105,7 +105,8 @@ def test_backup_json_error_reports_existing_destination_without_overwrite(
         "schema_version": 1,
     }
     assert str(destination) not in captured.out
-    assert str(destination) in captured.err
+    assert "[absolute path]" in captured.err
+    assert str(destination) not in captured.err
     assert destination.read_bytes() == b"keep-this-content"
 
 
@@ -132,7 +133,8 @@ def test_restore_json_error_reports_missing_backup_without_path_leak(
         "schema_version": 1,
     }
     assert str(backup) not in captured.out
-    assert str(backup) in captured.err
+    assert "[absolute path]" in captured.err
+    assert str(backup) not in captured.err
     assert not destination.exists()
 
 

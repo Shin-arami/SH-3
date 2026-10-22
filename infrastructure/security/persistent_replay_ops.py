@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -885,13 +886,30 @@ def _print_json_error(
     print(json.dumps(payload, sort_keys=True))
 
 
+def _redact_absolute_paths(message: str) -> str:
+    quoted_path_pattern = (
+        r"""(?P<quote>['"])(?P<path>"""
+        r"""(?:[A-Za-z]:[\\/]|/(?!/)|\\\\)[^'"]+)(?P=quote)"""
+    )
+    message = re.sub(
+        quoted_path_pattern,
+        lambda match: f"{match.group('quote')}[absolute path]{match.group('quote')}",
+        message,
+    )
+    unquoted_path_pattern = (
+        r"""(?i)(?<![\w/:])(?:[A-Z]:[\\/]|/(?!/)|\\\\)"""
+        r"""[^\r\n'";,]+"""
+    )
+    return re.sub(unquoted_path_pattern, "[absolute path]", message)
+
+
 def _print_error_diagnostics(error: Exception) -> None:
-    print(f"ERROR: {error}", file=sys.stderr)
+    print(f"ERROR: {_redact_absolute_paths(str(error))}", file=sys.stderr)
     notes = getattr(error, "__notes__", ())
     if isinstance(notes, list):
         for note in notes:
             if isinstance(note, str):
-                print(f"DETAIL: {note}", file=sys.stderr)
+                print(f"DETAIL: {_redact_absolute_paths(note)}", file=sys.stderr)
 
 
 def _parser() -> argparse.ArgumentParser:

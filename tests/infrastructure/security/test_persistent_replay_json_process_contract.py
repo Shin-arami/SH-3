@@ -133,7 +133,8 @@ def test_module_cli_check_error_is_json_on_stdout_and_diagnostic_on_stderr(
         "exit_code": 1,
     }
     assert result.stderr.startswith("ERROR:")
-    assert str(missing_database) in result.stderr
+    assert "[absolute path]" in result.stderr
+    assert str(missing_database) not in result.stderr
 
 
 def test_module_cli_expired_claim_gate_returns_process_exit_code_three(

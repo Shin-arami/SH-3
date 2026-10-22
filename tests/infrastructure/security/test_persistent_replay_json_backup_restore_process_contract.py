@@ -70,7 +70,8 @@ def test_backup_process_reports_destination_exists_without_overwrite(
     }
     assert str(destination) not in result.stdout
     assert result.stderr.startswith("ERROR:")
-    assert str(destination) in result.stderr
+    assert "[absolute path]" in result.stderr
+    assert str(destination) not in result.stderr
     assert destination.read_bytes() == original_content
 
 
@@ -102,7 +103,8 @@ def test_restore_process_reports_missing_backup_without_path_leak(
     }
     assert str(missing_backup) not in result.stdout
     assert result.stderr.startswith("ERROR:")
-    assert str(missing_backup) in result.stderr
+    assert "[absolute path]" in result.stderr
+    assert str(missing_backup) not in result.stderr
     assert not destination.exists()
 
 
@@ -149,7 +151,8 @@ def test_restore_process_reports_existing_destination_without_overwrite(
     }
     assert str(destination) not in result.stdout
     assert result.stderr.startswith("ERROR:")
-    assert str(destination) in result.stderr
+    assert "[absolute path]" in result.stderr
+    assert str(destination) not in result.stderr
     assert destination.read_bytes() == original_content
 
 # PART11_52_BACKUP_RESTORE_TIMEOUT_ERROR_PROCESS_CONTRACT

@@ -37,7 +37,8 @@ def test_json_error_report_for_missing_database_is_parseable_and_does_not_leak_p
     }
     assert str(database) not in captured.out
     assert "ERROR:" in captured.err
-    assert str(database) in captured.err
+    assert "[absolute path]" in captured.err
+    assert str(database) not in captured.err
 
 
 def test_json_error_report_classifies_readiness_schema_failure(
