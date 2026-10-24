@@ -623,12 +623,40 @@ def _backup_to_temporary(
             f"SQLite online backup failed from {source.name}: {exc}"
         ) from exc
     finally:
-        try:
-            if destination_connection is not None:
+        active_exception = sys.exc_info()[1]
+        connection_cleanup_errors: list[Exception] = []
+        if destination_connection is not None:
+            try:
                 destination_connection.close()
-        finally:
-            if owns_source_connection and active_source_connection is not None:
+            except Exception as exc:
+                connection_cleanup_errors.append(exc)
+        if owns_source_connection and active_source_connection is not None:
+            try:
                 active_source_connection.close()
+            except Exception as exc:
+                connection_cleanup_errors.append(exc)
+        if connection_cleanup_errors:
+            connection_cleanup_summary = (
+                "SQLite snapshot connection cleanup was incomplete "
+                f"({len(connection_cleanup_errors)} item(s)); "
+                "one or more connection close operations failed."
+            )
+            connection_cleanup_details = "; ".join(
+                f"{type(error).__name__}: {error}"
+                for error in connection_cleanup_errors
+            )
+            if active_exception is not None:
+                active_exception.add_note(
+                    f"{connection_cleanup_summary} Details: "
+                    f"{connection_cleanup_details}"
+                )
+            else:
+                if len(connection_cleanup_errors) == 1:
+                    raise connection_cleanup_errors[0]
+                raise PersistentReplayReadinessError(
+                    f"{connection_cleanup_summary} Details: "
+                    f"{connection_cleanup_details}"
+                ) from connection_cleanup_errors[0]
 
 
 def _source_file_identity(path: Path) -> tuple[int, int]:
