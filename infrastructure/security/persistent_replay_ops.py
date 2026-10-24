@@ -143,7 +143,17 @@ def _readonly_connection(
         connection.execute(f"PRAGMA busy_timeout = {int(timeout_seconds * 1000)}")
         yield connection
     finally:
-        connection.close()
+        active_exception = sys.exc_info()[1]
+        try:
+            connection.close()
+        except Exception as exc:
+            if active_exception is not None:
+                active_exception.add_note(
+                    "read-only source connection cleanup failed; "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                raise
 
 
 def _require_columns(
@@ -724,6 +734,9 @@ def _create_verified_snapshot(
                 source, source_identity, phase="during snapshot creation"
             )
             snapshot_report = check_database(temporary, timeout_seconds=timeout)
+            _require_source_identity(
+                source, source_identity, phase="before snapshot publication"
+            )
             try:
                 os.link(temporary, destination)
             except FileExistsError:
