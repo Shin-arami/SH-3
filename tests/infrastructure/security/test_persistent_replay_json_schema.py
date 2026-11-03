@@ -237,7 +237,7 @@ def test_schema_enforces_policy_gate_exit_code_consistency() -> None:
         "policy_gates": {},
         "exit_code": 0,
     }
-    valid_cases = (
+    valid_cases: tuple[tuple[dict[str, str], int], ...] = (
         ({}, 0),
         ({"pending_reconciliation": "pass"}, 0),
         ({"expired_claims": "pass"}, 0),
@@ -251,7 +251,7 @@ def test_schema_enforces_policy_gate_exit_code_consistency() -> None:
         report = dict(base, policy_gates=gates, exit_code=exit_code)
         assert not _validate_schema(report, schema, schema), (gates, exit_code)
 
-    invalid_cases = (
+    invalid_cases: tuple[tuple[dict[str, str], int], ...] = (
         ({"pending_reconciliation": "fail"}, 0),
         ({"expired_claims": "fail"}, 0),
         ({"expired_claims": "fail"}, 2),

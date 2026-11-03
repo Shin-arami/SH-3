@@ -78,3 +78,20 @@ After a verified restore, start one SH-3 instance against the restored path firs
 - A replay claim cannot atomically commit an arbitrary external side effect. External operations must be idempotent or transactional with their evidence boundary.
 - WAL improves local concurrency but does not turn SQLite into a multi-host coordination database. Use a storage adapter backed by a shared transactional database for a multi-host deployment.
 - Run this utility with an account that has only the filesystem permissions needed for its task. Do not run the `restore` command against the active database path; the utility refuses to overwrite an existing file as an additional safeguard.
+<!-- Part 11-141 snapshot failure operations integration -->
+
+## 6. Snapshot and connection lifecycle failure recovery
+
+Backup/restore failures can occur before publication even when SQLite created a temporary file. Read the primary error first, then any cleanup details. Parts 11-132 through 11-140 verify that connection open/configuration/close failures, source-identity failures, and temporary cleanup failures preserve the primary cause and prevent publication when the operation has not reached a valid publication point.
+
+Use this sequence after an incident:
+
+1. Preserve the source database, restore backup, command output, and diagnostic notes. Do not edit the database or replay-claim rows as a shortcut.
+2. Run the read-only `check` command on the source (and on the backup for restore). Do not proceed if readiness fails.
+3. Establish whether the destination was published. `FileExistsError` means an existing destination or a competing publisher won; do not overwrite it or delete it as generic cleanup. Verify it independently and select a new destination. If the error says `snapshot was published, but temporary cleanup was incomplete`, validate the destination before any retry because publication succeeded even though the operation reported an error.
+4. For failures before publication, expect no newly published destination, but verify that the destination is absent. If the error notes incomplete cleanup, inspect the exact `.partial` pathname and its `-wal`, `-shm`, and `-journal` sidecars. Establish that no SH-3 process or SQLite connection still owns them before removal. Preserve copies when incident review requires it.
+5. Never delete the source, a valid backup, or a destination that won a publication race. A temporary pathname may be a hard link to a valid destination; removing the confirmed orphan temporary name is different from deleting the destination itself.
+6. Correct the underlying cause (filesystem permissions, path replacement, storage availability, or connection configuration), rerun readiness checks, and retry with a bounded policy. Reuse a destination only if it is confirmed absent and the prior operation failed before publication; otherwise choose a new unique path.
+7. Retain source/destination check output, the primary failure, cleanup diagnostics, identified artifacts, and retry result as operational evidence.
+
+Part 11-141 consolidates the tested contracts from Parts 11-132 through 11-140. It does not automate process shutdown, artifact deletion, destination cutover, retention, remote replication, or recovery of external side effects. Those remain operator-controlled procedures.

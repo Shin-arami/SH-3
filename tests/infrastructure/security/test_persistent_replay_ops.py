@@ -15,6 +15,7 @@ from infrastructure.security.persistent_replay_ops import (
     restore_database,
 )
 from infrastructure.security.persistent_store import (
+    PersistentEvidenceIntegrityError,
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
 )
@@ -88,6 +89,49 @@ def test_check_fails_closed_on_application_evidence_tampering(tmp_path: Path) ->
 
     with pytest.raises(PersistentReplayReadinessError, match="application integrity"):
         check_database(database)
+
+
+def test_check_fails_closed_on_independent_evidence_row_integrity_metadata_tampering(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "evidence.sqlite3"
+    _seed_database(database)
+    evidence = _evidence()
+    store = SQLiteEvidenceStore(database)
+
+    with sqlite3.connect(database) as connection:
+        original_row = connection.execute(
+            "SELECT record_json, integrity FROM sh3_evidence_records "
+            "WHERE evidence_id = ?",
+            (evidence.evidence_id,),
+        ).fetchone()
+        assert original_row is not None
+        original_record_json, original_integrity = original_row
+        tampered_integrity = "sha256:" + "0" * 64
+        assert tampered_integrity != original_integrity
+        connection.execute(
+            "UPDATE sh3_evidence_records SET integrity = ? "
+            "WHERE evidence_id = ?",
+            (tampered_integrity, evidence.evidence_id),
+        )
+
+    with pytest.raises(PersistentEvidenceIntegrityError, match="row integrity"):
+        store.get(evidence.evidence_id)
+
+    with pytest.raises(PersistentReplayReadinessError, match="application integrity"):
+        check_database(database)
+
+    with sqlite3.connect(database) as connection:
+        stored_row = connection.execute(
+            "SELECT record_json, integrity FROM sh3_evidence_records "
+            "WHERE evidence_id = ?",
+            (evidence.evidence_id,),
+        ).fetchone()
+        assert stored_row is not None
+        stored_record_json, stored_integrity = stored_row
+
+    assert stored_record_json == original_record_json
+    assert stored_integrity == tampered_integrity
 
 
 def test_backup_and_restore_create_verified_non_overwriting_copies(
