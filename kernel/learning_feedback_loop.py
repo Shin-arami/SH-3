@@ -44,6 +44,15 @@ class ClosedLoopStatus(StrEnum):
     FAILED = "failed"
 
 
+def _json_compatible(value: Any) -> Any:
+    """Normalize nested optimizer data to JSON-native container types."""
+    if isinstance(value, Mapping):
+        return {key: _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    return value
+
+
 def _map(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return MappingProxyType(dict(value or {}))
 
@@ -742,8 +751,8 @@ class LearningClosedLoopCoordinator:
                 )
                 optimization = self._optimizer_boundary.request(learning_result, context=propagation, created_at=now)
                 propagation = optimization.propagation_context
-                optimization_result = dict(optimization.optimization)
-                execution = optimization.optimization.get("execution", ())
+                optimization_result = _json_compatible(optimization.optimization)
+                execution = optimization_result.get("execution", [])
                 optimization_success = optimization.success
                 if not optimization_success:
                     status = ClosedLoopStatus.RECOVERED if recover else ClosedLoopStatus.FAILED

@@ -92,6 +92,10 @@ class CognitiveClosedLoopRequest:
         request_id = short_id(
             {
                 "result_id": result.result_id,
+                "correlation_id": context.correlation_id,
+                "causation_id": context.causation_id,
+                "trace_id": context.trace_id,
+                "tenant_id": context.tenant_id,
                 "optimize": optimize,
                 "recover": recover,
             },
