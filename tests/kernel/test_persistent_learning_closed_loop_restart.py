@@ -861,3 +861,129 @@ def test_independent_runtimes_share_replay_claim_and_reject_concurrent_cycle(
     assert completed_claim.generation == active_claim.generation
     assert completed_claim.owner_token is None
     assert completed_claim.evidence_id is not None
+
+@pytest.mark.parametrize(
+    ("commit_before_error", "expected_initial_status"),
+    [
+        (False, ReplayClaimStatus.RELEASED),
+        (True, ReplayClaimStatus.COMPLETED),
+    ],
+    ids=["failure-before-commit", "lost-commit-acknowledgement"],
+)
+def test_kernel_restart_reconciles_evidence_when_claim_finalization_outcome_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    commit_before_error: bool,
+    expected_initial_status: ReplayClaimStatus,
+) -> None:
+    database = tmp_path / "persistent-replay-finalization-recovery.sqlite3"
+    first_runtime = create_persistent_sh3_kernel(
+        database,
+        create_if_missing=True,
+    )
+    result = _result()
+    cycle_id = f"learning-cycle:{result.result_id}"
+
+    original_record = CognitiveLearningBoundary.record
+    original_run_cycle = LearningClosedLoopCoordinator._run_cycle
+    original_complete = SQLiteReplayClaimStore.complete
+
+    learning_calls = 0
+    reports: list[LearningClosedLoopReport] = []
+
+    def count_learning(
+        boundary: CognitiveLearningBoundary,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        nonlocal learning_calls
+        learning_calls += 1
+        return original_record(boundary, *args, **kwargs)
+
+    def capture_report(
+        coordinator: LearningClosedLoopCoordinator,
+        cognitive_result: CognitiveResult,
+        requested_cycle_id: str,
+        *,
+        context: EventPropagationContext | None,
+        optimize: bool,
+        recover: bool,
+    ) -> LearningClosedLoopReport:
+        report = original_run_cycle(
+            coordinator,
+            cognitive_result,
+            requested_cycle_id,
+            context=context,
+            optimize=optimize,
+            recover=recover,
+        )
+        reports.append(report)
+        return report
+
+    def fail_with_ambiguous_completion(
+        store: SQLiteReplayClaimStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if commit_before_error:
+            original_complete(store, *args, **kwargs)
+
+        raise RuntimeError("simulated claim finalization interruption")
+
+    monkeypatch.setattr(CognitiveLearningBoundary, "record", count_learning)
+    monkeypatch.setattr(
+        LearningClosedLoopCoordinator,
+        "_run_cycle",
+        capture_report,
+    )
+    monkeypatch.setattr(
+        SQLiteReplayClaimStore,
+        "complete",
+        fail_with_ambiguous_completion,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="simulated claim finalization interruption",
+    ):
+        first_runtime.kernel.learning_feedback_loop.run(
+            result,
+            optimize=False,
+            recover=False,
+        )
+
+    assert learning_calls == 1
+    assert len(reports) == 1
+
+    original_report = reports[0]
+    assert original_report.status is ClosedLoopStatus.COMPLETED
+    assert original_report.replay_claim_generation == 1
+
+    persisted_evidence = (
+        first_runtime.kernel.learning_closed_loop_evidence_boundary.get(cycle_id)
+    )
+    assert persisted_evidence is not None
+    assert persisted_evidence.recorded
+    assert persisted_evidence.evidence is not None
+
+    initial_claim = first_runtime.stores.replay_claim_store.get(cycle_id)
+    assert initial_claim is not None
+    assert initial_claim.status is expected_initial_status
+    assert initial_claim.generation == original_report.replay_claim_generation
+
+    # A fresh Runtime must reconcile the persisted report without rerunning learning.
+    second_runtime = create_persistent_sh3_kernel(database)
+    restored_report = second_runtime.kernel.learning_feedback_loop.run(
+        result,
+        optimize=False,
+        recover=False,
+    )
+
+    assert restored_report == original_report
+    assert learning_calls == 1
+
+    restored_claim = second_runtime.stores.replay_claim_store.get(cycle_id)
+    assert restored_claim is not None
+    assert restored_claim.status is ReplayClaimStatus.COMPLETED
+    assert restored_claim.generation == original_report.replay_claim_generation
+    assert restored_claim.evidence_id == persisted_evidence.evidence.evidence_id
