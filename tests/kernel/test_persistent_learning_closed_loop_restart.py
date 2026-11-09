@@ -26,6 +26,7 @@ from kernel.learning_feedback_loop import (
     ClosedLoopStatus,
     LearningClosedLoopCoordinator,
     LearningClosedLoopReport,
+    _ReplayClaimLeaseHeartbeat,
 )
 from kernel.persistent_factory import create_persistent_sh3_kernel
 
@@ -658,3 +659,62 @@ def test_lost_replay_claim_stops_closed_loop_before_optimizer_stage(
     assert current_claim.generation == takeover.generation
     assert current_claim.owner_token == takeover.owner_token
     assert current_claim.status is ReplayClaimStatus.CLAIMED
+
+def test_exception_stops_lease_heartbeat_before_releasing_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "persistent-replay-heartbeat-exception.sqlite3"
+    runtime = create_persistent_sh3_kernel(
+        database,
+        create_if_missing=True,
+    )
+    coordinator = runtime.kernel.learning_feedback_loop
+    result = _result()
+    cycle_id = f"learning-cycle:{result.result_id}"
+
+    operations: list[str] = []
+    original_stop = _ReplayClaimLeaseHeartbeat.stop
+    original_release = SQLiteReplayClaimStore.release
+
+    def track_stop(guard: _ReplayClaimLeaseHeartbeat) -> None:
+        original_stop(guard)
+        operations.append("heartbeat_stopped")
+
+    def track_release(
+        store: SQLiteReplayClaimStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        assert "heartbeat_stopped" in operations, (
+            "claim release occurred before heartbeat stop/join completed"
+        )
+        operations.append("claim_released")
+        return original_release(store, *args, **kwargs)
+
+    def fail_cycle(
+        current: LearningClosedLoopCoordinator,
+        cognitive_result: CognitiveResult,
+        requested_cycle_id: str,
+        *,
+        context: EventPropagationContext | None,
+        optimize: bool,
+        recover: bool,
+    ) -> LearningClosedLoopReport:
+        assert requested_cycle_id == cycle_id
+        raise RuntimeError("simulated closed-loop failure")
+
+    monkeypatch.setattr(_ReplayClaimLeaseHeartbeat, "stop", track_stop)
+    monkeypatch.setattr(SQLiteReplayClaimStore, "release", track_release)
+    monkeypatch.setattr(LearningClosedLoopCoordinator, "_run_cycle", fail_cycle)
+
+    with pytest.raises(RuntimeError, match="simulated closed-loop failure"):
+        coordinator.run(result, optimize=False, recover=False)
+
+    assert operations[:2] == ["heartbeat_stopped", "claim_released"]
+
+    released_claim = runtime.stores.replay_claim_store.get(cycle_id)
+    assert released_claim is not None
+    assert released_claim.status is ReplayClaimStatus.RELEASED
+    assert released_claim.owner_token is None
+    assert released_claim.lease_expires_at is None

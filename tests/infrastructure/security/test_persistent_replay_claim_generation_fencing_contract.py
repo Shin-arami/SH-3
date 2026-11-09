@@ -264,3 +264,40 @@ def test_legacy_reconciliation_rejects_same_evidence_from_completed_newer_genera
     assert completed.status is ReplayClaimStatus.COMPLETED
     assert completed.generation == second_owner.generation
     assert completed.evidence_id == evidence_id
+
+def test_legacy_reconciliation_accepts_generation_one_without_generation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "claims-generation-one-legacy-reconcile.sqlite3"
+    store = SQLiteReplayClaimStore(database)
+    cycle_id = "learning-cycle:generation-one-legacy-reconcile"
+    fingerprint = "sha256:generation-one-legacy-reconcile"
+    first_time = datetime(2026, 11, 1, tzinfo=UTC)
+
+    owner = store.claim(
+        cycle_id,
+        fingerprint,
+        lease_seconds=30.0,
+        now=first_time,
+    )
+    assert owner.generation == 1
+    assert owner.owner_token is not None
+
+    evidence_id = "learning-closed-loop:generation-one-legacy-evidence"
+    store.complete(
+        cycle_id,
+        fingerprint,
+        owner.owner_token,
+        owner.generation,
+        evidence_id,
+        now=first_time + timedelta(seconds=1),
+    )
+
+    # Legacy persisted reports do not carry a generation field.
+    store.reconcile_completed(cycle_id, fingerprint, evidence_id)
+
+    completed = store.get(cycle_id)
+    assert completed is not None
+    assert completed.status is ReplayClaimStatus.COMPLETED
+    assert completed.generation == 1
+    assert completed.evidence_id == evidence_id
