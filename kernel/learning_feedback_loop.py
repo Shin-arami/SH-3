@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum, unique
 from threading import Event as ThreadEvent
-from threading import RLock, get_ident
+from threading import RLock, Thread, get_ident
 from types import MappingProxyType
 from typing import Any
 
@@ -24,6 +24,7 @@ from infrastructure.events import Event, EventPropagationContext
 from infrastructure.security.persistent_store import (
     ReplayClaimBusyError,
     ReplayClaimCompletedError,
+    ReplayClaimOwnershipError,
     ReplayClaimStatus,
     SQLiteReplayClaimStore,
 )
@@ -75,6 +76,7 @@ class LearningClosedLoopReport:
     failure_detail: Mapping[str, str] = field(default_factory=dict)
     optimize: bool = True
     recover: bool = True
+    replay_claim_generation: int | None = None
 
     def __post_init__(self) -> None:
         for name, value in (("cycle_id", self.cycle_id), ("result_id", self.result_id), ("goal_id", self.goal_id), ("correlation_id", self.correlation_id)):
@@ -86,6 +88,12 @@ class LearningClosedLoopReport:
             raise TypeError("optimize must be bool")
         if not isinstance(self.recover, bool):
             raise TypeError("recover must be bool")
+        if self.replay_claim_generation is not None and (
+            isinstance(self.replay_claim_generation, bool)
+            or not isinstance(self.replay_claim_generation, int)
+            or self.replay_claim_generation < 1
+        ):
+            raise ValueError("replay_claim_generation must be a positive integer or None")
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise ValueError("created_at must be timezone-aware")
         for field_name, field_value in (("causation_id", self.causation_id), ("trace_id", self.trace_id), ("tenant_id", self.tenant_id)):
@@ -129,11 +137,110 @@ class LearningClosedLoopReport:
             "failure_detail": dict(self.failure_detail),
             "optimize": self.optimize,
             "recover": self.recover,
+            "replay_claim_generation": self.replay_claim_generation,
         }
+
+
+class _ReplayClaimLeaseHeartbeat:
+    """Renew a replay claim while its coordinator pipeline is running."""
+
+    __slots__ = (
+        "_cycle_id",
+        "_failure",
+        "_fingerprint",
+        "_generation",
+        "_interval_seconds",
+        "_lease_seconds",
+        "_lock",
+        "_owner_token",
+        "_stop_event",
+        "_store",
+        "_thread",
+    )
+
+    def __init__(
+        self,
+        store: SQLiteReplayClaimStore,
+        cycle_id: str,
+        fingerprint: str,
+        owner_token: str,
+        generation: int,
+        lease_seconds: float,
+    ) -> None:
+        self._store = store
+        self._cycle_id = cycle_id
+        self._fingerprint = fingerprint
+        self._owner_token = owner_token
+        self._generation = generation
+        self._lease_seconds = lease_seconds
+        self._interval_seconds = lease_seconds / 3.0
+        self._stop_event = ThreadEvent()
+        self._lock = RLock()
+        self._failure: Exception | None = None
+        self._thread: Thread | None = None
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("replay claim heartbeat has already been started")
+        self._thread = Thread(
+            target=self._run,
+            name="sh3-replay-claim-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _renew(self) -> None:
+        self._store.renew(
+            self._cycle_id,
+            self._fingerprint,
+            self._owner_token,
+            self._generation,
+            lease_seconds=self._lease_seconds,
+        )
+
+    def _record_failure(self, failure: Exception) -> None:
+        with self._lock:
+            if self._failure is None:
+                self._failure = failure
+        self._stop_event.set()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_seconds):
+            try:
+                self._renew()
+            except Exception as exc:
+                self._record_failure(exc)
+                return
+
+    def check(self) -> None:
+        with self._lock:
+            failure = self._failure
+        if failure is not None:
+            raise ReplayClaimOwnershipError(
+                f"replay claim heartbeat lost ownership for {self._cycle_id}"
+            ) from failure
+        try:
+            self._renew()
+        except Exception as exc:
+            self._record_failure(exc)
+            raise ReplayClaimOwnershipError(
+                f"replay claim heartbeat lost ownership for {self._cycle_id}"
+            ) from exc
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.ident is not None:
+            thread.join()
 
 
 class LearningClosedLoopCoordinator:
     __slots__ = (
+        "_claim_lease_guards",
         "_closed_loop_evidence_boundary",
         "_cycle_failure_details",
         "_cycle_options",
@@ -233,6 +340,7 @@ class LearningClosedLoopCoordinator:
         self._lock = RLock()
         self._cycles: dict[str, LearningClosedLoopReport] = {}
         self._cycle_options: dict[str, tuple[bool, bool]] = {}
+        self._claim_lease_guards: dict[str, _ReplayClaimLeaseHeartbeat] = {}
         self._inflight: dict[str, tuple[ThreadEvent, int]] = {}
         self._goal_inflight: dict[str, tuple[str, int]] = {}
         self._goal_lifecycle_states: dict[str, CognitiveLifecycleState] = {}
@@ -327,6 +435,17 @@ class LearningClosedLoopCoordinator:
     def get(self, cycle_id: str) -> LearningClosedLoopReport | None:
         with self._lock:
             return self._cycles.get(cycle_id)
+
+    def _ensure_claim_ownership(self, cycle_id: str) -> None:
+        with self._lock:
+            guard = self._claim_lease_guards.get(cycle_id)
+        if guard is not None:
+            guard.check()
+
+    def _claim_generation_for_cycle(self, cycle_id: str) -> int | None:
+        with self._lock:
+            guard = self._claim_lease_guards.get(cycle_id)
+        return None if guard is None else guard.generation
 
     def run(
         self,
@@ -460,7 +579,10 @@ class LearningClosedLoopCoordinator:
                                 f"terminal report has no restorable evidence for {cycle_id}"
                             )
                         self._replay_claim_store.reconcile_completed(
-                            cycle_id, fingerprint, restored_evidence.evidence.evidence_id
+                            cycle_id,
+                            fingerprint,
+                            restored_evidence.evidence.evidence_id,
+                            generation=persisted_report.replay_claim_generation,
                         )
                     leader = False
                 else:
@@ -552,7 +674,26 @@ class LearningClosedLoopCoordinator:
                 )
             return existing
 
+        claim_guard: _ReplayClaimLeaseHeartbeat | None = None
         try:
+            if (
+                self._replay_claim_store is not None
+                and claim_owner_token is not None
+                and claim_generation is not None
+            ):
+                claim_guard = _ReplayClaimLeaseHeartbeat(
+                    self._replay_claim_store,
+                    cycle_id,
+                    fingerprint,
+                    claim_owner_token,
+                    claim_generation,
+                    self._replay_claim_lease_seconds,
+                )
+                with self._lock:
+                    self._claim_lease_guards[cycle_id] = claim_guard
+                claim_guard.start()
+                claim_guard.check()
+
             report = self._run_cycle(
                 result,
                 cycle_id,
@@ -560,18 +701,11 @@ class LearningClosedLoopCoordinator:
                 optimize=optimize,
                 recover=recover,
             )
-            with self._lock:
-                if result.status is CognitiveResultStatus.PARTIAL:
-                    self._goal_partial_counts[result.goal_id] = (
-                        next_partial_count
-                    )
-                self._goal_lifecycle_states[result.goal_id] = (
-                    CognitiveLifecycleState.FAILED
-                    if convergence_failure_detail is not None
-                    or report.status is ClosedLoopStatus.FAILED
-                    else result.lifecycle_state
-                )
+            if claim_guard is not None:
+                claim_guard.stop()
+            self._ensure_claim_ownership(cycle_id)
             if self._replay_claim_store is not None and claim_owner_token is not None and claim_generation is not None:
+                self._ensure_claim_ownership(cycle_id)
                 stored_evidence = self._closed_loop_evidence_boundary.get(cycle_id)
                 if (
                     stored_evidence is not None
@@ -586,12 +720,32 @@ class LearningClosedLoopCoordinator:
                         stored_evidence.evidence.evidence_id,
                     )
                 else:
-                    self._replay_claim_store.release(
+                    released = self._replay_claim_store.release(
                         cycle_id, claim_owner_token, claim_generation
                     )
+                    if not released:
+                        raise ReplayClaimOwnershipError(
+                            f"replay claim ownership was lost for {cycle_id}"
+                        )
                 claim_owner_token = None
+            with self._lock:
+                if result.status is CognitiveResultStatus.PARTIAL:
+                    self._goal_partial_counts[result.goal_id] = (
+                        next_partial_count
+                    )
+                self._goal_lifecycle_states[result.goal_id] = (
+                    CognitiveLifecycleState.FAILED
+                    if convergence_failure_detail is not None
+                    or report.status is ClosedLoopStatus.FAILED
+                    else result.lifecycle_state
+                )
             return report
         except Exception:
+            if claim_guard is not None:
+                claim_guard.stop()
+            with self._lock:
+                self._cycles.pop(cycle_id, None)
+                self._cycle_options.pop(cycle_id, None)
             if self._replay_claim_store is not None and claim_owner_token is not None and claim_generation is not None:
                 with suppress(Exception):
                     self._replay_claim_store.release(
@@ -599,6 +753,11 @@ class LearningClosedLoopCoordinator:
                     )
             raise
         finally:
+            if claim_guard is not None:
+                claim_guard.stop()
+                with self._lock:
+                    if self._claim_lease_guards.get(cycle_id) is claim_guard:
+                        self._claim_lease_guards.pop(cycle_id, None)
             with self._lock:
                 self._cycle_failure_details.pop(cycle_id, None)
                 completion = self._inflight.pop(cycle_id, None)
@@ -707,6 +866,7 @@ class LearningClosedLoopCoordinator:
         status = ClosedLoopStatus.COMPLETED
         failure_detail: dict[str, str] = {}
         try:
+            self._ensure_claim_ownership(cycle_id)
             propagation = self._publish(
                 "LearningClosedLoopStarted",
                 EventType.START,
@@ -717,11 +877,13 @@ class LearningClosedLoopCoordinator:
                 },
                     propagation
             )
+            self._ensure_claim_ownership(cycle_id)
             learning_value = self._learning_boundary.record(
                 result,
                 context=propagation,
                 created_at=now
             )
+            self._ensure_claim_ownership(cycle_id)
             propagation = learning_value.propagation_context
             if not learning_value.success:
                 raise RuntimeError(learning_value.error or f"cognitive learning failed: {learning_value.request_id}")
@@ -729,7 +891,9 @@ class LearningClosedLoopCoordinator:
             score = float(learning_result.get("score", 0.0))
             if result.status is CognitiveResultStatus.FAILURE:
                 if recover:
+                    self._ensure_claim_ownership(cycle_id)
                     healing_result = self._recover("cognition", cycle_id, result, propagation)
+                    self._ensure_claim_ownership(cycle_id)
                     status = ClosedLoopStatus.RECOVERED
                 else:
                     status = ClosedLoopStatus.FAILED
@@ -743,13 +907,16 @@ class LearningClosedLoopCoordinator:
                 metadata={"result_id": result.result_id, "memory_key": learning_result.get("memory_key")},
             ))
             if optimize:
+                self._ensure_claim_ownership(cycle_id)
                 propagation = self._publish(
                     "LearningOptimizationStarted",
                     EventType.START,
                     {"cycle_id": cycle_id},
                     propagation
                 )
+                self._ensure_claim_ownership(cycle_id)
                 optimization = self._optimizer_boundary.request(learning_result, context=propagation, created_at=now)
+                self._ensure_claim_ownership(cycle_id)
                 propagation = optimization.propagation_context
                 optimization_result = _json_compatible(optimization.optimization)
                 execution = optimization_result.get("execution", [])
@@ -757,7 +924,9 @@ class LearningClosedLoopCoordinator:
                 if not optimization_success:
                     status = ClosedLoopStatus.RECOVERED if recover else ClosedLoopStatus.FAILED
                     if recover:
+                        self._ensure_claim_ownership(cycle_id)
                         healing = self._healing_boundary.request(optimization, context=propagation, created_at=now)
+                        self._ensure_claim_ownership(cycle_id)
                         propagation = healing.propagation_context
                         healing_result = {
                             "success": healing.success,
@@ -786,11 +955,15 @@ class LearningClosedLoopCoordinator:
                     trace_id=propagation.trace_id, tenant_id=propagation.tenant_id, created_at=now,
                     metadata={"result_id": result.result_id},
                 ))
+        except ReplayClaimOwnershipError:
+            raise
         except Exception as exc:
             healing_error: Exception | None = None
             if recover:
                 try:
+                    self._ensure_claim_ownership(cycle_id)
                     healing_result = self._recover("closed_loop", cycle_id, result, propagation, error=exc)
+                    self._ensure_claim_ownership(cycle_id)
                 except Exception as recovery_exc:
                     healing_error = recovery_exc
                     healing_result = None
@@ -855,6 +1028,7 @@ class LearningClosedLoopCoordinator:
             metadata=aggregate_metadata,
         )
         feedback.append(aggregate_feedback)
+        self._ensure_claim_ownership(cycle_id)
         try:
             feedback_result = self._feedback_boundary.record(
                 aggregate_feedback,
@@ -900,6 +1074,7 @@ class LearningClosedLoopCoordinator:
                     "CognitiveFeedbackRecordingError"
                 )
                 failure_detail["feedback_error"] = feedback_error
+        self._ensure_claim_ownership(cycle_id)
         terminal_event_name = (
             "LearningClosedLoopFailed"
             if status is ClosedLoopStatus.FAILED
@@ -917,12 +1092,14 @@ class LearningClosedLoopCoordinator:
             "status": status.value,
         }
         terminal_payload.update(failure_detail)
+        self._ensure_claim_ownership(cycle_id)
         propagation = self._publish(
             terminal_event_name,
             terminal_event_type,
             terminal_payload,
             propagation,
         )
+        self._ensure_claim_ownership(cycle_id)
         report = LearningClosedLoopReport(
             cycle_id=cycle_id,
             result_id=result.result_id,
@@ -940,14 +1117,18 @@ class LearningClosedLoopCoordinator:
             failure_detail=failure_detail,
             optimize=optimize,
             recover=recover,
+            replay_claim_generation=self._claim_generation_for_cycle(cycle_id),
         )
+        self._ensure_claim_ownership(cycle_id)
         with self._lock:
             self._cycles[cycle_id] = report
+        self._ensure_claim_ownership(cycle_id)
         evidence_result = self._closed_loop_evidence_boundary.record(
             report,
             context=propagation,
             created_at=now,
         )
+        self._ensure_claim_ownership(cycle_id)
         if evidence_result.recorded:
             return report
 
@@ -955,11 +1136,13 @@ class LearningClosedLoopCoordinator:
             "Learning closed-loop evidence was not recorded; retrying once",
             {"cycle_id": cycle_id, "error": evidence_result.error},
         )
+        self._ensure_claim_ownership(cycle_id)
         retry_result = self._closed_loop_evidence_boundary.record(
             report,
             context=propagation,
             created_at=now,
         )
+        self._ensure_claim_ownership(cycle_id)
         if retry_result.recorded:
             return report
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event, Thread
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,7 +16,11 @@ from cognition.contracts import (
 )
 from cognition.feedback import CognitiveFeedbackKind
 from infrastructure.events import EventPropagationContext
-from infrastructure.security.persistent_store import ReplayClaimStatus
+from infrastructure.security.persistent_store import (
+    ReplayClaimOwnershipError,
+    ReplayClaimStatus,
+    SQLiteReplayClaimStore,
+)
 from kernel.cognitive_learning_boundary import CognitiveLearningBoundary
 from kernel.learning_feedback_loop import (
     ClosedLoopStatus,
@@ -221,6 +227,7 @@ def test_kernel_restart_replays_real_learning_pipeline_without_relearning(
     assert first_claim is not None
     assert first_claim.status is ReplayClaimStatus.COMPLETED
     assert first_claim.evidence_id is not None
+    assert first_report.replay_claim_generation == first_claim.generation
     evidence_count = first_runtime.stores.evidence_store.count()
 
     second_runtime = create_persistent_sh3_kernel(database)
@@ -232,6 +239,7 @@ def test_kernel_restart_replays_real_learning_pipeline_without_relearning(
 
     assert learning_calls == 1
     assert restored_report == first_report
+    assert restored_report.replay_claim_generation == first_claim.generation
     assert second_runtime.kernel.learning_feedback_loop.get(cycle_id) == first_report
     assert second_runtime.stores.evidence_store.count() == evidence_count
     restored_claim = second_runtime.stores.replay_claim_store.get(cycle_id)
@@ -454,3 +462,199 @@ def test_kernel_restart_replays_recovery_without_recovering_again(
     assert restored_claim is not None
     assert restored_claim.status is ReplayClaimStatus.COMPLETED
     assert restored_claim.evidence_id == first_claim.evidence_id
+
+def test_replay_claim_lease_is_renewed_while_closed_loop_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "persistent-replay-heartbeat.sqlite3"
+    runtime = create_persistent_sh3_kernel(
+        database,
+        create_if_missing=True,
+    )
+    coordinator = runtime.kernel.learning_feedback_loop
+    coordinator._replay_claim_lease_seconds = 0.3
+    result = _result()
+    cycle_id = f"learning-cycle:{result.result_id}"
+    entered = Event()
+    finish = Event()
+    heartbeat_renewed = Event()
+    renewal_count = 0
+    initial_expiries: list[float] = []
+    original_claim = SQLiteReplayClaimStore.claim
+    original_renew = SQLiteReplayClaimStore.renew
+
+    def track_claim(
+        store: SQLiteReplayClaimStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        claim = original_claim(store, *args, **kwargs)
+        if claim.lease_expires_at is not None:
+            initial_expiries.append(claim.lease_expires_at)
+        return claim
+
+    def track_renewal(
+        store: SQLiteReplayClaimStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        nonlocal renewal_count
+        renewed = original_renew(store, *args, **kwargs)
+        renewal_count += 1
+        if renewal_count >= 2:
+            heartbeat_renewed.set()
+        return renewed
+
+    def block_cycle(
+        current: LearningClosedLoopCoordinator,
+        cognitive_result: CognitiveResult,
+        requested_cycle_id: str,
+        *,
+        context: EventPropagationContext | None,
+        optimize: bool,
+        recover: bool,
+    ) -> Any:
+        assert requested_cycle_id == cycle_id
+        entered.set()
+        if not finish.wait(timeout=5.0):
+            raise TimeoutError("test did not release the blocked closed loop")
+        return SimpleNamespace(status=ClosedLoopStatus.COMPLETED)
+
+    monkeypatch.setattr(SQLiteReplayClaimStore, "claim", track_claim)
+    monkeypatch.setattr(SQLiteReplayClaimStore, "renew", track_renewal)
+    monkeypatch.setattr(LearningClosedLoopCoordinator, "_run_cycle", block_cycle)
+
+    failures: list[BaseException] = []
+
+    def run_cycle() -> None:
+        try:
+            coordinator.run(result, optimize=False, recover=False)
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = Thread(target=run_cycle, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(timeout=3.0)
+        assert len(initial_expiries) == 1
+        initial_expiry = initial_expiries[0]
+
+        assert heartbeat_renewed.wait(timeout=3.0)
+        renewed_claim = runtime.stores.replay_claim_store.get(cycle_id)
+        assert renewed_claim is not None
+        assert renewed_claim.lease_expires_at is not None
+        assert renewed_claim.lease_expires_at > initial_expiry
+    finally:
+        finish.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert failures == []
+    completed_renewal_count = renewal_count
+    Event().wait(timeout=0.15)
+    assert renewal_count == completed_renewal_count
+
+
+def test_lost_replay_claim_stops_closed_loop_before_optimizer_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "persistent-replay-heartbeat-takeover.sqlite3"
+    runtime = create_persistent_sh3_kernel(
+        database,
+        create_if_missing=True,
+    )
+    coordinator = runtime.kernel.learning_feedback_loop
+    coordinator._replay_claim_lease_seconds = 0.3
+    result = _result()
+    cycle_id = f"learning-cycle:{result.result_id}"
+    learning_entered = Event()
+    finish_learning = Event()
+    takeover_enabled = Event()
+    heartbeat_rejected = Event()
+    optimizer_calls = 0
+    original_learning_record = CognitiveLearningBoundary.record
+    original_renew = SQLiteReplayClaimStore.renew
+    optimizer_boundary_type = type(coordinator.optimizer_boundary)
+    original_optimizer_request = optimizer_boundary_type.request
+
+    def block_learning(
+        boundary: CognitiveLearningBoundary,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        learning_entered.set()
+        if not finish_learning.wait(timeout=5.0):
+            raise TimeoutError("test did not release learning stage")
+        return original_learning_record(boundary, *args, **kwargs)
+
+    def reject_renewal_after_takeover(
+        store: SQLiteReplayClaimStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if takeover_enabled.is_set():
+            heartbeat_rejected.set()
+            raise ReplayClaimOwnershipError("simulated stale generation")
+        return original_renew(store, *args, **kwargs)
+
+    def count_optimizer_request(
+        boundary: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        nonlocal optimizer_calls
+        optimizer_calls += 1
+        return original_optimizer_request(boundary, *args, **kwargs)
+
+    monkeypatch.setattr(CognitiveLearningBoundary, "record", block_learning)
+    monkeypatch.setattr(SQLiteReplayClaimStore, "renew", reject_renewal_after_takeover)
+    monkeypatch.setattr(optimizer_boundary_type, "request", count_optimizer_request)
+
+    failures: list[BaseException] = []
+
+    def run_cycle() -> None:
+        try:
+            coordinator.run(result, optimize=True, recover=False)
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = Thread(target=run_cycle, daemon=True)
+    worker.start()
+    takeover = None
+    try:
+        assert learning_entered.wait(timeout=3.0)
+        original_claim = runtime.stores.replay_claim_store.get(cycle_id)
+        assert original_claim is not None
+        assert original_claim.lease_expires_at is not None
+
+        takeover_enabled.set()
+        assert heartbeat_rejected.wait(timeout=3.0)
+        takeover_time = datetime.fromtimestamp(
+            original_claim.lease_expires_at + 1.0,
+            tz=UTC,
+        )
+        takeover = runtime.stores.replay_claim_store.claim(
+            cycle_id,
+            original_claim.fingerprint,
+            lease_seconds=30.0,
+            now=takeover_time,
+        )
+        assert takeover.status is ReplayClaimStatus.CLAIMED
+        assert takeover.generation == original_claim.generation + 1
+    finally:
+        finish_learning.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], ReplayClaimOwnershipError)
+    assert optimizer_calls == 0
+    assert coordinator.get(cycle_id) is None
+    current_claim = runtime.stores.replay_claim_store.get(cycle_id)
+    assert current_claim is not None
+    assert takeover is not None
+    assert current_claim.generation == takeover.generation
+    assert current_claim.owner_token == takeover.owner_token
+    assert current_claim.status is ReplayClaimStatus.CLAIMED

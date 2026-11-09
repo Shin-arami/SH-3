@@ -722,8 +722,12 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
                     )
                 if state == ReplayClaimStatus.COMPLETED.value:
                     if stored_evidence == evidence_id:
-                        self._commit(connection)
-                        return
+                        if stored_generation == generation:
+                            self._commit(connection)
+                            return
+                        raise ReplayClaimOwnershipError(
+                            f"replay claim ownership was lost for {cycle_id}"
+                        )
                     raise ReplayClaimConflictError(
                         f"completed replay evidence conflicts for {cycle_id}"
                     )
@@ -784,11 +788,19 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
         cycle_id: str,
         fingerprint: str,
         evidence_id: str,
+        *,
+        generation: int | None = None,
     ) -> None:
-        """Reconcile a terminal evidence record written before a process crash."""
+        """Reconcile terminal evidence only for the generation that produced it."""
         _text("cycle_id", cycle_id)
         _text("fingerprint", fingerprint)
         _text("evidence_id", evidence_id)
+        if generation is not None and (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("generation must be a positive integer or None")
         now = datetime.now(UTC).timestamp()
         with self._connection() as connection:
             self._begin(connection)
@@ -799,15 +811,28 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
                     (cycle_id,),
                 ).fetchone()
                 if row is None:
+                    reconciled_generation = 1 if generation is None else generation
                     connection.execute(
                         "INSERT INTO sh3_replay_claims "
                         "(cycle_id, fingerprint, state, generation, attempts, owner_token, "
                         "lease_expires_at, evidence_id, updated_at) "
-                        "VALUES (?, ?, 'completed', 1, 0, NULL, NULL, ?, ?)",
-                        (cycle_id, fingerprint, evidence_id, now),
+                        "VALUES (?, ?, 'completed', ?, 0, NULL, NULL, ?, ?)",
+                        (
+                            cycle_id,
+                            fingerprint,
+                            reconciled_generation,
+                            evidence_id,
+                            now,
+                        ),
                     )
                 else:
-                    stored_fingerprint, state, _generation, _attempts, stored_evidence = row
+                    (
+                        stored_fingerprint,
+                        state,
+                        stored_generation,
+                        _attempts,
+                        stored_evidence,
+                    ) = row
                     if stored_fingerprint != fingerprint:
                         raise ReplayClaimConflictError(
                             f"replay fingerprint conflicts for {cycle_id}"
@@ -817,12 +842,37 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
                             raise ReplayClaimConflictError(
                                 f"completed replay evidence conflicts for {cycle_id}"
                             )
+                        if generation is None:
+                            if stored_generation != 1:
+                                raise ReplayClaimOwnershipError(
+                                    f"replay claim generation is required after takeover for {cycle_id}"
+                                )
+                        elif stored_generation != generation:
+                            raise ReplayClaimOwnershipError(
+                                f"replay claim ownership was lost for {cycle_id}"
+                            )
                     else:
+                        if generation is None:
+                            if stored_generation != 1:
+                                raise ReplayClaimOwnershipError(
+                                    f"replay claim generation is required after takeover for {cycle_id}"
+                                )
+                        elif stored_generation != generation:
+                            raise ReplayClaimOwnershipError(
+                                f"replay claim ownership was lost for {cycle_id}"
+                            )
                         connection.execute(
                             "UPDATE sh3_replay_claims SET state = 'completed', "
                             "owner_token = NULL, lease_expires_at = NULL, evidence_id = ?, "
-                            "updated_at = ? WHERE cycle_id = ?",
-                            (evidence_id, now, cycle_id),
+                            "updated_at = ? WHERE cycle_id = ? AND fingerprint = ? "
+                            "AND generation = ?",
+                            (
+                                evidence_id,
+                                now,
+                                cycle_id,
+                                fingerprint,
+                                stored_generation,
+                            ),
                         )
                 self._commit(connection)
             except Exception:

@@ -233,6 +233,15 @@ class LearningClosedLoopEvidenceBoundary:
             created_at = datetime.fromisoformat(record.collected_at)
         except ValueError as exc:
             raise ValueError(f"persisted closed-loop timestamp is invalid: {cycle_id}") from exc
+        generation_value = payload.get("replay_claim_generation")
+        if generation_value is not None and (
+            isinstance(generation_value, bool)
+            or not isinstance(generation_value, int)
+            or generation_value < 1
+        ):
+            raise ValueError(
+                f"persisted replay claim generation is invalid: {cycle_id}"
+            )
         return LearningClosedLoopReport(
             cycle_id=cycle_id,
             result_id=_text("result_id", payload.get("result_id")),
@@ -250,6 +259,7 @@ class LearningClosedLoopEvidenceBoundary:
             failure_detail=failure_detail,
             optimize=options["optimize"],
             recover=options["recover"],
+            replay_claim_generation=generation_value,
         )
 
     def set_event_publisher(self, publisher: EventPublisher | None) -> None:
@@ -455,6 +465,7 @@ class LearningClosedLoopEvidenceBoundary:
             "feedback": [item.to_dict() for item in feedback],
             "failure_detail": dict(report.failure_detail),
             "cycle_options": {"optimize": report.optimize, "recover": report.recover},
+            "replay_claim_generation": report.replay_claim_generation,
             "success_semantics": {
                 "learning": None if learning is None else learning.success,
                 "optimization": None if optimization is None else optimization.success,
