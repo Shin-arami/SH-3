@@ -17,6 +17,7 @@ from cognition.contracts import (
 from cognition.feedback import CognitiveFeedbackKind
 from infrastructure.events import EventPropagationContext
 from infrastructure.security.persistent_store import (
+    ReplayClaimBusyError,
     ReplayClaimOwnershipError,
     ReplayClaimStatus,
     SQLiteReplayClaimStore,
@@ -718,3 +719,145 @@ def test_exception_stops_lease_heartbeat_before_releasing_claim(
     assert released_claim.status is ReplayClaimStatus.RELEASED
     assert released_claim.owner_token is None
     assert released_claim.lease_expires_at is None
+
+def test_independent_runtimes_share_replay_claim_and_reject_concurrent_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "persistent-replay-independent-runtimes.sqlite3"
+    runtime_a = create_persistent_sh3_kernel(
+        database,
+        create_if_missing=True,
+    )
+    runtime_b = create_persistent_sh3_kernel(database)
+
+    coordinator_a = runtime_a.kernel.learning_feedback_loop
+    coordinator_b = runtime_b.kernel.learning_feedback_loop
+    coordinator_a._replay_claim_lease_seconds = 0.3
+
+    result = _result()
+    cycle_id = f"learning-cycle:{result.result_id}"
+
+    learning_entered = Event()
+    finish_learning = Event()
+    periodic_renewal = Event()
+
+    learning_calls = [0]
+    renewal_count = [0]
+    initial_expiries: list[float] = []
+    reports: list[LearningClosedLoopReport] = []
+    failures: list[BaseException] = []
+
+    original_record = CognitiveLearningBoundary.record
+    original_claim = SQLiteReplayClaimStore.claim
+    original_renew = SQLiteReplayClaimStore.renew
+
+    def block_learning(
+        boundary: CognitiveLearningBoundary,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        learning_calls[0] += 1
+        learning_entered.set()
+
+        if not finish_learning.wait(timeout=5.0):
+            raise TimeoutError("test did not release the learning stage")
+
+        return original_record(boundary, *args, **kwargs)
+
+    def track_claim(
+        store: SQLiteReplayClaimStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        claim = original_claim(store, *args, **kwargs)
+
+        if (
+            claim.status is ReplayClaimStatus.CLAIMED
+            and claim.lease_expires_at is not None
+        ):
+            initial_expiries.append(claim.lease_expires_at)
+
+        return claim
+
+    def track_renewal(
+        store: SQLiteReplayClaimStore,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        renewed = original_renew(store, *args, **kwargs)
+        renewal_count[0] += 1
+
+        # The first renewal is the coordinator's immediate ownership check.
+        # The second proves that the background heartbeat also ran.
+        if renewal_count[0] >= 2:
+            periodic_renewal.set()
+
+        return renewed
+
+    monkeypatch.setattr(CognitiveLearningBoundary, "record", block_learning)
+    monkeypatch.setattr(SQLiteReplayClaimStore, "claim", track_claim)
+    monkeypatch.setattr(SQLiteReplayClaimStore, "renew", track_renewal)
+
+    def run_runtime_a() -> None:
+        try:
+            reports.append(
+                coordinator_a.run(
+                    result,
+                    optimize=False,
+                    recover=False,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = Thread(target=run_runtime_a, daemon=True)
+    worker.start()
+
+    try:
+        assert learning_entered.wait(timeout=3.0)
+        assert len(initial_expiries) == 1
+
+        # Wait until the independent heartbeat thread has renewed the lease.
+        assert periodic_renewal.wait(timeout=3.0)
+
+        active_claim = runtime_b.stores.replay_claim_store.get(cycle_id)
+        assert active_claim is not None
+        assert active_claim.status is ReplayClaimStatus.CLAIMED
+        assert active_claim.generation == 1
+        assert active_claim.lease_expires_at is not None
+        assert active_claim.lease_expires_at > initial_expiries[0]
+
+        # A second independent coordinator must not execute the same cycle.
+        with pytest.raises(
+            ReplayClaimBusyError,
+            match="claimed by another worker",
+        ):
+            coordinator_b.run(
+                result,
+                optimize=False,
+                recover=False,
+            )
+
+        still_owned = runtime_b.stores.replay_claim_store.get(cycle_id)
+        assert still_owned is not None
+        assert still_owned.status is ReplayClaimStatus.CLAIMED
+        assert still_owned.generation == active_claim.generation
+        assert still_owned.owner_token == active_claim.owner_token
+
+    finally:
+        finish_learning.set()
+        worker.join(timeout=10.0)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert len(reports) == 1
+    assert reports[0].status is ClosedLoopStatus.COMPLETED
+    assert learning_calls == [1]
+
+    completed_claim = runtime_b.stores.replay_claim_store.get(cycle_id)
+    assert completed_claim is not None
+    assert completed_claim.status is ReplayClaimStatus.COMPLETED
+    assert completed_claim.generation == active_claim.generation
+    assert completed_claim.owner_token is None
+    assert completed_claim.evidence_id is not None
