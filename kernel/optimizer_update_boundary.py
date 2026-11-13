@@ -120,6 +120,7 @@ class OptimizationUpdateRequest:
     trace_id: str | None = None
     tenant_id: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -142,6 +143,8 @@ class OptimizationUpdateRequest:
         ):
             if field_value is not None:
                 _text(field_name, field_value)
+        if self.idempotency_key is not None:
+            _text("idempotency_key", self.idempotency_key)
         object.__setattr__(self, "actions", normalized)
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
         object.__setattr__(self, "metadata", _mapping(self.metadata))
@@ -153,6 +156,7 @@ class OptimizationUpdateRequest:
         *,
         context: EventPropagationContext,
         created_at: datetime | None = None,
+        idempotency_key: str | None = None,
     ) -> OptimizationUpdateRequest:
         if not isinstance(optimization, Mapping):
             raise TypeError("optimization must be a mapping")
@@ -164,15 +168,21 @@ class OptimizationUpdateRequest:
         if not isinstance(raw_actions, (list, tuple)):
             raise TypeError("optimization.rebalance.actions must be a sequence")
         actions = tuple(raw_actions)
-        request_id = short_id(
-            {
+        request_identity: dict[str, Any]
+        if idempotency_key is not None:
+            _text("idempotency_key", idempotency_key)
+            request_identity = {"idempotency_key": idempotency_key}
+        else:
+            request_identity = {
                 "optimization_id": optimization_id,
                 "actions": actions,
                 "correlation_id": context.correlation_id,
                 "causation_id": context.causation_id,
                 "trace_id": context.trace_id,
                 "tenant_id": context.tenant_id,
-            },
+            }
+        request_id = short_id(
+            request_identity,
             prefix="optimization-update:",
         )
         return cls(
@@ -185,6 +195,7 @@ class OptimizationUpdateRequest:
             trace_id=context.trace_id,
             tenant_id=context.tenant_id,
             metadata={"optimizer_id": optimization_id},
+            idempotency_key=idempotency_key,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,6 +209,7 @@ class OptimizationUpdateRequest:
             "trace_id": self.trace_id,
             "tenant_id": self.tenant_id,
             "metadata": dict(self.metadata),
+            "idempotency_key": self.idempotency_key,
         }
 
 
@@ -350,6 +362,7 @@ class OptimizationUpdateBoundary:
         *,
         context: EventPropagationContext,
         created_at: datetime | None = None,
+        idempotency_key: str | None = None,
     ) -> OptimizationUpdateResult:
         if not isinstance(context, EventPropagationContext):
             raise TypeError("context must be EventPropagationContext")
@@ -357,6 +370,7 @@ class OptimizationUpdateBoundary:
             optimization,
             context=context,
             created_at=created_at,
+            idempotency_key=idempotency_key,
         )
         with self._lock:
             existing = self._results.get(request.request_id)
@@ -447,6 +461,7 @@ class OptimizationUpdateBoundary:
             trace_id=data.get("trace_id"),
             tenant_id=data.get("tenant_id"),
             metadata=metadata if isinstance(metadata, Mapping) else {},
+            idempotency_key=data.get("idempotency_key"),
         )
 
     def _execute(
@@ -460,14 +475,17 @@ class OptimizationUpdateBoundary:
                 return existing
         try:
             if request.actions:
+                action_context = {
+                    "correlation_id": context.correlation_id,
+                    "causation_id": context.causation_id,
+                    "trace_id": context.trace_id,
+                    "tenant_id": context.tenant_id,
+                }
+                if request.idempotency_key is not None:
+                    action_context["idempotency_key"] = request.idempotency_key
                 raw_results = self.optimizer.execute_actions(
                     request.actions,
-                    {
-                        "correlation_id": context.correlation_id,
-                        "causation_id": context.causation_id,
-                        "trace_id": context.trace_id,
-                        "tenant_id": context.tenant_id,
-                    },
+                    action_context,
                     rollback_on_failure=True,
                 )
             else:

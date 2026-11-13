@@ -10,6 +10,7 @@ from infrastructure.security.persistent_replay_runtime import (
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
+    SQLiteReplayStageStore,
 )
 from kernel import SH3Kernel, create_persistent_sh3_kernel
 from kernel.persistent_factory import PersistentKernelRuntime
@@ -27,9 +28,15 @@ def test_factory_creates_kernel_with_paired_persistent_stores(tmp_path: Path) ->
     assert isinstance(runtime.kernel, SH3Kernel)
     assert isinstance(runtime.stores.evidence_store, SQLiteEvidenceStore)
     assert isinstance(runtime.stores.replay_claim_store, SQLiteReplayClaimStore)
+    assert isinstance(runtime.stores.replay_stage_store, SQLiteReplayStageStore)
     assert runtime.database_path == database.resolve()
     assert runtime.stores.evidence_store.database_path == runtime.database_path
     assert runtime.stores.replay_claim_store.database_path == runtime.database_path
+    assert runtime.stores.replay_stage_store.database_path == runtime.database_path
+    assert (
+        runtime.kernel.cognitive_learning_boundary.replay_stage_store
+        is runtime.stores.replay_stage_store
+    )
     assert database.is_file()
 
 

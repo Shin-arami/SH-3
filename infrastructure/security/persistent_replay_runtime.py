@@ -11,6 +11,7 @@ from infrastructure.security.persistent_replay_ops import check_database
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
+    SQLiteReplayStageStore,
 )
 
 __all__ = [
@@ -78,11 +79,12 @@ def resolve_persistent_replay_database_path(
 
 @dataclass(frozen=True, slots=True)
 class PersistentReplayStores:
-    """One validated database path and the two stores that share it."""
+    """One validated database path and its three persistent stores."""
 
     database_path: Path
     evidence_store: SQLiteEvidenceStore
     replay_claim_store: SQLiteReplayClaimStore
+    replay_stage_store: SQLiteReplayStageStore | None = None
 
     def __post_init__(self) -> None:
         path = Path(self.database_path).expanduser().resolve()
@@ -94,6 +96,15 @@ class PersistentReplayStores:
             raise ValueError("evidence_store database path does not match database_path")
         if self.replay_claim_store.database_path != path:
             raise ValueError("replay_claim_store database path does not match database_path")
+        if self.replay_stage_store is not None:
+            if not isinstance(self.replay_stage_store, SQLiteReplayStageStore):
+                raise TypeError(
+                    "replay_stage_store must be SQLiteReplayStageStore or None"
+                )
+            if self.replay_stage_store.database_path != path:
+                raise ValueError(
+                    "replay_stage_store database path does not match database_path"
+                )
         object.__setattr__(self, "database_path", path)
 
 
@@ -136,9 +147,11 @@ def create_persistent_replay_stores(
 
     evidence_store = SQLiteEvidenceStore(path, timeout_seconds=timeout)
     replay_claim_store = SQLiteReplayClaimStore(path, timeout_seconds=timeout)
+    replay_stage_store = SQLiteReplayStageStore(path, timeout_seconds=timeout)
     check_database(path, timeout_seconds=timeout)
     return PersistentReplayStores(
         database_path=path,
         evidence_store=evidence_store,
         replay_claim_store=replay_claim_store,
+        replay_stage_store=replay_stage_store,
     )

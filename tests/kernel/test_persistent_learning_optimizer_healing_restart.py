@@ -70,9 +70,10 @@ def test_kernel_restart_replays_optimizer_healing_without_healing_again(
         *,
         context: EventPropagationContext | None = None,
         execute: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         calls["optimizer_backend"] += 1
-        _ = (backend, context, execute)
+        _ = (backend, context, execute, idempotency_key)
         raise RuntimeError("injected optimizer failure for persistent replay")
 
     def count_optimizer_request(

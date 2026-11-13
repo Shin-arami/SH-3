@@ -4,9 +4,10 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from inspect import Parameter, signature
 from threading import Condition, RLock
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from cognition.contracts import CognitiveResult
 from foundation.Enums.category import Category
@@ -15,6 +16,11 @@ from foundation.utils.hash import short_id
 from foundation.utils.logging import error
 from infrastructure.event_bus import EventBus, EventPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security.persistent_store import (
+    ReplayStageKey,
+    ReplayStageStatus,
+    SQLiteReplayStageStore,
+)
 
 __all__ = [
     "CognitiveLearningBoundary",
@@ -62,11 +68,25 @@ def _matches_trace(
 
 
 class LearningBackend(Protocol):
+    """Backend contract retained for non-persistent Learning execution."""
+
     def run(
         self,
         execution_result: dict[str, Any],
         *,
         context: EventPropagationContext | None = None,
+    ) -> dict[str, Any]: ...
+
+
+class IdempotentLearningBackend(Protocol):
+    """Learning backend that accepts a stable Stage idempotency key."""
+
+    def run(
+        self,
+        execution_result: dict[str, Any],
+        *,
+        context: EventPropagationContext | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -280,20 +300,46 @@ class CognitiveLearningBoundary:
         "_started",
         "_subscriber_id",
         "learning",
+        "replay_stage_store",
     )
 
     def __init__(
         self,
-        learning: LearningBackend,
+        learning: LearningBackend | IdempotentLearningBackend,
         event_publisher: EventPublisher | None = None,
         *,
         subscriber_id: str = "cognition.learning-boundary",
+        replay_stage_store: SQLiteReplayStageStore | None = None,
     ) -> None:
         if learning is None or not callable(getattr(learning, "run", None)):
             raise TypeError("learning must provide run")
         if event_publisher is not None and not isinstance(event_publisher, EventPublisher):
             raise TypeError("event_publisher must be EventPublisher or None")
+        if replay_stage_store is not None and not isinstance(
+            replay_stage_store, SQLiteReplayStageStore
+        ):
+            raise TypeError(
+                "replay_stage_store must be SQLiteReplayStageStore or None"
+            )
+        if replay_stage_store is not None:
+            try:
+                parameters = signature(learning.run).parameters.values()
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "persistent learning backend must expose an "
+                    "idempotency_key parameter"
+                ) from exc
+            supports_idempotency_key = any(
+                parameter.name == "idempotency_key"
+                or parameter.kind is Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            if not supports_idempotency_key:
+                raise TypeError(
+                    "persistent learning backend must accept idempotency_key"
+                )
         self.learning = learning
+        self.replay_stage_store = replay_stage_store
         self._backend_lock = RLock()
         self._event_publisher = event_publisher
         self._event_bus: EventBus | None = None
@@ -342,39 +388,216 @@ class CognitiveLearningBoundary:
         *,
         context: EventPropagationContext,
         created_at: datetime | None = None,
+        replay_cycle_id: str | None = None,
+        replay_cycle_fingerprint: str | None = None,
+        replay_claim_owner_token: str | None = None,
+        replay_claim_generation: int | None = None,
     ) -> CognitiveLearningResult:
-        request = CognitiveLearningRequest.from_result(result, context=context, created_at=created_at)
-        owner = False
+        request = CognitiveLearningRequest.from_result(
+            result,
+            context=context,
+            created_at=created_at,
+        )
+
+        stage_store = self.replay_stage_store
+        stage_key: ReplayStageKey | None = None
+        stage_owner_token: str | None = None
+        stage_generation: int | None = None
+
+        claim_values = (
+            replay_cycle_id,
+            replay_cycle_fingerprint,
+            replay_claim_owner_token,
+            replay_claim_generation,
+        )
+
+        if stage_store is None:
+            if any(value is not None for value in claim_values):
+                raise ValueError(
+                    "replay claim metadata requires a configured replay stage store"
+                )
+        else:
+            if any(value is None for value in claim_values):
+                raise ValueError(
+                    "persistent learning requires complete replay claim metadata"
+                )
+            assert replay_cycle_id is not None
+            assert replay_cycle_fingerprint is not None
+            assert replay_claim_owner_token is not None
+            assert replay_claim_generation is not None
+
+            stage_key = ReplayStageKey.create(
+                replay_cycle_id,
+                replay_cycle_fingerprint,
+                "cognitive_learning.record.v1",
+                {
+                    "contract": "cognitive-learning-v1",
+                    "learning_input": dict(request.learning_input),
+                },
+            )
+            stage_owner_token = replay_claim_owner_token
+            stage_generation = replay_claim_generation
+
         with self._condition:
             existing = self._results.get(request.request_id)
-            if existing is not None:
+            if existing is not None and stage_store is None:
                 return existing
+
             while request.request_id in self._pending:
-                self._condition.wait_for(lambda: request.request_id in self._results or request.request_id not in self._pending)
+                if stage_store is None:
+                    self._condition.wait_for(
+                        lambda: (
+                            request.request_id in self._results
+                            or request.request_id not in self._pending
+                        )
+                    )
+                else:
+                    self._condition.wait_for(
+                        lambda: request.request_id not in self._pending
+                    )
+
                 existing = self._results.get(request.request_id)
-                if existing is not None:
+                if existing is not None and stage_store is None:
                     return existing
+
             self._pending.add(request.request_id)
-            owner = True
             publisher = self._event_publisher
             event_bus = self._event_bus
-        if not owner:
-            raise RuntimeError(f"learning request ownership lost: {request.request_id}")
+
         try:
-            if publisher is None or event_bus is None:
-                return self._execute(request, context)
-            request_context = self._publish(
-                "CognitiveLearningRequested",
-                EventType.START,
-                {"request": request.to_dict()},
-                context,
-            )
-            result_value = self._execute(request, request_context)
+            stage_execution = None
+            if stage_key is not None:
+                assert stage_store is not None
+                assert stage_owner_token is not None
+                assert stage_generation is not None
+
+                # The durable claim is acquired before publishing or executing
+                # the Learning request.
+                stage_execution = stage_store.begin(
+                    stage_key,
+                    stage_owner_token,
+                    stage_generation,
+                )
+
+            request_context = context
+            if publisher is not None and event_bus is not None:
+                request_payload: dict[str, Any] = {
+                    "request": request.to_dict(),
+                }
+                if stage_key is not None:
+                    request_payload["idempotency_key"] = (
+                        stage_key.idempotency_key
+                    )
+                    request_payload["replayed"] = (
+                        stage_execution is not None
+                        and stage_execution.status is ReplayStageStatus.COMPLETED
+                    )
+
+                request_context = self._publish(
+                    "CognitiveLearningRequested",
+                    EventType.START,
+                    request_payload,
+                    context,
+                )
+
+            if (
+                stage_execution is not None
+                and stage_execution.status is ReplayStageStatus.COMPLETED
+            ):
+                if stage_execution.result is None:
+                    raise RuntimeError(
+                        "completed replay stage has no persisted result"
+                    )
+                assert stage_key is not None
+                result_value = self._restore_completed_stage(
+                    request,
+                    stage_execution.result,
+                    request_context,
+                    stage_key.idempotency_key,
+                )
+            else:
+                idempotency_key = (
+                    None if stage_key is None else stage_key.idempotency_key
+                )
+                result_value = self._execute(
+                    request,
+                    request_context,
+                    idempotency_key=idempotency_key,
+                )
+
+                if stage_key is not None:
+                    assert stage_store is not None
+                    assert stage_owner_token is not None
+                    assert stage_generation is not None
+                    stage_store.complete(
+                        stage_key,
+                        stage_owner_token,
+                        stage_generation,
+                        result_value.to_dict(),
+                    )
+
             return result_value
         finally:
             with self._condition:
                 self._pending.remove(request.request_id)
                 self._condition.notify_all()
+
+    def _restore_completed_stage(
+        self,
+        request: CognitiveLearningRequest,
+        stored_result: Mapping[str, Any],
+        context: EventPropagationContext,
+        idempotency_key: str,
+    ) -> CognitiveLearningResult:
+        restored = CognitiveLearningResult.from_dict(stored_result)
+
+        if (
+            restored.result_id != request.result_id
+            or restored.created_at != request.created_at
+            or restored.correlation_id != request.correlation_id
+            or restored.trace_id != request.trace_id
+            or restored.tenant_id != request.tenant_id
+        ):
+            raise ValueError(
+                "persisted learning stage result conflicts with the current request"
+            )
+
+        # Causation belongs to this replay attempt. Keep the durable Learning
+        # output but continue the current event propagation chain.
+        restored = replace(
+            restored,
+            request_id=request.request_id,
+            correlation_id=context.correlation_id,
+            causation_id=context.causation_id,
+            trace_id=context.trace_id,
+            tenant_id=context.tenant_id,
+        )
+
+        event_name = (
+            "CognitiveLearningCompleted"
+            if restored.success
+            else "CognitiveLearningFailed"
+        )
+        event_type = EventType.COMPLETE if restored.success else EventType.FAILURE
+        final_context = self._publish(
+            event_name,
+            event_type,
+            {
+                "request": request.to_dict(),
+                "result": restored.to_dict(),
+                "idempotency_key": idempotency_key,
+                "replayed": True,
+            },
+            context,
+        )
+        restored = replace(restored, _next_context=final_context)
+
+        with self._condition:
+            self._results[request.request_id] = restored
+            self._last_context = final_context
+            self._condition.notify_all()
+
+        return restored
 
     def _configure(self) -> None:
         publisher = self._event_publisher
@@ -413,6 +636,12 @@ class CognitiveLearningBoundary:
                 pending = self._pending
                 if request.request_id in pending:
                     return
+            if self.replay_stage_store is not None:
+                error(
+                    "Persistent learning event requires coordinator claim context",
+                    {"request_id": request.request_id},
+                )
+                return
             self._execute(request, EventPropagationContext.from_event(event))
         except Exception as exc:
             error("Cognitive learning boundary event handling failed", {"error": str(exc)})
@@ -421,17 +650,34 @@ class CognitiveLearningBoundary:
         self,
         request: CognitiveLearningRequest,
         context: EventPropagationContext,
+        *,
+        idempotency_key: str | None = None,
     ) -> CognitiveLearningResult:
-        with self._condition:
-            existing = self._results.get(request.request_id)
-            if existing is not None:
-                return existing
+        # Non-persistent requests retain the legacy request-id cache.
+        # Persistent requests are identified by their Stage idempotency key.
+        if idempotency_key is None:
+            with self._condition:
+                existing = self._results.get(request.request_id)
+                if existing is not None:
+                    return existing
         result_context = context
         try:
             with self._backend_lock:
                 backend_context_before = getattr(self.learning, "propagation_context", None)
                 try:
-                    learning = self.learning.run(dict(request.learning_input), context=context)
+                    if idempotency_key is None:
+                        learning = self.learning.run(
+                            dict(request.learning_input),
+                            context=context,
+                        )
+                    else:
+                        # Persistent-store construction validates this capability
+                        # with inspect.signature before execution.
+                        learning = cast(IdempotentLearningBackend, self.learning).run(
+                            dict(request.learning_input),
+                            context=context,
+                            idempotency_key=idempotency_key,
+                        )
                 finally:
                     backend_context_after = getattr(self.learning, "propagation_context", None)
                     if (
@@ -475,10 +721,17 @@ class CognitiveLearningBoundary:
             self._results[request.request_id] = result
         event_name = "CognitiveLearningCompleted" if result.success else "CognitiveLearningFailed"
         event_type = EventType.COMPLETE if result.success else EventType.FAILURE
+        event_payload: dict[str, Any] = {
+            "request": request.to_dict(),
+            "result": result.to_dict(),
+        }
+        if idempotency_key is not None:
+            event_payload["idempotency_key"] = idempotency_key
+
         final_context = self._publish(
             event_name,
             event_type,
-            {"request": request.to_dict(), "result": result.to_dict()},
+            event_payload,
             result_context,
         )
         result = replace(result, _next_context=final_context)

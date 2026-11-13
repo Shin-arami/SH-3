@@ -9,6 +9,9 @@ from infrastructure.security.persistent_replay_ops import (
     PersistentReplayReadinessError,
     check_database,
 )
+from infrastructure.security.persistent_replay_provision import (
+    provision_persistent_replay_database,
+)
 from infrastructure.security.persistent_replay_runtime import (
     PERSISTENT_REPLAY_DATABASE_ENV,
     PersistentReplayConfigurationError,
@@ -20,6 +23,7 @@ from infrastructure.security.persistent_store import (
     ReplayClaimStatus,
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
+    SQLiteReplayStageStore,
 )
 from kernel.core import SH3Kernel
 
@@ -87,19 +91,28 @@ def test_explicit_provisioning_creates_one_valid_database_and_wires_kernel(
     assert stores.database_path == database.resolve()
     assert stores.evidence_store.database_path == stores.database_path
     assert stores.replay_claim_store.database_path == stores.database_path
+    assert isinstance(stores.replay_stage_store, SQLiteReplayStageStore)
+    assert stores.replay_stage_store.database_path == stores.database_path
     report = check_database(database)
     assert report.evidence_count == 0
     assert report.replay_claim_count == 0
+    assert report.replay_stage_execution_count == 0
     assert report.journal_mode == "wal"
 
     kernel = SH3Kernel(
         evidence_store=stores.evidence_store,
         replay_claim_store=stores.replay_claim_store,
+        replay_stage_store=stores.replay_stage_store,
     )
     assert kernel.optimizer_evidence_boundary.evidence_store is stores.evidence_store
     assert (
         kernel.learning_closed_loop_evidence_boundary.evidence_store
         is stores.evidence_store
+    )
+    assert kernel.replay_stage_store is stores.replay_stage_store
+    assert (
+        kernel.cognitive_learning_boundary.replay_stage_store
+        is stores.replay_stage_store
     )
 
 
@@ -117,6 +130,7 @@ def test_runtime_store_bundle_reopens_persisted_state_across_instances(
     )
 
     second = create_persistent_replay_stores(database)
+    assert isinstance(second.replay_stage_store, SQLiteReplayStageStore)
     loaded_evidence = second.evidence_store.get(evidence.evidence_id)
     loaded_claim = second.replay_claim_store.get("learning-cycle:runtime-wiring")
 
@@ -128,6 +142,7 @@ def test_runtime_store_bundle_reopens_persisted_state_across_instances(
     assert loaded_claim.generation == claim.generation
     assert check_database(database).evidence_count == 1
     assert check_database(database).replay_claim_count == 1
+    assert check_database(database).replay_stage_execution_count == 0
 
 
 def test_bundle_rejects_stores_that_point_to_different_database_files(
@@ -170,3 +185,22 @@ def test_existing_unrecognized_database_is_not_silently_initialized(
         create_persistent_replay_stores(database, create_if_missing=True)
 
     assert database.read_bytes() == original
+
+
+def test_explicit_provisioning_initializes_replay_stage_table(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "provisioned-stage.sqlite3"
+
+    report = provision_persistent_replay_database(
+        database,
+        confirm_first_use=True,
+    )
+
+    assert database.is_file()
+    assert report.replay_claim_count == 0
+    assert report.replay_stage_execution_count == 0
+
+    stores = create_persistent_replay_stores(database)
+    assert isinstance(stores.replay_stage_store, SQLiteReplayStageStore)
+    assert stores.replay_stage_store.database_path == database.resolve()

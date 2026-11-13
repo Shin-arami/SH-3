@@ -390,7 +390,12 @@ class SystemOptimizer:
         *,
         context: EventPropagationContext | None = None,
         execute: bool = False,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key must not be empty")
         if context is not None:
             self.set_propagation_context(context)
 
@@ -409,7 +414,12 @@ class SystemOptimizer:
         proposed_actions = tuple(rebalance_actions["actions"])
         execution: tuple[OptimizationActionResult, ...] = ()
         if execute:
-            execution = self.execute_actions(proposed_actions)
+            action_context = (
+                {"idempotency_key": idempotency_key}
+                if idempotency_key is not None
+                else None
+            )
+            execution = self.execute_actions(proposed_actions, action_context)
         result = {
             "optimizer_id": self.optimizer_id,
             "snapshot": snapshot,

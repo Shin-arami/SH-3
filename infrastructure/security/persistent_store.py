@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -11,6 +12,7 @@ from enum import StrEnum, unique
 from os import PathLike
 from pathlib import Path
 from secrets import token_hex
+from types import MappingProxyType
 from typing import Any
 
 from infrastructure.security import EvidenceRecord, EvidenceStore
@@ -23,8 +25,14 @@ __all__ = [
     "ReplayClaimConflictError",
     "ReplayClaimOwnershipError",
     "ReplayClaimStatus",
+    "ReplayStageBusyError",
+    "ReplayStageConflictError",
+    "ReplayStageExecution",
+    "ReplayStageKey",
+    "ReplayStageStatus",
     "SQLiteEvidenceStore",
     "SQLiteReplayClaimStore",
+    "SQLiteReplayStageStore",
 ]
 
 
@@ -890,3 +898,604 @@ class SQLiteReplayClaimStore(_SQLiteDatabase):
         if row is None:
             return None
         return self._claim_from_row(row)
+
+def _replay_stage_key_digest(
+    cycle_id: str,
+    cycle_fingerprint: str,
+    stage_name: str,
+    input_fingerprint: str,
+) -> str:
+    identity = {
+        "contract_version": 1,
+        "cycle_id": cycle_id,
+        "cycle_fingerprint": cycle_fingerprint,
+        "stage_name": stage_name,
+        "input_fingerprint": input_fingerprint,
+    }
+    digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
+    return f"sh3-stage-v1:{digest}"
+
+
+def _replay_stage_result_integrity(result_json: str) -> str:
+    digest = hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+@unique
+class ReplayStageStatus(StrEnum):
+    CLAIMED = "claimed"
+    COMPLETED = "completed"
+
+
+class ReplayStageBusyError(ReplayClaimError):
+    """Raised when the same generation already owns an unfinished stage."""
+
+
+class ReplayStageConflictError(ReplayClaimError):
+    """Raised when a stage identity or its completed result conflicts."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayStageKey:
+    """Stable idempotency identity for one logical stage execution.
+
+    The key deliberately excludes the replay-claim generation and owner token.
+    """
+
+    idempotency_key: str
+    cycle_id: str
+    cycle_fingerprint: str
+    stage_name: str
+    input_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _text("idempotency_key", self.idempotency_key)
+        _text("cycle_id", self.cycle_id)
+        _text("cycle_fingerprint", self.cycle_fingerprint)
+        _text("stage_name", self.stage_name)
+        _text("input_fingerprint", self.input_fingerprint)
+
+        expected = _replay_stage_key_digest(
+            self.cycle_id,
+            self.cycle_fingerprint,
+            self.stage_name,
+            self.input_fingerprint,
+        )
+        if self.idempotency_key != expected:
+            raise ValueError("idempotency_key does not match stage identity")
+
+    @classmethod
+    def create(
+        cls,
+        cycle_id: str,
+        cycle_fingerprint: str,
+        stage_name: str,
+        input_payload: Mapping[str, Any],
+    ) -> ReplayStageKey:
+        if not isinstance(input_payload, Mapping):
+            raise TypeError("input_payload must be a mapping")
+
+        input_json = _canonical_json(input_payload)
+        input_fingerprint = (
+            "sha256:"
+            + hashlib.sha256(input_json.encode("utf-8")).hexdigest()
+        )
+        return cls.from_fingerprints(
+            cycle_id,
+            cycle_fingerprint,
+            stage_name,
+            input_fingerprint,
+        )
+
+    @classmethod
+    def from_fingerprints(
+        cls,
+        cycle_id: str,
+        cycle_fingerprint: str,
+        stage_name: str,
+        input_fingerprint: str,
+    ) -> ReplayStageKey:
+        return cls(
+            idempotency_key=_replay_stage_key_digest(
+                cycle_id,
+                cycle_fingerprint,
+                stage_name,
+                input_fingerprint,
+            ),
+            cycle_id=cycle_id,
+            cycle_fingerprint=cycle_fingerprint,
+            stage_name=stage_name,
+            input_fingerprint=input_fingerprint,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayStageExecution:
+    key: ReplayStageKey
+    status: ReplayStageStatus
+    generation: int
+    attempts: int
+    owner_token: str | None
+    result: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, ReplayStageKey):
+            raise TypeError("key must be ReplayStageKey")
+        if not isinstance(self.status, ReplayStageStatus):
+            raise TypeError("status must be ReplayStageStatus")
+
+        for name, value in (
+            ("generation", self.generation),
+            ("attempts", self.attempts),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+
+        if self.status is ReplayStageStatus.CLAIMED:
+            _text("owner_token", self.owner_token)
+            if self.result is not None:
+                raise ValueError("claimed stage must not contain a result")
+        else:
+            if self.owner_token is not None:
+                raise ValueError("completed stage must not retain an owner token")
+            if not isinstance(self.result, Mapping):
+                raise TypeError("completed stage result must be a mapping")
+            object.__setattr__(
+                self,
+                "result",
+                MappingProxyType(dict(self.result)),
+            )
+
+
+def _decode_replay_stage_result(
+    result_json: str,
+    expected_integrity: str,
+) -> Mapping[str, Any]:
+    try:
+        raw = json.loads(result_json)
+        if not isinstance(raw, Mapping):
+            raise TypeError("stage result must be a JSON object")
+
+        canonical = _canonical_json(raw)
+        if canonical != result_json:
+            raise ValueError("stage result is not canonical JSON")
+
+        if _replay_stage_result_integrity(canonical) != expected_integrity:
+            raise PersistentEvidenceIntegrityError(
+                "persisted replay stage result integrity failed"
+            )
+        return MappingProxyType(dict(raw))
+    except PersistentEvidenceIntegrityError:
+        raise
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PersistentEvidenceIntegrityError(
+            "persisted replay stage result is malformed"
+        ) from exc
+
+
+class SQLiteReplayStageStore(_SQLiteDatabase):
+    """Durable stage execution ledger fenced by the parent replay claim.
+
+    Stage rows share the replay-claim database. A completed result can be
+    replayed by a newer generation. An unfinished row can be taken over only
+    after the parent claim has moved to a newer generation.
+    """
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        database_path: str | PathLike[str],
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        super().__init__(database_path, timeout_seconds=timeout_seconds)
+        with self._connection() as connection:
+            parent = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'sh3_replay_claims'"
+            ).fetchone()
+            if parent is None:
+                raise ValueError(
+                    "SQLiteReplayStageStore requires sh3_replay_claims"
+                )
+
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sh3_replay_stage_executions (
+                    idempotency_key TEXT PRIMARY KEY NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    cycle_fingerprint TEXT NOT NULL,
+                    stage_name TEXT NOT NULL,
+                    input_fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK (state IN ('claimed', 'completed')),
+                    generation INTEGER NOT NULL CHECK (generation >= 1),
+                    attempts INTEGER NOT NULL CHECK (attempts >= 1),
+                    owner_token TEXT,
+                    result_json TEXT,
+                    result_integrity TEXT,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY (cycle_id)
+                        REFERENCES sh3_replay_claims(cycle_id),
+                    CHECK (
+                        (
+                            state = 'claimed'
+                            AND owner_token IS NOT NULL
+                            AND result_json IS NULL
+                            AND result_integrity IS NULL
+                        )
+                        OR
+                        (
+                            state = 'completed'
+                            AND owner_token IS NULL
+                            AND result_json IS NOT NULL
+                            AND result_integrity IS NOT NULL
+                        )
+                    )
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "sh3_replay_stage_cycle_state_idx "
+                "ON sh3_replay_stage_executions(cycle_id, state)"
+            )
+
+    @staticmethod
+    def _validate_parent_owner(
+        connection: sqlite3.Connection,
+        key: ReplayStageKey,
+        owner_token: str,
+        generation: int,
+        current_time: float,
+    ) -> None:
+        row = connection.execute(
+            "SELECT fingerprint, state, generation, owner_token, "
+            "lease_expires_at FROM sh3_replay_claims WHERE cycle_id = ?",
+            (key.cycle_id,),
+        ).fetchone()
+
+        if row is None:
+            raise ReplayClaimOwnershipError(
+                f"replay claim is missing for {key.cycle_id}"
+            )
+
+        fingerprint, state, stored_generation, stored_owner, lease = row
+        if fingerprint != key.cycle_fingerprint:
+            raise ReplayClaimConflictError(
+                f"replay fingerprint conflicts for {key.cycle_id}"
+            )
+        if (
+            state != ReplayClaimStatus.CLAIMED.value
+            or stored_generation != generation
+            or stored_owner != owner_token
+        ):
+            raise ReplayClaimOwnershipError(
+                f"replay claim ownership was lost for {key.cycle_id}"
+            )
+        if lease is None or float(lease) <= current_time:
+            raise ReplayClaimOwnershipError(
+                f"replay claim lease expired for {key.cycle_id}"
+            )
+
+    @staticmethod
+    def _execution_from_row(
+        key: ReplayStageKey,
+        row: tuple[Any, ...],
+    ) -> ReplayStageExecution:
+        (
+            cycle_fingerprint,
+            stage_name,
+            input_fingerprint,
+            state,
+            generation,
+            attempts,
+            owner_token,
+            result_json,
+            result_integrity,
+            cycle_id,
+        ) = row
+
+        if (
+            cycle_id != key.cycle_id
+            or cycle_fingerprint != key.cycle_fingerprint
+            or stage_name != key.stage_name
+            or input_fingerprint != key.input_fingerprint
+        ):
+            raise ReplayStageConflictError(
+                f"replay stage identity conflicts for {key.idempotency_key}"
+            )
+
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or attempts < 1
+        ):
+            raise PersistentEvidenceIntegrityError(
+                "persisted replay stage ownership metadata is invalid"
+            )
+
+        if state == ReplayStageStatus.CLAIMED.value:
+            if (
+                not isinstance(owner_token, str)
+                or not owner_token.strip()
+                or result_json is not None
+                or result_integrity is not None
+            ):
+                raise PersistentEvidenceIntegrityError(
+                    "persisted claimed replay stage is inconsistent"
+                )
+            return ReplayStageExecution(
+                key=key,
+                status=ReplayStageStatus.CLAIMED,
+                generation=generation,
+                attempts=attempts,
+                owner_token=owner_token,
+            )
+
+        if state == ReplayStageStatus.COMPLETED.value:
+            if (
+                owner_token is not None
+                or not isinstance(result_json, str)
+                or not isinstance(result_integrity, str)
+            ):
+                raise PersistentEvidenceIntegrityError(
+                    "persisted completed replay stage is inconsistent"
+                )
+            result = _decode_replay_stage_result(
+                result_json,
+                result_integrity,
+            )
+            return ReplayStageExecution(
+                key=key,
+                status=ReplayStageStatus.COMPLETED,
+                generation=generation,
+                attempts=attempts,
+                owner_token=None,
+                result=result,
+            )
+
+        raise PersistentEvidenceIntegrityError(
+            f"unknown replay stage state: {state}"
+        )
+
+    def get(self, key: ReplayStageKey) -> ReplayStageExecution | None:
+        if not isinstance(key, ReplayStageKey):
+            raise TypeError("key must be ReplayStageKey")
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT cycle_fingerprint, stage_name, input_fingerprint, "
+                "state, generation, attempts, owner_token, result_json, "
+                "result_integrity, cycle_id FROM sh3_replay_stage_executions "
+                "WHERE idempotency_key = ?",
+                (key.idempotency_key,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return self._execution_from_row(key, row)
+
+    def begin(
+        self,
+        key: ReplayStageKey,
+        owner_token: str,
+        generation: int,
+        *,
+        now: datetime | None = None,
+    ) -> ReplayStageExecution:
+        if not isinstance(key, ReplayStageKey):
+            raise TypeError("key must be ReplayStageKey")
+        _text("owner_token", owner_token)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("generation must be a positive integer")
+
+        current_time = SQLiteReplayClaimStore._now_timestamp(now)
+        with self._connection() as connection:
+            self._begin(connection)
+            try:
+                self._validate_parent_owner(
+                    connection,
+                    key,
+                    owner_token,
+                    generation,
+                    current_time,
+                )
+                row = connection.execute(
+                    "SELECT cycle_fingerprint, stage_name, input_fingerprint, "
+                    "state, generation, attempts, owner_token, result_json, "
+                    "result_integrity, cycle_id FROM sh3_replay_stage_executions "
+                    "WHERE idempotency_key = ?",
+                    (key.idempotency_key,),
+                ).fetchone()
+
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO sh3_replay_stage_executions "
+                        "(idempotency_key, cycle_id, cycle_fingerprint, "
+                        "stage_name, input_fingerprint, state, generation, "
+                        "attempts, owner_token, result_json, result_integrity, "
+                        "updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'claimed', ?, 1, ?, NULL, "
+                        "NULL, ?)",
+                        (
+                            key.idempotency_key,
+                            key.cycle_id,
+                            key.cycle_fingerprint,
+                            key.stage_name,
+                            key.input_fingerprint,
+                            generation,
+                            owner_token,
+                            current_time,
+                        ),
+                    )
+                    self._commit(connection)
+                    return ReplayStageExecution(
+                        key=key,
+                        status=ReplayStageStatus.CLAIMED,
+                        generation=generation,
+                        attempts=1,
+                        owner_token=owner_token,
+                    )
+
+                execution = self._execution_from_row(key, row)
+                if execution.status is ReplayStageStatus.COMPLETED:
+                    self._commit(connection)
+                    return execution
+
+                if (
+                    execution.generation == generation
+                    and execution.owner_token == owner_token
+                ):
+                    raise ReplayStageBusyError(
+                        f"replay stage is already claimed: {key.idempotency_key}"
+                    )
+
+                if execution.generation >= generation:
+                    raise ReplayClaimOwnershipError(
+                        f"replay stage generation is newer or conflicts: "
+                        f"{key.idempotency_key}"
+                    )
+
+                next_attempts = execution.attempts + 1
+                cursor = connection.execute(
+                    "UPDATE sh3_replay_stage_executions "
+                    "SET generation = ?, attempts = ?, owner_token = ?, "
+                    "updated_at = ? WHERE idempotency_key = ? "
+                    "AND state = 'claimed' AND generation = ?",
+                    (
+                        generation,
+                        next_attempts,
+                        owner_token,
+                        current_time,
+                        key.idempotency_key,
+                        execution.generation,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ReplayClaimOwnershipError(
+                        f"replay stage takeover was lost: {key.idempotency_key}"
+                    )
+
+                self._commit(connection)
+                return ReplayStageExecution(
+                    key=key,
+                    status=ReplayStageStatus.CLAIMED,
+                    generation=generation,
+                    attempts=next_attempts,
+                    owner_token=owner_token,
+                )
+            except Exception:
+                self._rollback(connection)
+                raise
+
+    def complete(
+        self,
+        key: ReplayStageKey,
+        owner_token: str,
+        generation: int,
+        result: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> ReplayStageExecution:
+        if not isinstance(key, ReplayStageKey):
+            raise TypeError("key must be ReplayStageKey")
+        _text("owner_token", owner_token)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("generation must be a positive integer")
+        if not isinstance(result, Mapping):
+            raise TypeError("result must be a mapping")
+
+        result_json = _canonical_json(result)
+        result_integrity = _replay_stage_result_integrity(result_json)
+        current_time = SQLiteReplayClaimStore._now_timestamp(now)
+
+        with self._connection() as connection:
+            self._begin(connection)
+            try:
+                self._validate_parent_owner(
+                    connection,
+                    key,
+                    owner_token,
+                    generation,
+                    current_time,
+                )
+                row = connection.execute(
+                    "SELECT cycle_fingerprint, stage_name, input_fingerprint, "
+                    "state, generation, attempts, owner_token, result_json, "
+                    "result_integrity, cycle_id FROM sh3_replay_stage_executions "
+                    "WHERE idempotency_key = ?",
+                    (key.idempotency_key,),
+                ).fetchone()
+
+                if row is None:
+                    raise ReplayClaimOwnershipError(
+                        f"replay stage claim is missing: {key.idempotency_key}"
+                    )
+
+                execution = self._execution_from_row(key, row)
+                if execution.status is ReplayStageStatus.COMPLETED:
+                    if (
+                        row[7] != result_json
+                        or row[8] != result_integrity
+                    ):
+                        raise ReplayStageConflictError(
+                            f"completed replay stage result conflicts: "
+                            f"{key.idempotency_key}"
+                        )
+                    self._commit(connection)
+                    return execution
+
+                if (
+                    execution.generation != generation
+                    or execution.owner_token != owner_token
+                ):
+                    raise ReplayClaimOwnershipError(
+                        f"replay stage ownership was lost: {key.idempotency_key}"
+                    )
+
+                cursor = connection.execute(
+                    "UPDATE sh3_replay_stage_executions "
+                    "SET state = 'completed', owner_token = NULL, "
+                    "result_json = ?, result_integrity = ?, updated_at = ? "
+                    "WHERE idempotency_key = ? AND state = 'claimed' "
+                    "AND generation = ? AND owner_token = ?",
+                    (
+                        result_json,
+                        result_integrity,
+                        current_time,
+                        key.idempotency_key,
+                        generation,
+                        owner_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ReplayClaimOwnershipError(
+                        f"replay stage completion was fenced: {key.idempotency_key}"
+                    )
+
+                self._commit(connection)
+                return ReplayStageExecution(
+                    key=key,
+                    status=ReplayStageStatus.COMPLETED,
+                    generation=generation,
+                    attempts=execution.attempts,
+                    owner_token=None,
+                    result=result,
+                )
+            except Exception:
+                self._rollback(connection)
+                raise

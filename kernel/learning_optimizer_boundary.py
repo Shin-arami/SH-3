@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
+from enum import Enum
+from inspect import Parameter, signature
 from math import isfinite
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from foundation.Enums.category import Category
 from foundation.Enums.event import EventType
@@ -15,6 +17,11 @@ from foundation.utils.hash import short_id
 from foundation.utils.logging import error
 from infrastructure.event_bus import EventBus, EventPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security.persistent_store import (
+    ReplayStageKey,
+    ReplayStageStatus,
+    SQLiteReplayStageStore,
+)
 from kernel.optimizer_update_boundary import OptimizationUpdateBoundary
 
 __all__ = [
@@ -38,6 +45,34 @@ def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return MappingProxyType(dict(value or {}))
 
 
+def _stage_json_value(value: Any) -> Any:
+    """Convert optimizer results to deterministic JSON-native values."""
+    if isinstance(value, Enum):
+        return _stage_json_value(value.value)
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat()
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("persistent optimizer result mapping keys must be strings")
+            normalized[key] = _stage_json_value(item)
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [_stage_json_value(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _stage_json_value(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(
+        "persistent optimizer result contains a non-JSON value: "
+        f"{type(value).__name__}"
+    )
+
+
 def _matches_trace(candidate: object, requested: EventPropagationContext) -> bool:
     return (
         isinstance(candidate, EventPropagationContext)
@@ -57,6 +92,16 @@ class OptimizerBackend(Protocol):
         *,
         context: EventPropagationContext | None = None,
         execute: bool = False,
+    ) -> dict[str, Any]: ...
+
+
+class IdempotentOptimizerBackend(Protocol):
+    def optimize(
+        self,
+        *,
+        context: EventPropagationContext | None = None,
+        execute: bool = False,
+        idempotency_key: str,
     ) -> dict[str, Any]: ...
 
 
@@ -312,6 +357,7 @@ class LearningOptimizerBoundary:
         "_subscriber_id",
         "_update_boundary",
         "optimizer",
+        "replay_stage_store",
     )
 
     def __init__(
@@ -321,6 +367,7 @@ class LearningOptimizerBoundary:
         *,
         subscriber_id: str = "learning.optimizer-boundary",
         update_boundary: OptimizationUpdateBoundary | None = None,
+        replay_stage_store: SQLiteReplayStageStore | None = None,
     ) -> None:
         if optimizer is None or not callable(getattr(optimizer, "optimize", None)):
             raise TypeError("optimizer must provide optimize")
@@ -331,7 +378,28 @@ class LearningOptimizerBoundary:
         self.optimizer = optimizer
         if update_boundary is not None and not isinstance(update_boundary, OptimizationUpdateBoundary):
             raise TypeError("update_boundary must be OptimizationUpdateBoundary or None")
+        if replay_stage_store is not None and not isinstance(
+            replay_stage_store, SQLiteReplayStageStore
+        ):
+            raise TypeError("replay_stage_store must be SQLiteReplayStageStore or None")
+        if replay_stage_store is not None:
+            try:
+                parameters = signature(optimizer.optimize).parameters.values()
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "persistent optimizer backend must expose an idempotency_key parameter"
+                ) from exc
+            supports_idempotency_key = any(
+                parameter.name == "idempotency_key"
+                or parameter.kind is Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            if not supports_idempotency_key:
+                raise TypeError(
+                    "persistent optimizer backend must accept idempotency_key"
+                )
         self._update_boundary = update_boundary
+        self.replay_stage_store = replay_stage_store
         self._event_publisher = event_publisher
         self._event_bus: EventBus | None = None
         self._lock = RLock()
@@ -382,12 +450,109 @@ class LearningOptimizerBoundary:
         *,
         context: EventPropagationContext,
         created_at: datetime | None = None,
+        replay_cycle_id: str | None = None,
+        replay_cycle_fingerprint: str | None = None,
+        replay_claim_owner_token: str | None = None,
+        replay_claim_generation: int | None = None,
     ) -> LearningOptimizationResult:
+        if not isinstance(context, EventPropagationContext):
+            raise TypeError("context must be EventPropagationContext")
         request = LearningOptimizationRequest.from_learning_result(
             learning_result,
             context=context,
             created_at=created_at,
         )
+
+        stage_store = self.replay_stage_store
+        claim_values = (
+            replay_cycle_id,
+            replay_cycle_fingerprint,
+            replay_claim_owner_token,
+            replay_claim_generation,
+        )
+        if stage_store is None:
+            if any(value is not None for value in claim_values):
+                raise ValueError(
+                    "replay claim metadata requires a configured optimizer stage store"
+                )
+        else:
+            if any(value is None for value in claim_values):
+                raise ValueError(
+                    "persistent optimization requires complete replay claim metadata"
+                )
+            assert replay_cycle_id is not None
+            assert replay_cycle_fingerprint is not None
+            assert replay_claim_owner_token is not None
+            assert replay_claim_generation is not None
+
+            stage_key = ReplayStageKey.create(
+                replay_cycle_id,
+                replay_cycle_fingerprint,
+                "learning_optimizer.request.v1",
+                {
+                    "contract": "learning-optimizer-v1",
+                    "learning_input": {
+                        "learning_record_id": request.learning_record_id,
+                        "domain": request.domain,
+                        "success": request.success,
+                        "score": request.score,
+                        "strategy": request.strategy,
+                        "metadata": dict(request.metadata),
+                    },
+                },
+            )
+            stage_execution = stage_store.begin(
+                stage_key,
+                replay_claim_owner_token,
+                replay_claim_generation,
+            )
+            with self._lock:
+                publisher = self._event_publisher
+                event_bus = self._event_bus
+
+            request_context = context
+            if publisher is not None and event_bus is not None:
+                request_context = self._publish(
+                    "LearningOptimizationRequested",
+                    EventType.START,
+                    {
+                        "request": request.to_dict(),
+                        "idempotency_key": stage_key.idempotency_key,
+                        "replayed": (
+                            stage_execution.status is ReplayStageStatus.COMPLETED
+                        ),
+                    },
+                    context,
+                )
+
+            if stage_execution.status is ReplayStageStatus.COMPLETED:
+                if stage_execution.result is None:
+                    raise RuntimeError(
+                        "completed optimizer stage has no persisted result"
+                    )
+                return self._restore_completed_stage(
+                    request,
+                    stage_execution.result,
+                    request_context,
+                    stage_key.idempotency_key,
+                )
+
+            result = self._execute(
+                request,
+                request_context,
+                idempotency_key=stage_key.idempotency_key,
+            )
+            stage_result = _stage_json_value(result.to_dict())
+            if not isinstance(stage_result, Mapping):
+                raise TypeError("persistent optimizer result must normalize to a mapping")
+            stage_store.complete(
+                stage_key,
+                replay_claim_owner_token,
+                replay_claim_generation,
+                stage_result,
+            )
+            return result
+
         with self._lock:
             existing = self._results.get(request.request_id)
             publisher = self._event_publisher
@@ -402,12 +567,12 @@ class LearningOptimizerBoundary:
             {"request": request.to_dict()},
             context,
         )
-        result = self.get(request.request_id)
-        if result is None:
+        event_result = self.get(request.request_id)
+        if event_result is None:
             raise RuntimeError(
                 f"optimization result not produced: {request.request_id}"
             )
-        return result
+        return event_result
 
     def _configure(self) -> None:
         publisher = self._event_publisher
@@ -441,6 +606,8 @@ class LearningOptimizerBoundary:
             self._started = True
 
     def _handle_request(self, event: Event) -> None:
+        if self.replay_stage_store is not None:
+            return
         payload = event.payload.get("request")
         if not isinstance(payload, Mapping):
             return
@@ -454,10 +621,91 @@ class LearningOptimizerBoundary:
                 {"error": str(exc)},
             )
 
+    def _restore_completed_stage(
+        self,
+        request: LearningOptimizationRequest,
+        stored_result: Mapping[str, Any],
+        context: EventPropagationContext,
+        idempotency_key: str,
+    ) -> LearningOptimizationResult:
+        if not isinstance(stored_result, Mapping):
+            raise TypeError("persisted optimizer stage result must be a mapping")
+        created_at_value = stored_result.get("created_at")
+        created_at = (
+            created_at_value
+            if isinstance(created_at_value, datetime)
+            else datetime.fromisoformat(str(created_at_value))
+        )
+        optimization = stored_result.get("optimization")
+        if not isinstance(optimization, Mapping):
+            raise ValueError("persisted optimizer stage result has invalid optimization data")
+        success_value = stored_result.get("success")
+        if not isinstance(success_value, bool):
+            raise ValueError("persisted optimizer stage result has invalid success flag")
+
+        restored = LearningOptimizationResult(
+            request_id=_text("request_id", stored_result.get("request_id")),
+            learning_record_id=_text(
+                "learning_record_id", stored_result.get("learning_record_id")
+            ),
+            optimizer_id=_text("optimizer_id", stored_result.get("optimizer_id")),
+            success=success_value,
+            optimization=optimization,
+            created_at=created_at,
+            correlation_id=_text(
+                "correlation_id", stored_result.get("correlation_id")
+            ),
+            causation_id=stored_result.get("causation_id"),
+            trace_id=stored_result.get("trace_id"),
+            tenant_id=stored_result.get("tenant_id"),
+            error=stored_result.get("error"),
+        )
+        if (
+            restored.learning_record_id != request.learning_record_id
+            or restored.created_at != request.created_at
+        ):
+            raise ValueError(
+                "persisted optimizer stage result conflicts with the current learning request"
+            )
+
+        # The optimization output is durable; request/event lineage belongs to this replay.
+        restored = replace(
+            restored,
+            request_id=request.request_id,
+            correlation_id=context.correlation_id,
+            causation_id=context.causation_id,
+            trace_id=context.trace_id,
+            tenant_id=context.tenant_id,
+        )
+        event_name = (
+            "LearningOptimizationCompleted"
+            if restored.success
+            else "LearningOptimizationFailed"
+        )
+        event_type = EventType.COMPLETE if restored.success else EventType.FAILURE
+        result_context = self._publish(
+            event_name,
+            event_type,
+            {
+                "result": restored.to_dict(),
+                "request": request.to_dict(),
+                "idempotency_key": idempotency_key,
+                "replayed": True,
+            },
+            context,
+        )
+        restored = replace(restored, _next_context=result_context)
+        with self._lock:
+            self._results[request.request_id] = restored
+            self._last_context = result_context
+        return restored
+
     def _execute(
         self,
         request: LearningOptimizationRequest,
         context: EventPropagationContext,
+        *,
+        idempotency_key: str | None = None,
     ) -> LearningOptimizationResult:
         with self._lock:
             existing = self._results.get(request.request_id)
@@ -468,7 +716,14 @@ class LearningOptimizerBoundary:
             try:
                 update_boundary = self._update_boundary
                 if update_boundary is None:
-                    optimization = self.optimizer.optimize(context=context, execute=True)
+                    if idempotency_key is None:
+                        optimization = self.optimizer.optimize(context=context, execute=True)
+                    else:
+                        optimization = cast(IdempotentOptimizerBackend, self.optimizer).optimize(
+                            context=context,
+                            execute=True,
+                            idempotency_key=idempotency_key,
+                        )
                     optimizer_id = str(optimization.get("optimizer_id", "optimizer"))
                     optimizer_context = getattr(self.optimizer, "propagation_context", None)
                     if (
@@ -479,7 +734,14 @@ class LearningOptimizerBoundary:
                         event_context = optimizer_context
                     success = self._optimization_success(optimization)
                 else:
-                    optimization = self.optimizer.optimize(context=context, execute=False)
+                    if idempotency_key is None:
+                        optimization = self.optimizer.optimize(context=context, execute=False)
+                    else:
+                        optimization = cast(IdempotentOptimizerBackend, self.optimizer).optimize(
+                            context=context,
+                            execute=False,
+                            idempotency_key=idempotency_key,
+                        )
                     optimizer_id = str(optimization.get("optimizer_id", "optimizer"))
                     optimizer_context = getattr(self.optimizer, "propagation_context", None)
                     update_context = context
@@ -493,6 +755,7 @@ class LearningOptimizerBoundary:
                         optimization,
                         context=update_context,
                         created_at=request.created_at,
+                        idempotency_key=idempotency_key,
                     )
                     update_context_after = getattr(
                         update,
@@ -519,6 +782,8 @@ class LearningOptimizerBoundary:
                     optimization = dict(optimization)
                     optimization["update"] = update.to_dict()
                     success = update.success
+                if idempotency_key is not None:
+                    optimization = _stage_json_value(optimization)
                 error_message = None
             except Exception as exc:
                 optimizer_context = getattr(self.optimizer, "propagation_context", None)
@@ -555,7 +820,12 @@ class LearningOptimizerBoundary:
         result_context = self._publish(
             event_name,
             event_type,
-            {"result": result.to_dict(), "request": request.to_dict()},
+            {
+                "result": result.to_dict(),
+                "request": request.to_dict(),
+                **({"idempotency_key": idempotency_key} if idempotency_key is not None else {}),
+                "replayed": False,
+            },
             event_context,
         )
         result = replace(result, _next_context=result_context)

@@ -21,6 +21,7 @@ from infrastructure.security.persistent_replay_runtime import (
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
+    SQLiteReplayStageStore,
 )
 
 __all__ = ["main", "provision_persistent_replay_database"]
@@ -93,6 +94,7 @@ def provision_persistent_replay_database(
     # the file on error so an operator can inspect it; never auto-delete it.
     SQLiteEvidenceStore(path, timeout_seconds=timeout)
     SQLiteReplayClaimStore(path, timeout_seconds=timeout)
+    SQLiteReplayStageStore(path, timeout_seconds=timeout)
     return check_database(path, timeout_seconds=timeout)
 
 

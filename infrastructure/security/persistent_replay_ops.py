@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from foundation.utils.hash import short_id
 from infrastructure.security import EvidenceRecord
+from infrastructure.security.persistent_store import ReplayStageKey
 
 __all__ = [
     "DatabaseReadinessReport",
@@ -42,6 +44,21 @@ _CLAIM_COLUMNS = {
     "updated_at",
 }
 _CLAIM_STATES = {"claimed", "completed", "released"}
+_STAGE_TABLE = "sh3_replay_stage_executions"
+_STAGE_COLUMNS = {
+    "idempotency_key",
+    "cycle_id",
+    "cycle_fingerprint",
+    "stage_name",
+    "input_fingerprint",
+    "state",
+    "generation",
+    "attempts",
+    "owner_token",
+    "result_json",
+    "result_integrity",
+    "updated_at",
+}
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _EXIT_PENDING_RECONCILIATION_POLICY_GATE = 2
 _EXIT_EXPIRED_CLAIM_POLICY_GATE = 3
@@ -109,6 +126,7 @@ class DatabaseReadinessReport:
     expired_claim_count: int
     pending_evidence_reconciliation_count: int = 0
     pending_evidence_reconciliations: tuple[PendingEvidenceReconciliation, ...] = field(default=(), repr=False)
+    replay_stage_execution_count: int = 0
 
 
 def _timeout(value: float) -> float:
@@ -359,6 +377,194 @@ def _validate_claim(row: sqlite3.Row, now: float) -> bool:
     return False
 
 
+def _require_replay_stage_parent_foreign_key(
+    connection: sqlite3.Connection,
+) -> None:
+    rows = connection.execute(
+        "PRAGMA foreign_key_list(sh3_replay_stage_executions)"
+    ).fetchall()
+
+    matching = [
+        row
+        for row in rows
+        if str(row["table"]) == _CLAIM_TABLE
+        and str(row["from"]) == "cycle_id"
+        and str(row["to"]) == "cycle_id"
+    ]
+
+    if len(matching) != 1:
+        raise PersistentReplayReadinessError(
+            "stage execution table must define exactly one "
+            "cycle_id foreign key to sh3_replay_claims(cycle_id)"
+        )
+
+
+def _require_replay_stage_state_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (_STAGE_TABLE,),
+    ).fetchone()
+    table_sql = "" if table_row is None or table_row[0] is None else str(table_row[0])
+    normalized_sql = "".join(table_sql.lower().split())
+    required_check = "statetextnotnullcheck(statein('claimed','completed'))"
+    if required_check not in normalized_sql:
+        raise PersistentReplayReadinessError(
+            "database table sh3_replay_stage_executions does not enforce "
+            "the required stage states"
+        )
+
+    index_rows = connection.execute(
+        "PRAGMA index_list(sh3_replay_stage_executions)"
+    ).fetchall()
+    index_row = next(
+        (
+            row
+            for row in index_rows
+            if str(row["name"]) == "sh3_replay_stage_cycle_state_idx"
+        ),
+        None,
+    )
+    if index_row is None:
+        raise PersistentReplayReadinessError(
+            "database is missing required index "
+            "sh3_replay_stage_cycle_state_idx"
+        )
+    if bool(index_row["unique"]) or bool(index_row["partial"]):
+        raise PersistentReplayReadinessError(
+            "stage cycle/state index must be non-unique and non-partial"
+        )
+
+    index_columns = tuple(
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA index_info(sh3_replay_stage_cycle_state_idx)"
+        ).fetchall()
+    )
+    if index_columns != ("cycle_id", "state"):
+        raise PersistentReplayReadinessError(
+            "stage cycle/state index must use ordered columns "
+            "(cycle_id, state)"
+        )
+
+
+def _validate_replay_stage_rows(
+    connection: sqlite3.Connection,
+) -> int:
+    rows = connection.execute(
+        "SELECT idempotency_key, cycle_id, cycle_fingerprint, stage_name, "
+        "input_fingerprint, state, generation, attempts, owner_token, "
+        "result_json, result_integrity, updated_at "
+        "FROM sh3_replay_stage_executions ORDER BY idempotency_key"
+    ).fetchall()
+
+    count = 0
+    for row in rows:
+        try:
+            idempotency_key = _required_text(
+                "idempotency_key", row["idempotency_key"]
+            )
+            cycle_id = _required_text("cycle_id", row["cycle_id"])
+            cycle_fingerprint = _required_text(
+                "cycle_fingerprint", row["cycle_fingerprint"]
+            )
+            stage_name = _required_text("stage_name", row["stage_name"])
+            input_fingerprint = _required_text(
+                "input_fingerprint", row["input_fingerprint"]
+            )
+            state = _required_text("state", row["state"])
+            generation = row["generation"]
+            attempts = row["attempts"]
+            updated_at = row["updated_at"]
+
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+                or isinstance(attempts, bool)
+                or not isinstance(attempts, int)
+                or attempts < 1
+            ):
+                raise ValueError("stage generation or attempts is invalid")
+            if (
+                isinstance(updated_at, bool)
+                or not isinstance(updated_at, (int, float))
+                or not math.isfinite(float(updated_at))
+            ):
+                raise ValueError("stage updated_at is invalid")
+
+            expected_key = ReplayStageKey.from_fingerprints(
+                cycle_id,
+                cycle_fingerprint,
+                stage_name,
+                input_fingerprint,
+            )
+            if expected_key.idempotency_key != idempotency_key:
+                raise ValueError("stage idempotency key does not match identity")
+
+            parent = connection.execute(
+                "SELECT fingerprint, generation FROM sh3_replay_claims "
+                "WHERE cycle_id = ?",
+                (cycle_id,),
+            ).fetchone()
+            if parent is None or parent["fingerprint"] != cycle_fingerprint:
+                raise ValueError("stage row does not match its parent replay claim")
+            if generation > int(parent["generation"]):
+                raise ValueError("stage generation is newer than its parent claim")
+
+            owner_token = row["owner_token"]
+            result_json = row["result_json"]
+            result_integrity = row["result_integrity"]
+
+            if state == "claimed":
+                if (
+                    not isinstance(owner_token, str)
+                    or not owner_token.strip()
+                    or result_json is not None
+                    or result_integrity is not None
+                ):
+                    raise ValueError("claimed stage ownership/result fields conflict")
+            elif state == "completed":
+                if (
+                    owner_token is not None
+                    or not isinstance(result_json, str)
+                    or not isinstance(result_integrity, str)
+                ):
+                    raise ValueError("completed stage ownership/result fields conflict")
+
+                parsed = json.loads(result_json)
+                if not isinstance(parsed, Mapping):
+                    raise ValueError("completed stage result is not a JSON object")
+                canonical = json.dumps(
+                    parsed,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if canonical != result_json:
+                    raise ValueError("completed stage result is not canonical JSON")
+                digest = (
+                    "sha256:"
+                    + hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+                )
+                if digest != result_integrity:
+                    raise ValueError("completed stage result integrity mismatch")
+            else:
+                raise ValueError(f"unknown stage state: {state}")
+
+        except PersistentReplayReadinessError:
+            raise
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PersistentReplayReadinessError(
+                "replay stage execution failed application integrity verification"
+            ) from exc
+
+        count += 1
+
+    return count
+
 def check_database(
     database_path: str | os.PathLike[str],
     *,
@@ -492,6 +698,7 @@ def check_database(
 
                 now = time.time()
                 replay_claim_count = 0
+                replay_stage_execution_count = 0
                 expired_claim_count = 0
                 pending_evidence_reconciliation_count = 0
                 pending_evidence_reconciliations: list[PendingEvidenceReconciliation] = []
@@ -548,6 +755,29 @@ def check_database(
                             pending_evidence_reconciliation_count += 1
                     replay_claim_count += 1
 
+                if _STAGE_TABLE in tables:
+                    _require_columns(
+                        connection,
+                        _STAGE_TABLE,
+                        _STAGE_COLUMNS,
+                        primary_key="idempotency_key",
+                        not_null={
+                            "idempotency_key",
+                            "cycle_id",
+                            "cycle_fingerprint",
+                            "stage_name",
+                            "input_fingerprint",
+                            "state",
+                            "generation",
+                            "attempts",
+                            "updated_at",
+                        },
+                    )
+                    _require_replay_stage_state_schema(connection)
+                    _require_replay_stage_parent_foreign_key(connection)
+                    replay_stage_execution_count = _validate_replay_stage_rows(
+                        connection
+                    )
                 journal_row = connection.execute("PRAGMA journal_mode").fetchone()
                 journal_mode = str(journal_row[0]).lower() if journal_row else "unknown"
             finally:
@@ -569,6 +799,7 @@ def check_database(
         expired_claim_count=expired_claim_count,
         pending_evidence_reconciliation_count=pending_evidence_reconciliation_count,
         pending_evidence_reconciliations=tuple(pending_evidence_reconciliations),
+        replay_stage_execution_count=replay_stage_execution_count,
     )
 
 

@@ -21,6 +21,7 @@ from infrastructure.security import EvidenceStore
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
+    SQLiteReplayStageStore,
 )
 from runtime.context_manager import ContextManager
 from runtime.core import RuntimeCore
@@ -52,6 +53,7 @@ class SH3Kernel:
         "policy",
         "recovery_execution_boundary",
         "recovery_strategy_boundary",
+        "replay_stage_store",
         "runtime",
         "system_optimizer",
     )
@@ -62,6 +64,7 @@ class SH3Kernel:
         event_publisher: EventPublisher | None = None,
         evidence_store: EvidenceStore | None = None,
         replay_claim_store: SQLiteReplayClaimStore | None = None,
+        replay_stage_store: SQLiteReplayStageStore | None = None,
     ) -> None:
         if evidence_store is not None and not isinstance(evidence_store, EvidenceStore):
             raise TypeError("evidence_store must be EvidenceStore or None")
@@ -69,6 +72,19 @@ class SH3Kernel:
             replay_claim_store, SQLiteReplayClaimStore
         ):
             raise TypeError("replay_claim_store must be SQLiteReplayClaimStore or None")
+        if replay_stage_store is not None and not isinstance(
+            replay_stage_store, SQLiteReplayStageStore
+        ):
+            raise TypeError("replay_stage_store must be SQLiteReplayStageStore or None")
+        if replay_stage_store is not None:
+            if replay_claim_store is None:
+                raise ValueError(
+                    "replay_stage_store requires replay_claim_store"
+                )
+            if replay_stage_store.database_path != replay_claim_store.database_path:
+                raise ValueError(
+                    "replay claim and stage stores must share one SQLite database"
+                )
         if replay_claim_store is not None:
             if not isinstance(evidence_store, SQLiteEvidenceStore):
                 raise ValueError("replay_claim_store requires SQLiteEvidenceStore")
@@ -77,6 +93,7 @@ class SH3Kernel:
         self._event_publisher = event_publisher
         self._last_event_id: str | None = None
         self._propagation_context: EventPropagationContext | None = None
+        self.replay_stage_store = replay_stage_store
 
         self.runtime = RuntimeCore(event_publisher=event_publisher)
         self.context_manager = ContextManager()
@@ -128,6 +145,7 @@ class SH3Kernel:
         self.cognitive_learning_boundary = CognitiveLearningBoundary(
             self.learning_loop,
             event_publisher=event_publisher,
+            replay_stage_store=replay_stage_store,
         )
         self.feedback_boundary = CognitiveFeedbackBoundary(
             self.cognition,
@@ -150,6 +168,7 @@ class SH3Kernel:
             self.system_optimizer,
             event_publisher=event_publisher,
             update_boundary=self.optimizer_update_boundary,
+            replay_stage_store=replay_stage_store,
         )
         self.recovery_strategy_boundary = RecoveryStrategyBoundary(
             self.meta_controller.healer,

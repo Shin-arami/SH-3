@@ -53,7 +53,7 @@ def test_evidence_registration_times_out_without_partial_row_and_retries(
     evidence = _evidence()
     writer = _hold_writer_lock(database)
     try:
-        with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+        with pytest.raises(sqlite3.OperationalError, match=r"locked|busy"):
             store.register(evidence)
     finally:
         _release_writer_lock(writer)
@@ -76,7 +76,7 @@ def test_claim_creation_times_out_without_increment_and_retries_as_generation_on
     fingerprint = "sha256:claim-timeout"
     writer = _hold_writer_lock(database)
     try:
-        with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+        with pytest.raises(sqlite3.OperationalError, match=r"locked|busy"):
             store.claim(cycle_id, fingerprint, lease_seconds=60.0)
     finally:
         _release_writer_lock(writer)
@@ -104,7 +104,7 @@ def test_claim_completion_timeout_preserves_owner_and_retries_same_generation(
 
     writer = _hold_writer_lock(database)
     try:
-        with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+        with pytest.raises(sqlite3.OperationalError, match=r"locked|busy"):
             store.complete(
                 cycle_id,
                 fingerprint,

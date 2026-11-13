@@ -183,6 +183,14 @@ class _ReplayClaimLeaseHeartbeat:
     def generation(self) -> int:
         return self._generation
 
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    @property
+    def owner_token(self) -> str:
+        return self._owner_token
+
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("replay claim heartbeat has already been started")
@@ -446,6 +454,20 @@ class LearningClosedLoopCoordinator:
         with self._lock:
             guard = self._claim_lease_guards.get(cycle_id)
         return None if guard is None else guard.generation
+
+    def _claim_metadata_for_cycle(
+        self,
+        cycle_id: str,
+    ) -> tuple[str, str, int] | None:
+        with self._lock:
+            guard = self._claim_lease_guards.get(cycle_id)
+        if guard is None:
+            return None
+        return (
+            guard.fingerprint,
+            guard.owner_token,
+            guard.generation,
+        )
 
     def run(
         self,
@@ -878,10 +900,37 @@ class LearningClosedLoopCoordinator:
                     propagation
             )
             self._ensure_claim_ownership(cycle_id)
+            stage_enabled = (
+                self._learning_boundary.replay_stage_store is not None
+            )
+            claim_metadata = (
+                self._claim_metadata_for_cycle(cycle_id)
+                if stage_enabled
+                else None
+            )
+            if stage_enabled and claim_metadata is None:
+                raise ReplayClaimOwnershipError(
+                    f"persistent Learning has no active claim guard: {cycle_id}"
+                )
+
+            replay_claim_fingerprint = None
+            replay_claim_owner_token = None
+            replay_claim_generation = None
+            if claim_metadata is not None:
+                (
+                    replay_claim_fingerprint,
+                    replay_claim_owner_token,
+                    replay_claim_generation,
+                ) = claim_metadata
+
             learning_value = self._learning_boundary.record(
                 result,
                 context=propagation,
-                created_at=now
+                created_at=now,
+                replay_cycle_id=cycle_id if stage_enabled else None,
+                replay_cycle_fingerprint=replay_claim_fingerprint,
+                replay_claim_owner_token=replay_claim_owner_token,
+                replay_claim_generation=replay_claim_generation,
             )
             self._ensure_claim_ownership(cycle_id)
             propagation = learning_value.propagation_context
@@ -915,7 +964,15 @@ class LearningClosedLoopCoordinator:
                     propagation
                 )
                 self._ensure_claim_ownership(cycle_id)
-                optimization = self._optimizer_boundary.request(learning_result, context=propagation, created_at=now)
+                optimization = self._optimizer_boundary.request(
+                    learning_result,
+                    context=propagation,
+                    created_at=now,
+                    replay_cycle_id=cycle_id if stage_enabled else None,
+                    replay_cycle_fingerprint=replay_claim_fingerprint,
+                    replay_claim_owner_token=replay_claim_owner_token,
+                    replay_claim_generation=replay_claim_generation,
+                )
                 self._ensure_claim_ownership(cycle_id)
                 propagation = optimization.propagation_context
                 optimization_result = _json_compatible(optimization.optimization)
