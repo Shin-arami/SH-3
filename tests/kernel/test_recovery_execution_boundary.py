@@ -202,3 +202,221 @@ def test_request_requires_strategy_result_type() -> None:
     boundary = RecoveryExecutionBoundary(SelfHealingCore())
     with pytest.raises(TypeError, match="RecoveryStrategyResult"):
         boundary.request(cast(RecoveryStrategyResult, object()), _snapshot(), context=_context(), created_at=NOW)
+
+
+# P2-2 persistent recovery execution regression coverage.
+def _p2_2_fake_replay_stage_store():
+    from types import SimpleNamespace
+
+    from infrastructure.security.persistent_store import SQLiteReplayStageStore
+
+    class FakeReplayStageStore(SQLiteReplayStageStore):
+        def __init__(self):
+            self.completed = {}
+            self.begin_calls = []
+            self.complete_calls = []
+
+        def begin(self, key, owner_token, generation, *, now=None):
+            self.begin_calls.append((key.idempotency_key, owner_token, generation))
+            persisted = self.completed.get(key.idempotency_key)
+            if persisted is not None:
+                return SimpleNamespace(status="completed", result=dict(persisted))
+            return SimpleNamespace(status="claimed", result=None)
+
+        def complete(self, key, owner_token, generation, result, *, now=None):
+            self.complete_calls.append((key.idempotency_key, owner_token, generation))
+            self.completed[key.idempotency_key] = dict(result)
+            return SimpleNamespace(status="completed", result=dict(result))
+
+    return FakeReplayStageStore()
+
+
+class _PersistentReplayCountingHealer(SelfHealingCore):
+    def __init__(self, *, fail=False):
+        super().__init__()
+        self.execution_calls = 0
+        self.fail = fail
+
+    def recover_with_strategy(self, snapshot, strategy):
+        self.execution_calls += 1
+        if self.fail:
+            raise RuntimeError("persistent recovery failure")
+        return {
+            "status": "recovered",
+            "strategy": strategy,
+            "trace_id": snapshot.trace_id,
+        }
+
+
+def _p2_2_replay_arguments(*, generation, owner="execution-owner", result_id="result-1", error_message="boom"):
+    return {
+        "replay_cycle_id": "execution-cycle",
+        "replay_cycle_fingerprint": "execution-cycle-fingerprint",
+        "replay_claim_owner_token": owner,
+        "replay_claim_generation": generation,
+        "replay_stage_input": {
+            "source": "learning_feedback_loop",
+            "result_id": result_id,
+            "error_type": "ValueError",
+            "error_message": error_message,
+        },
+    }
+
+
+def test_persistent_recovery_execution_replays_after_restart_without_backend_call():
+    store = _p2_2_fake_replay_stage_store()
+    first_healer = _PersistentReplayCountingHealer()
+    _, _, first_strategy, first_snapshot = _strategy_result(first_healer)
+    first_boundary = RecoveryExecutionBoundary(
+        first_healer,
+        replay_stage_store=store,
+    )
+    first = first_boundary.request(
+        first_strategy,
+        first_snapshot,
+        context=_context(),
+        created_at=NOW,
+        **_p2_2_replay_arguments(generation=1, owner="owner-1"),
+    )
+
+    second_healer = _PersistentReplayCountingHealer()
+    _, _, second_strategy, second_snapshot = _strategy_result(second_healer)
+    second_boundary = RecoveryExecutionBoundary(
+        second_healer,
+        replay_stage_store=store,
+    )
+    second = second_boundary.request(
+        second_strategy,
+        second_snapshot,
+        context=_context(),
+        created_at=NOW,
+        **_p2_2_replay_arguments(generation=2, owner="owner-2"),
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert first_healer.execution_calls == 1
+    assert second_healer.execution_calls == 0
+    assert second.result == first.result
+    assert len(store.complete_calls) == 1
+    assert store.begin_calls[0][1:] == ("owner-1", 1)
+    assert store.begin_calls[1][1:] == ("owner-2", 2)
+
+
+def test_persistent_recovery_execution_caches_failure_result_across_restart():
+    store = _p2_2_fake_replay_stage_store()
+    first_healer = _PersistentReplayCountingHealer(fail=True)
+    _, _, first_strategy, first_snapshot = _strategy_result(first_healer)
+    first = RecoveryExecutionBoundary(
+        first_healer,
+        replay_stage_store=store,
+    ).request(
+        first_strategy,
+        first_snapshot,
+        context=_context(),
+        created_at=NOW,
+        **_p2_2_replay_arguments(generation=1),
+    )
+
+    second_healer = _PersistentReplayCountingHealer(fail=True)
+    _, _, second_strategy, second_snapshot = _strategy_result(second_healer)
+    second = RecoveryExecutionBoundary(
+        second_healer,
+        replay_stage_store=store,
+    ).request(
+        second_strategy,
+        second_snapshot,
+        context=_context(),
+        created_at=NOW,
+        **_p2_2_replay_arguments(generation=2, owner="owner-2"),
+    )
+
+    assert first.success is False
+    assert second.success is False
+    assert first.error == "persistent recovery failure"
+    assert second.error == first.error
+    assert first_healer.execution_calls == 1
+    assert second_healer.execution_calls == 0
+
+
+def test_persistent_recovery_execution_uses_a_new_stage_for_different_input():
+    store = _p2_2_fake_replay_stage_store()
+    healer = _PersistentReplayCountingHealer()
+    boundary = RecoveryExecutionBoundary(healer, replay_stage_store=store)
+
+    _, _, first_strategy, first_snapshot = _strategy_result(healer)
+    first = boundary.request(
+        first_strategy,
+        first_snapshot,
+        context=_context(),
+        created_at=NOW,
+        **_p2_2_replay_arguments(generation=1, result_id="result-1"),
+    )
+
+    second_context = EventPropagationContext.create(
+        correlation_id="execution-correlation-2",
+        trace_id="execution-trace-2",
+        tenant_id="execution-tenant",
+    )
+    second_snapshot = _snapshot("different recovery input")
+    second_strategy_boundary = RecoveryStrategyBoundary(healer)
+    second_strategy = second_strategy_boundary.request(
+        second_snapshot,
+        context=second_context,
+        created_at=NOW,
+    )
+    second = boundary.request(
+        second_strategy,
+        second_snapshot,
+        context=second_context,
+        created_at=NOW,
+        **_p2_2_replay_arguments(generation=1, result_id="result-2"),
+    )
+
+    assert first.success is True
+    assert second.success is True
+    assert healer.execution_calls == 2
+    assert len(store.complete_calls) == 2
+
+
+def test_persistent_recovery_execution_rejects_partial_replay_metadata():
+    store = _p2_2_fake_replay_stage_store()
+    healer = _PersistentReplayCountingHealer()
+    _, _, strategy, snapshot = _strategy_result(healer)
+    boundary = RecoveryExecutionBoundary(healer, replay_stage_store=store)
+
+    try:
+        boundary.request(
+            strategy,
+            snapshot,
+            context=_context(),
+            created_at=NOW,
+            replay_cycle_id="cycle-only",
+        )
+    except ValueError as exc:
+        assert "completely" in str(exc)
+    else:
+        raise AssertionError("partial replay metadata must be rejected")
+
+    assert healer.execution_calls == 0
+    assert store.begin_calls == []
+
+
+def test_recovery_execution_without_replay_metadata_keeps_legacy_behavior():
+    store = _p2_2_fake_replay_stage_store()
+    healer = _PersistentReplayCountingHealer()
+    _, _, strategy, snapshot = _strategy_result(healer)
+    result = RecoveryExecutionBoundary(
+        healer,
+        replay_stage_store=store,
+    ).request(
+        strategy,
+        snapshot,
+        context=_context(),
+        created_at=NOW,
+    )
+
+    assert result.success is True
+    assert healer.execution_calls == 1
+    assert store.begin_calls == []
+    assert store.complete_calls == []

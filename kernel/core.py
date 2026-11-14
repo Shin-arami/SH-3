@@ -173,10 +173,12 @@ class SH3Kernel:
         self.recovery_strategy_boundary = RecoveryStrategyBoundary(
             self.meta_controller.healer,
             event_publisher=event_publisher,
+            replay_stage_store=replay_stage_store,
         )
         self.recovery_execution_boundary = RecoveryExecutionBoundary(
             self.meta_controller.healer,
             event_publisher=event_publisher,
+            replay_stage_store=replay_stage_store,
         )
         self.optimizer_healing_boundary = OptimizerHealingBoundary(
             self.meta_controller.healer,

@@ -80,6 +80,12 @@ class OptimizerHealingRequest:
     trace_id: str | None = None
     tenant_id: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # P2-3: optimizer-healing replay metadata survives event serialization.
+    replay_cycle_id: str | None = None
+    replay_cycle_fingerprint: str | None = None
+    replay_claim_owner_token: str | None = None
+    replay_claim_generation: int | None = None
+    replay_stage_input: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -101,6 +107,37 @@ class OptimizerHealingRequest:
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
         object.__setattr__(self, "optimization", _mapping(self.optimization))
         object.__setattr__(self, "metadata", _mapping(self.metadata))
+        replay_values = (
+            self.replay_cycle_id,
+            self.replay_cycle_fingerprint,
+            self.replay_claim_owner_token,
+        )
+        if self.replay_stage_input is not None and not isinstance(
+            self.replay_stage_input, Mapping
+        ):
+            raise TypeError("replay_stage_input must be a mapping or None")
+        replay_enabled = any(value is not None for value in replay_values) or (
+            self.replay_claim_generation is not None
+        ) or self.replay_stage_input is not None
+        if replay_enabled:
+            if any(value is None for value in replay_values) or (
+                self.replay_claim_generation is None
+            ) or self.replay_stage_input is None:
+                raise ValueError(
+                    "persistent optimizer healing requires complete replay metadata"
+                )
+            _text("replay_cycle_id", self.replay_cycle_id)
+            _text("replay_cycle_fingerprint", self.replay_cycle_fingerprint)
+            _text("replay_claim_owner_token", self.replay_claim_owner_token)
+            if (
+                isinstance(self.replay_claim_generation, bool)
+                or not isinstance(self.replay_claim_generation, int)
+                or self.replay_claim_generation < 1
+            ):
+                raise ValueError("replay_claim_generation must be a positive integer")
+            object.__setattr__(
+                self, "replay_stage_input", _mapping(self.replay_stage_input)
+            )
 
     @classmethod
     def from_result(
@@ -109,6 +146,11 @@ class OptimizerHealingRequest:
         *,
         context: EventPropagationContext,
         created_at: datetime | None = None,
+        replay_cycle_id: str | None = None,
+        replay_cycle_fingerprint: str | None = None,
+        replay_claim_owner_token: str | None = None,
+        replay_claim_generation: int | None = None,
+        replay_stage_input: Mapping[str, Any] | None = None,
     ) -> OptimizerHealingRequest:
         if not isinstance(result, LearningOptimizationResult):
             raise TypeError("result must be LearningOptimizationResult")
@@ -139,6 +181,11 @@ class OptimizerHealingRequest:
             trace_id=context.trace_id,
             tenant_id=context.tenant_id,
             metadata={"optimization_request_id": result.request_id},
+            replay_cycle_id=replay_cycle_id,
+            replay_cycle_fingerprint=replay_cycle_fingerprint,
+            replay_claim_owner_token=replay_claim_owner_token,
+            replay_claim_generation=replay_claim_generation,
+            replay_stage_input=replay_stage_input,
         )
 
     @classmethod
@@ -153,6 +200,7 @@ class OptimizerHealingRequest:
         )
         optimization = data.get("optimization")
         metadata = data.get("metadata")
+        replay_stage_input = data.get("replay_stage_input")
         return cls(
             request_id=_text("request_id", data.get("request_id")),
             optimizer_id=_text("optimizer_id", data.get("optimizer_id")),
@@ -167,6 +215,13 @@ class OptimizerHealingRequest:
             trace_id=data.get("trace_id"),
             tenant_id=data.get("tenant_id"),
             metadata=metadata if isinstance(metadata, Mapping) else {},
+            replay_cycle_id=data.get("replay_cycle_id"),
+            replay_cycle_fingerprint=data.get("replay_cycle_fingerprint"),
+            replay_claim_owner_token=data.get("replay_claim_owner_token"),
+            replay_claim_generation=data.get("replay_claim_generation"),
+            replay_stage_input=(
+                replay_stage_input if isinstance(replay_stage_input, Mapping) else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -182,6 +237,15 @@ class OptimizerHealingRequest:
             "trace_id": self.trace_id,
             "tenant_id": self.tenant_id,
             "metadata": dict(self.metadata),
+            "replay_cycle_id": self.replay_cycle_id,
+            "replay_cycle_fingerprint": self.replay_cycle_fingerprint,
+            "replay_claim_owner_token": self.replay_claim_owner_token,
+            "replay_claim_generation": self.replay_claim_generation,
+            "replay_stage_input": (
+                dict(self.replay_stage_input)
+                if self.replay_stage_input is not None
+                else None
+            ),
         }
 
 
@@ -379,11 +443,21 @@ class OptimizerHealingBoundary:
         *,
         context: EventPropagationContext,
         created_at: datetime | None = None,
+        replay_cycle_id: str | None = None,
+        replay_cycle_fingerprint: str | None = None,
+        replay_claim_owner_token: str | None = None,
+        replay_claim_generation: int | None = None,
+        replay_stage_input: Mapping[str, Any] | None = None,
     ) -> OptimizerHealingResult:
         request = OptimizerHealingRequest.from_result(
             optimization_result,
             context=context,
             created_at=created_at,
+            replay_cycle_id=replay_cycle_id,
+            replay_cycle_fingerprint=replay_cycle_fingerprint,
+            replay_claim_owner_token=replay_claim_owner_token,
+            replay_claim_generation=replay_claim_generation,
+            replay_stage_input=replay_stage_input,
         )
         return self._start(request, context)
 
@@ -479,6 +553,19 @@ class OptimizerHealingBoundary:
                     },
                 )
                 failure_id = getattr(snapshot, "trace_id", None)
+                replay_arguments: dict[str, Any] = {}
+                if request.replay_cycle_id is not None:
+                    replay_arguments = {
+                        "replay_cycle_id": request.replay_cycle_id,
+                        "replay_cycle_fingerprint": request.replay_cycle_fingerprint,
+                        "replay_claim_owner_token": request.replay_claim_owner_token,
+                        "replay_claim_generation": request.replay_claim_generation,
+                        "replay_stage_input": request.replay_stage_input,
+                    }
+                    if self._strategy_boundary is None or self._execution_boundary is None:
+                        raise RuntimeError(
+                            "persistent optimizer healing requires recovery strategy and execution boundaries"
+                        )
                 if self._strategy_boundary is None:
                     value = self.healer.recover_with_learning(snapshot, max_attempts=1)
                 else:
@@ -486,6 +573,7 @@ class OptimizerHealingBoundary:
                         snapshot,
                         context=self.healer.propagation_context or context,
                         created_at=request.created_at,
+                        **replay_arguments,
                     )
                     self.healer.set_propagation_context(strategy.propagation_context)
                     if self._execution_boundary is None:
@@ -497,6 +585,7 @@ class OptimizerHealingBoundary:
                             snapshot,
                             context=strategy.propagation_context,
                             created_at=request.created_at,
+                            **replay_arguments,
                         )
                         if not execution.success:
                             raise RuntimeError(execution.error or "recovery execution failed")

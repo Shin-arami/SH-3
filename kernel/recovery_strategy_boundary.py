@@ -15,6 +15,11 @@ from foundation.utils.hash import short_id
 from foundation.utils.logging import error
 from infrastructure.event_bus import EventBus, EventPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security.persistent_store import (
+    ReplayStageKey,
+    ReplayStageStatus,
+    SQLiteReplayStageStore,
+)
 from self_healing.core import FailureSnapshot
 
 __all__ = [
@@ -161,6 +166,7 @@ class RecoveryStrategyBoundary:
         "_last_context",
         "_lock",
         "_pending",
+        "_replay_stage_store",
         "_results",
         "_subscriber_id",
         "backend",
@@ -172,6 +178,7 @@ class RecoveryStrategyBoundary:
         event_publisher: EventPublisher | None = None,
         *,
         subscriber_id: str = "recovery.strategy-boundary",
+        replay_stage_store: SQLiteReplayStageStore | None = None,
     ) -> None:
         if backend is None:
             raise TypeError("backend must not be None")
@@ -180,12 +187,29 @@ class RecoveryStrategyBoundary:
             raise TypeError("backend must provide strategy evaluation and selection APIs")
         if event_publisher is not None and not isinstance(event_publisher, EventPublisher):
             raise TypeError("event_publisher must be EventPublisher or None")
+        if replay_stage_store is not None and not isinstance(
+            replay_stage_store, SQLiteReplayStageStore
+        ):
+            raise TypeError(
+                "replay_stage_store must be SQLiteReplayStageStore or None"
+            )
         self.backend = backend
+        self._replay_stage_store = replay_stage_store
         self._event_publisher = event_publisher
         self._event_bus: EventBus | None = None
         self._lock = RLock()
         self._results: dict[str, RecoveryStrategyResult] = {}
-        self._pending: dict[str, tuple[FailureSnapshot, EventPropagationContext, datetime]] = {}
+        self._pending: dict[
+            str,
+            tuple[
+                FailureSnapshot,
+                EventPropagationContext,
+                datetime,
+                ReplayStageKey | None,
+                str | None,
+                int | None,
+            ],
+        ] = {}
         self._inflight: dict[str, ThreadEvent] = {}
         self._last_context: EventPropagationContext | None = None
         self._subscriber_id = _text("subscriber_id", subscriber_id)
@@ -223,11 +247,55 @@ class RecoveryStrategyBoundary:
         *,
         context: EventPropagationContext,
         created_at: datetime | None = None,
+        replay_cycle_id: str | None = None,
+        replay_cycle_fingerprint: str | None = None,
+        replay_claim_owner_token: str | None = None,
+        replay_claim_generation: int | None = None,
+        replay_stage_input: Mapping[str, Any] | None = None,
     ) -> RecoveryStrategyResult:
         if not isinstance(snapshot, FailureSnapshot):
             raise TypeError("snapshot must be FailureSnapshot")
         if not isinstance(context, EventPropagationContext):
             raise TypeError("context must be EventPropagationContext")
+
+        claim_values = (
+            replay_cycle_id,
+            replay_cycle_fingerprint,
+            replay_claim_owner_token,
+            replay_claim_generation,
+        )
+        replay_enabled = any(value is not None for value in claim_values)
+        if replay_enabled:
+            if any(value is None for value in claim_values):
+                raise ValueError("persistent recovery requires complete replay claim metadata")
+            if self._replay_stage_store is None:
+                raise ValueError(
+                    "replay claim metadata requires a configured replay stage store"
+                )
+            if not isinstance(replay_stage_input, Mapping):
+                raise TypeError("replay_stage_input must be a mapping for persistent recovery")
+            assert replay_cycle_id is not None
+            assert replay_cycle_fingerprint is not None
+            assert replay_claim_owner_token is not None
+            assert replay_claim_generation is not None
+            stage_key = ReplayStageKey.create(
+                replay_cycle_id,
+                replay_cycle_fingerprint,
+                "recovery_strategy.select.v1",
+                {
+                    "contract": "recovery-strategy-v1",
+                    "recovery_input": dict(replay_stage_input),
+                },
+            )
+            stage_owner_token: str | None = replay_claim_owner_token
+            stage_generation: int | None = replay_claim_generation
+        else:
+            if replay_stage_input is not None:
+                raise ValueError("replay_stage_input requires complete replay claim metadata")
+            stage_key = None
+            stage_owner_token = None
+            stage_generation = None
+
         candidates = tuple(self.backend.strategy_candidates(snapshot))
         if not candidates:
             raise ValueError("strategy candidates must not be empty")
@@ -242,6 +310,7 @@ class RecoveryStrategyBoundary:
             },
             prefix="recovery-strategy:",
         )
+        request_created_at = created_at or datetime.now(UTC)
         with self._lock:
             existing = self._results.get(request_id)
             if existing is not None:
@@ -250,7 +319,14 @@ class RecoveryStrategyBoundary:
             if waiter is None:
                 waiter = ThreadEvent()
                 self._inflight[request_id] = waiter
-                self._pending[request_id] = (snapshot, context, created_at or datetime.now(UTC))
+                self._pending[request_id] = (
+                    snapshot,
+                    context,
+                    request_created_at,
+                    stage_key,
+                    stage_owner_token,
+                    stage_generation,
+                )
                 leader = True
             else:
                 leader = False
@@ -260,21 +336,87 @@ class RecoveryStrategyBoundary:
             if result is None:
                 raise RuntimeError(f"recovery strategy result not produced: {request_id}")
             return result
+
         try:
-            payload = {
+            stage_execution = None
+            if stage_key is not None:
+                assert self._replay_stage_store is not None
+                assert stage_owner_token is not None
+                assert stage_generation is not None
+                stage_execution = self._replay_stage_store.begin(
+                    stage_key,
+                    stage_owner_token,
+                    stage_generation,
+                )
+
+            replayed = (
+                stage_execution is not None
+                and stage_execution.status is ReplayStageStatus.COMPLETED
+            )
+            payload: dict[str, Any] = {
                 "request_id": request_id,
                 "failure_id": snapshot.trace_id,
                 "candidates": candidates,
             }
+            if stage_key is not None:
+                payload["idempotency_key"] = stage_key.idempotency_key
+                payload["replayed"] = replayed
+
             publisher = self.event_publisher
             event_bus = self._event_bus
-            if publisher is None or event_bus is None:
-                return self._execute(request_id, snapshot, context=context, created_at=created_at or datetime.now(UTC))
-            self._publish("RecoveryStrategyRequested", EventType.START, payload, context)
-            result = self.get(request_id)
-            if result is None:
-                raise RuntimeError(f"recovery strategy result not produced: {request_id}")
-            return result
+            request_context = context
+            if publisher is not None and event_bus is not None:
+                request_context = self._publish(
+                    "RecoveryStrategyRequested",
+                    EventType.START,
+                    payload,
+                    context,
+                )
+                if replayed:
+                    assert stage_execution is not None
+                    if stage_execution.result is None:
+                        raise RuntimeError(
+                            "completed recovery strategy stage has no persisted result"
+                        )
+                    assert stage_key is not None
+                    return self._restore_completed_stage(
+                        request_id,
+                        snapshot,
+                        stage_execution.result,
+                        context=request_context,
+                        created_at=request_created_at,
+                        idempotency_key=stage_key.idempotency_key,
+                    )
+                result = self.get(request_id)
+                if result is None:
+                    raise RuntimeError(f"recovery strategy result not produced: {request_id}")
+                return result
+
+            if replayed:
+                assert stage_execution is not None
+                if stage_execution.result is None:
+                    raise RuntimeError(
+                        "completed recovery strategy stage has no persisted result"
+                    )
+                assert stage_key is not None
+                return self._restore_completed_stage(
+                    request_id,
+                    snapshot,
+                    stage_execution.result,
+                    context=request_context,
+                    created_at=request_created_at,
+                    idempotency_key=stage_key.idempotency_key,
+                )
+
+            return self._execute(
+                request_id,
+                snapshot,
+                context=request_context,
+                created_at=request_created_at,
+                replay_stage_key=stage_key,
+                replay_stage_owner_token=stage_owner_token,
+                replay_stage_generation=stage_generation,
+            )
         finally:
             with self._lock:
                 waiter = self._inflight.pop(request_id, None)
@@ -309,19 +451,43 @@ class RecoveryStrategyBoundary:
         request_id = event.payload.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             return
+        if event.payload.get("replayed") is True:
+            return
         with self._lock:
             pending = self._pending.get(request_id)
         if pending is None:
             return
-        snapshot, context, created_at = pending
+        (
+            snapshot,
+            context,
+            created_at,
+            stage_key,
+            stage_owner_token,
+            stage_generation,
+        ) = pending
         try:
-            self._execute(request_id, snapshot, context=EventPropagationContext.from_event(event), created_at=created_at)
+            self._execute(
+                request_id,
+                snapshot,
+                context=EventPropagationContext.from_event(event),
+                created_at=created_at,
+                replay_stage_key=stage_key,
+                replay_stage_owner_token=stage_owner_token,
+                replay_stage_generation=stage_generation,
+            )
         except Exception as exc:
             context = EventPropagationContext.from_event(event)
+            failure_payload: dict[str, Any] = {
+                "request_id": request_id,
+                "failure_id": snapshot.trace_id,
+                "error": str(exc),
+            }
+            if stage_key is not None:
+                failure_payload["idempotency_key"] = stage_key.idempotency_key
             self._publish(
                 "RecoveryStrategySelectionFailed",
                 EventType.FAILURE,
-                {"request_id": request_id, "failure_id": snapshot.trace_id, "error": str(exc)},
+                failure_payload,
                 context,
             )
             error("Recovery strategy boundary event handling failed", {"error": str(exc), "request_id": request_id})
@@ -333,6 +499,9 @@ class RecoveryStrategyBoundary:
         *,
         context: EventPropagationContext,
         created_at: datetime,
+        replay_stage_key: ReplayStageKey | None = None,
+        replay_stage_owner_token: str | None = None,
+        replay_stage_generation: int | None = None,
     ) -> RecoveryStrategyResult:
         with self._lock:
             existing = self._results.get(request_id)
@@ -357,16 +526,23 @@ class RecoveryStrategyBoundary:
                 )
             )
         evaluations = tuple(evaluations_list)
+        event_details: dict[str, Any] = {
+            "request_id": request_id,
+            "failure_id": snapshot.trace_id,
+            "evaluations": [item.to_dict() for item in evaluations],
+        }
+        if replay_stage_key is not None:
+            event_details["idempotency_key"] = replay_stage_key.idempotency_key
+            event_details["replayed"] = False
         result_context = self._publish(
             "RecoveryStrategyEvaluated",
             EventType.UPDATED,
-            {
-                "request_id": request_id,
-                "failure_id": snapshot.trace_id,
-                "evaluations": [item.to_dict() for item in evaluations],
-            },
+            event_details,
             context,
         )
+        metadata: dict[str, Any] = {}
+        if replay_stage_key is not None:
+            metadata["idempotency_key"] = replay_stage_key.idempotency_key
         result = RecoveryStrategyResult(
             request_id=request_id,
             failure_id=snapshot.trace_id,
@@ -378,20 +554,177 @@ class RecoveryStrategyBoundary:
             causation_id=result_context.causation_id,
             trace_id=result_context.trace_id,
             tenant_id=result_context.tenant_id,
+            metadata=metadata,
+        )
+
+        if replay_stage_key is not None:
+            if self._replay_stage_store is None:
+                raise RuntimeError("persistent recovery stage store is unavailable")
+            if replay_stage_owner_token is None or replay_stage_generation is None:
+                raise RuntimeError("persistent recovery stage has incomplete ownership metadata")
+            self._replay_stage_store.complete(
+                replay_stage_key,
+                replay_stage_owner_token,
+                replay_stage_generation,
+                {
+                    "contract": "recovery-strategy-v1",
+                    "selected_strategy": selected_strategy,
+                    "evaluations": [item.to_dict() for item in evaluations],
+                    "learned": result.learned,
+                },
+            )
+
+        with self._lock:
+            self._results[request_id] = result
+            self._last_context = result_context
+        selected_payload: dict[str, Any] = {
+            "request_id": request_id,
+            "failure_id": snapshot.trace_id,
+            "strategy": selected_strategy,
+            "confidence": result.confidence,
+            "evaluations": [item.to_dict() for item in evaluations],
+        }
+        if replay_stage_key is not None:
+            selected_payload["idempotency_key"] = replay_stage_key.idempotency_key
+            selected_payload["replayed"] = False
+        final_context = self._publish(
+            "RecoveryStrategySelected",
+            EventType.COMPLETE,
+            selected_payload,
+            result_context,
+        )
+        with self._lock:
+            self._last_context = final_context
+            self._results[request_id] = RecoveryStrategyResult(
+                request_id=result.request_id,
+                failure_id=result.failure_id,
+                selected_strategy=result.selected_strategy,
+                evaluations=result.evaluations,
+                learned=result.learned,
+                created_at=result.created_at,
+                correlation_id=result_context.correlation_id,
+                causation_id=final_context.causation_id,
+                trace_id=final_context.trace_id,
+                tenant_id=final_context.tenant_id,
+                metadata=result.metadata,
+            )
+            return self._results[request_id]
+
+    def _restore_completed_stage(
+        self,
+        request_id: str,
+        snapshot: FailureSnapshot,
+        stored_result: Mapping[str, Any],
+        *,
+        context: EventPropagationContext,
+        created_at: datetime,
+        idempotency_key: str,
+    ) -> RecoveryStrategyResult:
+        if stored_result.get("contract") != "recovery-strategy-v1":
+            raise ValueError("persisted recovery strategy stage contract is invalid")
+        selected_strategy = stored_result.get("selected_strategy")
+        if not isinstance(selected_strategy, str) or not selected_strategy.strip():
+            raise ValueError("persisted recovery strategy selection is invalid")
+        learned = stored_result.get("learned")
+        if not isinstance(learned, bool):
+            raise ValueError("persisted recovery strategy learned flag is invalid")
+        raw_evaluations = stored_result.get("evaluations")
+        if not isinstance(raw_evaluations, (list, tuple)) or not raw_evaluations:
+            raise ValueError("persisted recovery strategy evaluations are invalid")
+
+        evaluations: list[RecoveryStrategyEvaluation] = []
+        for item in raw_evaluations:
+            if not isinstance(item, Mapping):
+                raise ValueError("persisted recovery strategy evaluation is invalid")
+
+            strategy = item.get("strategy")
+            samples = item.get("samples")
+            successes = item.get("successes")
+            success_rate = item.get("success_rate")
+            rank = item.get("rank")
+            selected = item.get("selected", False)
+
+            if not isinstance(strategy, str) or not strategy.strip():
+                raise ValueError("persisted recovery strategy name is invalid")
+            if (
+                not isinstance(samples, int)
+                or isinstance(samples, bool)
+                or samples < 0
+            ):
+                raise ValueError("persisted recovery strategy samples are invalid")
+            if (
+                not isinstance(successes, int)
+                or isinstance(successes, bool)
+                or successes < 0
+            ):
+                raise ValueError("persisted recovery strategy successes are invalid")
+            if (
+                not isinstance(success_rate, (int, float))
+                or isinstance(success_rate, bool)
+            ):
+                raise ValueError("persisted recovery strategy success rate is invalid")
+            if (
+                not isinstance(rank, int)
+                or isinstance(rank, bool)
+                or rank < 0
+            ):
+                raise ValueError("persisted recovery strategy rank is invalid")
+            if not isinstance(selected, bool):
+                raise ValueError("persisted recovery strategy selected flag is invalid")
+
+            evaluations.append(
+                RecoveryStrategyEvaluation(
+                    strategy=strategy,
+                    samples=samples,
+                    successes=successes,
+                    success_rate=float(success_rate),
+                    rank=rank,
+                    selected=selected,
+                )
+            )
+        evaluation_values = tuple(evaluations)
+        event_details: dict[str, Any] = {
+            "request_id": request_id,
+            "failure_id": snapshot.trace_id,
+            "evaluations": [item.to_dict() for item in evaluation_values],
+            "idempotency_key": idempotency_key,
+            "replayed": True,
+        }
+        result_context = self._publish(
+            "RecoveryStrategyEvaluated",
+            EventType.UPDATED,
+            event_details,
+            context,
+        )
+        result = RecoveryStrategyResult(
+            request_id=request_id,
+            failure_id=snapshot.trace_id,
+            selected_strategy=selected_strategy,
+            evaluations=evaluation_values,
+            learned=learned,
+            created_at=created_at,
+            correlation_id=result_context.correlation_id,
+            causation_id=result_context.causation_id,
+            trace_id=result_context.trace_id,
+            tenant_id=result_context.tenant_id,
+            metadata={"idempotency_key": idempotency_key, "replayed": True},
         )
         with self._lock:
             self._results[request_id] = result
             self._last_context = result_context
+        selected_payload: dict[str, Any] = {
+            "request_id": request_id,
+            "failure_id": snapshot.trace_id,
+            "strategy": selected_strategy,
+            "confidence": result.confidence,
+            "evaluations": [item.to_dict() for item in evaluation_values],
+            "idempotency_key": idempotency_key,
+            "replayed": True,
+        }
         final_context = self._publish(
             "RecoveryStrategySelected",
             EventType.COMPLETE,
-            {
-                "request_id": request_id,
-                "failure_id": snapshot.trace_id,
-                "strategy": selected_strategy,
-                "confidence": result.confidence,
-                "evaluations": [item.to_dict() for item in evaluations],
-            },
+            selected_payload,
             result_context,
         )
         with self._lock:

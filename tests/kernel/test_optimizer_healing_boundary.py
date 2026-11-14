@@ -346,3 +346,96 @@ def test_closed_loop_recovery_flag_is_preserved_for_optimizer_failure(monkeypatc
     assert report.status.value == "failed"
     assert report.healing_result is None
     assert kernel.optimizer_healing_boundary.records() == ()
+
+
+def test_optimizer_healing_replay_metadata_survives_event_and_reaches_nested_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kernel.recovery_execution_boundary import RecoveryExecutionBoundary
+    from kernel.recovery_strategy_boundary import RecoveryStrategyBoundary
+
+    publisher = EventBusPublisher(EventBus())
+    healer = SelfHealingCore(event_publisher=publisher)
+    strategy_boundary = RecoveryStrategyBoundary(healer, event_publisher=publisher)
+    execution_boundary = RecoveryExecutionBoundary(healer, event_publisher=publisher)
+
+    replay_metadata: dict[str, Any] = {
+        "replay_cycle_id": "optimizer-healing-cycle",
+        "replay_cycle_fingerprint": "optimizer-healing-fingerprint",
+        "replay_claim_owner_token": "optimizer-healing-owner",
+        "replay_claim_generation": 1,
+        "replay_stage_input": {
+            "source": "optimizer",
+            "result_id": "optimizer-healing-result",
+            "optimizer_id": "optimizer:1",
+            "learning_record_id": "record:1",
+            "optimization_request_id": "learning-optimization:1",
+            "error_type": "OptimizerExecutionFailure",
+            "error_message": "optimization failure",
+        },
+    }
+    request = OptimizerHealingRequest.from_result(
+        _optimization_result(),
+        context=EventPropagationContext.create(correlation_id="replay-roundtrip"),
+        created_at=NOW,
+        **replay_metadata,
+    )
+    restored_request = OptimizerHealingRequest.from_dict(request.to_dict())
+    assert restored_request == request
+
+    observed_strategy: dict[str, Any] = {}
+    observed_execution: dict[str, Any] = {}
+    original_strategy_request = RecoveryStrategyBoundary.request
+    original_execution_request = RecoveryExecutionBoundary.request
+
+    def capture_strategy(boundary: Any, snapshot: Any, **kwargs: Any) -> Any:
+        observed_strategy.update(
+            {key: kwargs[key] for key in replay_metadata if key in kwargs}
+        )
+        legacy_kwargs = {
+            key: value for key, value in kwargs.items() if key not in replay_metadata
+        }
+        return original_strategy_request(boundary, snapshot, **legacy_kwargs)
+
+    def capture_execution(
+        boundary: Any, strategy: Any, snapshot: Any, **kwargs: Any
+    ) -> Any:
+        observed_execution.update(
+            {key: kwargs[key] for key in replay_metadata if key in kwargs}
+        )
+        legacy_kwargs = {
+            key: value for key, value in kwargs.items() if key not in replay_metadata
+        }
+        return original_execution_request(
+            boundary, strategy, snapshot, **legacy_kwargs
+        )
+
+    monkeypatch.setattr(RecoveryStrategyBoundary, "request", capture_strategy)
+    monkeypatch.setattr(RecoveryExecutionBoundary, "request", capture_execution)
+
+    boundary = OptimizerHealingBoundary(
+        healer,
+        publisher,
+        strategy_boundary=strategy_boundary,
+        execution_boundary=execution_boundary,
+    )
+    result = boundary.request(
+        _optimization_result(),
+        context=EventPropagationContext.create(correlation_id="replay-event-path"),
+        created_at=NOW,
+        **replay_metadata,
+    )
+
+    assert result.success is True
+    assert observed_strategy == replay_metadata
+    assert observed_execution == replay_metadata
+
+
+def test_optimizer_healing_rejects_partial_replay_metadata() -> None:
+    with pytest.raises(ValueError, match="complete replay metadata"):
+        OptimizerHealingRequest.from_result(
+            _optimization_result(),
+            context=EventPropagationContext.create(correlation_id="partial-replay"),
+            created_at=NOW,
+            replay_cycle_id="incomplete-cycle",
+        )

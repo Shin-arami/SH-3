@@ -982,7 +982,30 @@ class LearningClosedLoopCoordinator:
                     status = ClosedLoopStatus.RECOVERED if recover else ClosedLoopStatus.FAILED
                     if recover:
                         self._ensure_claim_ownership(cycle_id)
-                        healing = self._healing_boundary.request(optimization, context=propagation, created_at=now)
+                        healing_replay_arguments: dict[str, Any] = {}
+                        if stage_enabled:
+                            healing_replay_arguments = {
+                                "replay_cycle_id": cycle_id,
+                                "replay_cycle_fingerprint": replay_claim_fingerprint,
+                                "replay_claim_owner_token": replay_claim_owner_token,
+                                "replay_claim_generation": replay_claim_generation,
+                                "replay_stage_input": {
+                                    "source": "optimizer",
+                                    "result_id": result.result_id,
+                                    "optimizer_id": optimization.optimizer_id,
+                                    "learning_record_id": optimization.learning_record_id,
+                                    "optimization_request_id": optimization.request_id,
+                                    "error_type": "OptimizerExecutionFailure",
+                                    "error_message": optimization.error
+                                    or f"optimizer cycle failure for {optimization.learning_record_id}",
+                                },
+                            }
+                        healing = self._healing_boundary.request(
+                            optimization,
+                            context=propagation,
+                            created_at=now,
+                            **healing_replay_arguments,
+                        )
                         self._ensure_claim_ownership(cycle_id)
                         propagation = healing.propagation_context
                         healing_result = {
@@ -1318,16 +1341,40 @@ class LearningClosedLoopCoordinator:
         exc = error or RuntimeError(f"{source} cycle failure for {result.result_id}")
         self.kernel.meta_controller.healer.set_propagation_context(propagation)
         snapshot = self.kernel.meta_controller.healer.detect(exc, {"source": source, "cycle_id": cycle_id, "result_id": result.result_id})
+
+        replay_arguments: dict[str, Any] = {}
+        if self._learning_boundary.replay_stage_store is not None:
+            claim_metadata = self._claim_metadata_for_cycle(cycle_id)
+            if claim_metadata is None:
+                raise ReplayClaimOwnershipError(
+                    f"persistent recovery has no active claim guard: {cycle_id}"
+                )
+            fingerprint, owner_token, generation = claim_metadata
+            replay_arguments = {
+                "replay_cycle_id": cycle_id,
+                "replay_cycle_fingerprint": fingerprint,
+                "replay_claim_owner_token": owner_token,
+                "replay_claim_generation": generation,
+                "replay_stage_input": {
+                    "source": source,
+                    "result_id": result.result_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            }
+
         strategy = self._recovery_strategy_boundary.request(
             snapshot,
             context=self.kernel.meta_controller.healer.propagation_context or propagation,
             created_at=result.created_at,
+            **replay_arguments,
         )
         execution = self._recovery_execution_boundary.request(
             strategy,
             snapshot,
             context=strategy.propagation_context,
             created_at=result.created_at,
+            **replay_arguments,
         )
         self.kernel.meta_controller.healer.set_propagation_context(execution.propagation_context)
         if not execution.success:

@@ -54,6 +54,7 @@ def test_kernel_restart_replays_optimizer_healing_without_healing_again(
     original_learning_record = learning_boundary_type.record
     original_optimizer_request = optimizer_boundary_type.request
     original_healing_request = healing_boundary_type.request
+    healing_replay_metadata: dict[str, Any] = {}
     original_strategy_request = strategy_boundary_type.request
     original_execution_request = execution_boundary_type.request
 
@@ -90,6 +91,18 @@ def test_kernel_restart_replays_optimizer_healing_without_healing_again(
         **kwargs: Any,
     ) -> Any:
         calls["optimizer_healing"] += 1
+        healing_replay_metadata.update(
+            {
+                key: kwargs.get(key)
+                for key in (
+                    "replay_cycle_id",
+                    "replay_cycle_fingerprint",
+                    "replay_claim_owner_token",
+                    "replay_claim_generation",
+                    "replay_stage_input",
+                )
+            }
+        )
         return original_healing_request(boundary, *args, **kwargs)
 
     def count_strategy_request(
@@ -153,6 +166,12 @@ def test_kernel_restart_replays_optimizer_healing_without_healing_again(
         "recovery_strategy": 1,
         "recovery_execution": 1,
     }
+    assert healing_replay_metadata["replay_cycle_id"] == cycle_id
+    assert isinstance(healing_replay_metadata["replay_cycle_fingerprint"], str)
+    assert isinstance(healing_replay_metadata["replay_claim_owner_token"], str)
+    assert isinstance(healing_replay_metadata["replay_claim_generation"], int)
+    assert healing_replay_metadata["replay_stage_input"]["source"] == "optimizer"
+    assert healing_replay_metadata["replay_stage_input"]["result_id"] == result.result_id
     assert first_report.status is ClosedLoopStatus.RECOVERED
     assert first_report.optimize is True
     assert first_report.recover is True
