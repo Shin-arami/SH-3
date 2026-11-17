@@ -99,3 +99,65 @@ def test_meta_controller_optimize_executes_system_optimizer() -> None:
     assert result["status"] == "optimized"
     assert result["optimization"]["execution"][0]["success"] is True
     assert kernel.context_manager.snapshot()["depth"] == 6
+
+
+def test_keyed_optimizer_rollback_receives_a_distinct_rollback_key() -> None:
+    optimizer = SystemOptimizer(SH3Kernel())
+    rollback_keys: list[str] = []
+
+    optimizer.register_action(
+        OptimizationAction(
+            "first_keyed",
+            lambda _: {"changed": True},
+            lambda _, *, idempotency_key: rollback_keys.append(idempotency_key),
+        )
+    )
+
+    def fail(_: Mapping[str, Any]) -> None:
+        raise RuntimeError("forced failure")
+
+    optimizer.register_action(OptimizationAction("second_failure", fail, lambda _: None))
+    results = optimizer.execute_actions(
+        ("first_keyed", "second_failure"),
+        {"idempotency_key": "optimizer-parent:rollback"},
+        rollback_on_failure=True,
+    )
+
+    rolled_back = results[0]
+    assert rolled_back.success is True
+    assert rolled_back.rolled_back is True
+    assert rolled_back.idempotency_key is not None
+    assert rolled_back.rollback_idempotency_key is not None
+    assert rolled_back.rollback_idempotency_key.startswith("optimizer-action-rollback:")
+    assert rolled_back.rollback_idempotency_key != rolled_back.idempotency_key
+    assert rollback_keys == [rolled_back.rollback_idempotency_key]
+
+
+def test_keyed_optimizer_rollback_fails_closed_for_legacy_callback() -> None:
+    optimizer = SystemOptimizer(SH3Kernel())
+    rollback_calls: list[bool] = []
+    optimizer.register_action(
+        OptimizationAction(
+            "legacy_rollback",
+            lambda _: {"changed": True},
+            lambda _: rollback_calls.append(True),
+        )
+    )
+
+    def fail(_: Mapping[str, Any]) -> None:
+        raise RuntimeError("forced failure")
+
+    optimizer.register_action(OptimizationAction("trigger_failure", fail, lambda _: None))
+    results = optimizer.execute_actions(
+        ("legacy_rollback", "trigger_failure"),
+        {"idempotency_key": "optimizer-parent:legacy-rollback"},
+        rollback_on_failure=True,
+    )
+
+    rollback_result = results[0]
+    assert rollback_result.success is False
+    assert rollback_result.rolled_back is False
+    assert "must accept the idempotency_key" in (rollback_result.error or "")
+    assert rollback_result.rollback_idempotency_key is not None
+    assert rollback_result.state_uncertain is True
+    assert rollback_calls == []

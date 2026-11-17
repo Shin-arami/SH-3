@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from runtime.context_manager import ContextManager, RuntimeContext
 
 
@@ -102,3 +104,24 @@ def test_clear() -> None:
     manager.clear()
     assert manager.current() is None
     assert manager.snapshot()["depth"] == 0
+
+
+
+def test_clear_accepts_idempotency_key_and_is_repeatable() -> None:
+    manager = ContextManager()
+    manager.push("root")
+    manager.push("child")
+
+    manager.clear(idempotency_key="context-clear:repeatable")
+    assert manager.current() is None
+    assert manager.snapshot()["depth"] == 0
+
+    manager.clear(idempotency_key="context-clear:repeatable")
+    assert manager.current() is None
+    assert manager.snapshot()["depth"] == 0
+
+
+def test_clear_rejects_blank_idempotency_key() -> None:
+    manager = ContextManager()
+    with pytest.raises(ValueError, match="idempotency_key must not be empty"):
+        manager.clear(idempotency_key=" ")

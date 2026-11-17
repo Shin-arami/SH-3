@@ -128,10 +128,17 @@ class ContextManager:
                 "stack": [context.to_dict() for context in self._stack],
             }
 
-    def clear(self) -> None:
+    def clear(self, *, idempotency_key: str | None = None) -> None:
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key must not be empty")
         with self._lock:
             self._stack.clear()
+        if idempotency_key is None:
             info("Context stack cleared")
+        else:
+            info("Context stack cleared", {"idempotency_key": idempotency_key})
 
     def __len__(self) -> int:
         with self._lock:

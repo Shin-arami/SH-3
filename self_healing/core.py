@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from inspect import Parameter, signature
 from threading import RLock, local
 from types import MappingProxyType
 from typing import Any
@@ -66,14 +67,14 @@ class FailureSnapshot:
 @dataclass(frozen=True, slots=True)
 class RecoveryPlan:
     strategy: str
-    action: Callable[[FailureSnapshot], Any]
+    action: Callable[..., Any]
     trace_id: str
 
     @classmethod
     def create(
         cls,
         strategy: str,
-        action: Callable[[FailureSnapshot], Any],
+        action: Callable[..., Any],
     ) -> RecoveryPlan:
         return cls(
             strategy=strategy,
@@ -81,8 +82,15 @@ class RecoveryPlan:
             trace_id=short_id(f"recovery:{strategy}"),
         )
 
-    def execute(self, snapshot: FailureSnapshot) -> Any:
-        return self.action(snapshot)
+    def execute(
+        self,
+        snapshot: FailureSnapshot,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Any:
+        if idempotency_key is None:
+            return self.action(snapshot)
+        return self.action(snapshot, idempotency_key=idempotency_key)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -371,8 +379,8 @@ class SelfHealingCore:
     def _strategy_action(
         self,
         strategy: str,
-    ) -> Callable[[FailureSnapshot], Any]:
-        actions: dict[str, Callable[[FailureSnapshot], Any]] = {
+    ) -> Callable[..., Any]:
+        actions: dict[str, Callable[..., Any]] = {
             "retry_safe": self._retry,
             "fallback_default": self._fallback,
             "rebuild_context": self._rebuild,
@@ -563,15 +571,21 @@ class SelfHealingCore:
         self,
         snapshot: FailureSnapshot,
         strategy: str,
+        *,
+        idempotency_key: str | None = None,
     ) -> Any:
         if not isinstance(snapshot, FailureSnapshot):
             raise TypeError("snapshot must be a FailureSnapshot")
         if not isinstance(strategy, str) or not strategy.strip():
             raise ValueError("strategy must not be empty")
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key must not be empty")
         if strategy not in self._strategy_candidates(snapshot):
             raise SelfHealingException(f"Unknown recovery strategy: {strategy}")
         plan = RecoveryPlan.create(strategy, self._strategy_action(strategy))
-        return self.recover(snapshot, plan)
+        return self.recover(snapshot, plan, idempotency_key=idempotency_key)
 
     def plan_recovery(
         self,
@@ -629,9 +643,14 @@ class SelfHealingCore:
         snapshot: FailureSnapshot,
         plan: RecoveryPlan,
         attempt: int,
+        *,
+        idempotency_key: str | None = None,
     ) -> Any:
         try:
-            result = plan.execute(snapshot)
+            result = plan.execute(
+                snapshot,
+                idempotency_key=idempotency_key,
+            )
         except Exception as exc:
             self._record_attempt(
                 attempt,
@@ -646,6 +665,7 @@ class SelfHealingCore:
                 success=False,
                 result=None,
                 recovery_error=exc,
+                idempotency_key=idempotency_key,
             )
             raise
 
@@ -661,6 +681,7 @@ class SelfHealingCore:
             attempt=attempt,
             success=True,
             result=result,
+            idempotency_key=idempotency_key,
         )
         return result
 
@@ -668,13 +689,24 @@ class SelfHealingCore:
         self,
         snapshot: FailureSnapshot,
         plan: RecoveryPlan | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> Any:
         if not isinstance(snapshot, FailureSnapshot):
             raise TypeError("snapshot must be a FailureSnapshot")
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key must not be empty")
         if plan is None:
             plan = self.plan_recovery(snapshot)
         elif not isinstance(plan, RecoveryPlan):
             raise TypeError("plan must be a RecoveryPlan or None")
+        idempotency_metadata = (
+            {"idempotency_key": idempotency_key}
+            if idempotency_key is not None
+            else {}
+        )
         self._publish(
             "RecoveryStarted",
             EventType.START,
@@ -682,11 +714,17 @@ class SelfHealingCore:
                 "recovery_id": plan.trace_id,
                 "failure_id": snapshot.trace_id,
                 "strategy": plan.strategy,
+                **idempotency_metadata,
             },
             snapshot,
         )
         try:
-            result = self._execute_plan(snapshot, plan, 1)
+            result = self._execute_plan(
+                snapshot,
+                plan,
+                1,
+                idempotency_key=idempotency_key,
+            )
         except SH3Exception as exc:
             with self._lock:
                 self._failed += 1
@@ -702,6 +740,7 @@ class SelfHealingCore:
                         "error_type": type(exc).__name__,
                     },
                     "success": False,
+                    **idempotency_metadata,
                 },
                 context=self._propagation_context,
             )
@@ -720,6 +759,7 @@ class SelfHealingCore:
                     "details": {
                         "error_type": type(exc).__name__,
                     },
+                    **idempotency_metadata,
                 },
                 context=self._propagation_context,
             )
@@ -747,6 +787,7 @@ class SelfHealingCore:
                 "strategy": plan.strategy,
                 "success": True,
                 "details": result,
+                **idempotency_metadata,
             },
             context=self._propagation_context,
         )
@@ -894,6 +935,7 @@ class SelfHealingCore:
         success: bool,
         result: Any = None,
         recovery_error: Exception | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         score = 1.0 if success else 0.0
         details = {
@@ -907,6 +949,7 @@ class SelfHealingCore:
             "recovery_result": result,
             "snapshot_context": dict(snapshot.context),
             "recovery_error": str(recovery_error) if recovery_error is not None else None,
+            **({"idempotency_key": idempotency_key} if idempotency_key is not None else {}),
         }
 
         publisher = self._event_publisher
@@ -1013,29 +1056,78 @@ class SelfHealingCore:
         with self._lock:
             return len(self._attempts)
 
-    def _retry(self, snapshot: FailureSnapshot) -> dict[str, Any]:
-        info("Retry strategy executed", {"trace_id": snapshot.trace_id})
+    def _retry(
+        self,
+        snapshot: FailureSnapshot,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        info(
+            "Retry strategy executed",
+            {
+                "trace_id": snapshot.trace_id,
+                **({"idempotency_key": idempotency_key} if idempotency_key is not None else {}),
+            },
+        )
         return {
             "status": "retried",
             "strategy": "retry_safe",
             "trace_id": snapshot.trace_id,
         }
 
-    def _fallback(self, snapshot: FailureSnapshot) -> dict[str, Any]:
-        info("Fallback strategy executed", {"trace_id": snapshot.trace_id})
+    def _fallback(
+        self,
+        snapshot: FailureSnapshot,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        info(
+            "Fallback strategy executed",
+            {
+                "trace_id": snapshot.trace_id,
+                **({"idempotency_key": idempotency_key} if idempotency_key is not None else {}),
+            },
+        )
         return {
             "status": "fallback_used",
             "strategy": "fallback_default",
             "trace_id": snapshot.trace_id,
         }
 
-    def _rebuild(self, snapshot: FailureSnapshot) -> dict[str, Any]:
+    def _rebuild(
+        self,
+        snapshot: FailureSnapshot,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         rebuilt = False
         manager = self.context_manager
         if manager is not None:
             clear = getattr(manager, "clear", None)
             if callable(clear):
-                clear()
+                if idempotency_key is None:
+                    clear()
+                else:
+                    try:
+                        parameters = signature(clear).parameters.values()
+                        supports_key = any(
+                            parameter.kind is Parameter.VAR_KEYWORD
+                            or (
+                                parameter.name == "idempotency_key"
+                                and parameter.kind
+                                in {
+                                    Parameter.POSITIONAL_OR_KEYWORD,
+                                    Parameter.KEYWORD_ONLY,
+                                }
+                            )
+                            for parameter in parameters
+                        )
+                    except (TypeError, ValueError):
+                        supports_key = False
+                    if supports_key:
+                        clear(idempotency_key=idempotency_key)
+                    else:
+                        clear()
                 rebuilt = True
 
         info(
@@ -1043,6 +1135,7 @@ class SelfHealingCore:
             {
                 "trace_id": snapshot.trace_id,
                 "context_rebuilt": rebuilt,
+                **({"idempotency_key": idempotency_key} if idempotency_key is not None else {}),
             },
         )
         return {
@@ -1050,6 +1143,11 @@ class SelfHealingCore:
             "strategy": "rebuild_context",
             "trace_id": snapshot.trace_id,
             "context_rebuilt": rebuilt,
+            **(
+                {"idempotency_key": idempotency_key}
+                if idempotency_key is not None
+                else {}
+            ),
         }
 
     def execute_safe(

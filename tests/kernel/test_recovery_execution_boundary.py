@@ -17,6 +17,7 @@ from kernel.recovery_execution_boundary import (
     RecoveryExecutionResult,
 )
 from kernel.recovery_strategy_boundary import RecoveryStrategyBoundary, RecoveryStrategyResult
+from runtime.context_manager import ContextManager
 from self_healing.core import FailureSnapshot, SelfHealingCore
 
 NOW = datetime(2026, 10, 6, 0, 0, tzinfo=UTC)
@@ -235,10 +236,18 @@ class _PersistentReplayCountingHealer(SelfHealingCore):
     def __init__(self, *, fail=False):
         super().__init__()
         self.execution_calls = 0
+        self.idempotency_keys: list[str | None] = []
         self.fail = fail
 
-    def recover_with_strategy(self, snapshot, strategy):
+    def recover_with_strategy(
+        self,
+        snapshot,
+        strategy,
+        *,
+        idempotency_key=None,
+    ):
         self.execution_calls += 1
+        self.idempotency_keys.append(idempotency_key)
         if self.fail:
             raise RuntimeError("persistent recovery failure")
         return {
@@ -261,6 +270,82 @@ def _p2_2_replay_arguments(*, generation, owner="execution-owner", result_id="re
             "error_message": error_message,
         },
     }
+
+
+def test_persistent_recovery_execution_rejects_backend_without_idempotency_contract():
+    class LegacyBackend:
+        def recover_with_strategy(self, snapshot, strategy):
+            return {"strategy": strategy}
+
+    store = _p2_2_fake_replay_stage_store()
+    with pytest.raises(TypeError, match="must accept idempotency_key"):
+        RecoveryExecutionBoundary(
+            LegacyBackend(),
+            replay_stage_store=store,
+        )
+
+
+def test_recovery_execution_propagates_stage_key_into_self_healing_action_and_events(
+):
+    class KeyAwareHealer(SelfHealingCore):
+        def __init__(self):
+            super().__init__()
+            self.action_idempotency_key = None
+
+        def _rebuild(self, snapshot, *, idempotency_key=None):
+            self.action_idempotency_key = idempotency_key
+            return super()._rebuild(
+                snapshot,
+                idempotency_key=idempotency_key,
+            )
+
+    store = _p2_2_fake_replay_stage_store()
+    healer = KeyAwareHealer()
+    snapshot = _snapshot()
+    strategy = RecoveryStrategyBoundary(healer).request(
+        snapshot,
+        context=_context(),
+        created_at=NOW,
+    )
+    bus = EventBus()
+    publisher = EventBusPublisher(bus)
+    events: list[Event] = []
+    bus.subscribe(
+        EventSubscription(
+            subscriber_id="p3-1a-recovery-idempotency-audit",
+            handler=events.append,
+            priority=200,
+        )
+    )
+    boundary = RecoveryExecutionBoundary(
+        healer,
+        publisher,
+        replay_stage_store=store,
+    )
+    result = boundary.request(
+        strategy,
+        snapshot,
+        context=_context(),
+        created_at=NOW,
+        **_p2_2_replay_arguments(generation=1),
+    )
+
+    expected_key = store.begin_calls[0][0]
+    assert result.success is True
+    assert healer.action_idempotency_key == expected_key
+    recovery_events = [
+        event
+        for event in events
+        if event.name in {"RecoveryExecutionRequested", "RecoveryExecutionCompleted"}
+    ]
+    assert [event.name for event in recovery_events] == [
+        "RecoveryExecutionRequested",
+        "RecoveryExecutionCompleted",
+    ]
+    assert all(
+        event.payload["idempotency_key"] == expected_key
+        for event in recovery_events
+    )
 
 
 def test_persistent_recovery_execution_replays_after_restart_without_backend_call():
@@ -296,11 +381,60 @@ def test_persistent_recovery_execution_replays_after_restart_without_backend_cal
     assert first.success is True
     assert second.success is True
     assert first_healer.execution_calls == 1
+    assert first_healer.idempotency_keys == [store.begin_calls[0][0]]
     assert second_healer.execution_calls == 0
+    assert second_healer.idempotency_keys == []
     assert second.result == first.result
     assert len(store.complete_calls) == 1
     assert store.begin_calls[0][1:] == ("owner-1", 1)
     assert store.begin_calls[1][1:] == ("owner-2", 2)
+
+
+def test_rebuild_propagates_idempotency_key_to_key_aware_context_manager() -> None:
+    class KeyAwareContextManager(ContextManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.received_keys: list[str | None] = []
+
+        def clear(self, *, idempotency_key: str | None = None) -> None:
+            self.received_keys.append(idempotency_key)
+            super().clear(idempotency_key=idempotency_key)
+
+    manager = KeyAwareContextManager()
+    manager.push("root")
+    healer = SelfHealingCore(context_manager=manager)
+    key = "recovery-context-clear:stable"
+
+    result = healer.recover_with_strategy(
+        _snapshot("rebuild with idempotency"),
+        "rebuild_context",
+        idempotency_key=key,
+    )
+
+    assert manager.received_keys == [key]
+    assert manager.snapshot()["depth"] == 0
+    assert result["idempotency_key"] == key
+
+
+def test_rebuild_preserves_legacy_context_manager_clear_signature() -> None:
+    class LegacyContextManager:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+
+    manager = LegacyContextManager()
+    healer = SelfHealingCore(context_manager=manager)
+
+    result = healer.recover_with_strategy(
+        _snapshot("legacy clear signature"),
+        "rebuild_context",
+        idempotency_key="recovery-context-clear:legacy",
+    )
+
+    assert manager.clear_calls == 1
+    assert result["context_rebuilt"] is True
 
 
 def test_persistent_recovery_execution_caches_failure_result_across_restart():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from threading import RLock, local
 from typing import Any
 
@@ -22,7 +23,7 @@ __all__ = ["OptimizationAction", "OptimizationActionResult", "SystemOptimizer"]
 class OptimizationAction:
     name: str
     apply: Callable[[Mapping[str, Any]], Any]
-    rollback: Callable[[Any], Any]
+    rollback: Callable[..., Any]
     description: str = ""
 
     def __post_init__(self) -> None:
@@ -44,15 +45,76 @@ class OptimizationActionResult:
     result: Any = None
     rolled_back: bool = False
     error: str | None = None
+    idempotency_key: str | None = None
+    parent_idempotency_key: str | None = None
+    rollback_idempotency_key: str | None = None
+    state_uncertain: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "action": self.action,
             "success": self.success,
             "result": self.result,
             "rolled_back": self.rolled_back,
             "error": self.error,
         }
+        for name, value in (
+            ("idempotency_key", self.idempotency_key),
+            ("parent_idempotency_key", self.parent_idempotency_key),
+            ("rollback_idempotency_key", self.rollback_idempotency_key),
+        ):
+            if value is not None:
+                data[name] = value
+        if self.state_uncertain:
+            data["state_uncertain"] = True
+        return data
+
+
+def _action_idempotency_key(
+    parent_idempotency_key: str,
+    action: str,
+    ordinal: int,
+) -> str:
+    if not isinstance(parent_idempotency_key, str) or not parent_idempotency_key.strip():
+        raise ValueError("idempotency_key must not be empty")
+    if not isinstance(ordinal, int) or ordinal < 0:
+        raise ValueError("action ordinal must be a non-negative integer")
+    return short_id(
+        {
+            "parent_idempotency_key": parent_idempotency_key,
+            "action": action,
+            "ordinal": ordinal,
+        },
+        length=24,
+        prefix="optimizer-action:",
+    )
+
+
+def _rollback_idempotency_key(action_idempotency_key: str, action: str) -> str:
+    return short_id(
+        {
+            "action_idempotency_key": action_idempotency_key,
+            "action": action,
+            "operation": "rollback",
+        },
+        length=24,
+        prefix="optimizer-action-rollback:",
+    )
+
+
+def _accepts_keyword_argument(callback: Callable[..., Any], name: str) -> bool:
+    try:
+        parameters = signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is Parameter.VAR_KEYWORD
+        or (
+            parameter.name == name
+            and parameter.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY)
+        )
+        for parameter in parameters
+    )
 
 
 class SystemOptimizer:
@@ -181,7 +243,12 @@ class SystemOptimizer:
             return {"changed": False, "depth": 0, "context": None}
         return {"changed": True, "depth": len(self.kernel.context_manager), "context": context.to_dict()}
 
-    def _rollback_context(self, result: Any) -> None:
+    def _rollback_context(
+        self,
+        result: Any,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
         if not isinstance(result, Mapping) or not result.get("changed"):
             return
         data = result.get("context")
@@ -198,7 +265,11 @@ class SystemOptimizer:
         return {"changed": False, "groups": groups, "group_size": group_size}
 
     @staticmethod
-    def _rollback_noop(_: Any) -> None:
+    def _rollback_noop(
+        _: Any,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
         return None
 
     def _apply_simplify_policy(self, _: Mapping[str, Any]) -> dict[str, Any]:
@@ -209,7 +280,12 @@ class SystemOptimizer:
         rules.pop(index)
         return {"changed": True, "index": index, "rule": rule}
 
-    def _rollback_policy(self, result: Any) -> None:
+    def _rollback_policy(
+        self,
+        result: Any,
+        *,
+        idempotency_key: str | None = None,
+    ) -> None:
         if not isinstance(result, Mapping) or not result.get("changed"):
             return
         rule = result.get("rule")
@@ -219,21 +295,82 @@ class SystemOptimizer:
         rules = self.kernel.policy.rules
         rules.insert(min(index, len(rules)), rule)
 
-    def execute_action(self, name: str, context: Mapping[str, Any] | None = None) -> OptimizationActionResult:
+    def execute_action(
+        self,
+        name: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> OptimizationActionResult:
+        stored_context = dict(context or {})
+        parent_idempotency_key = stored_context.get("idempotency_key")
+        if parent_idempotency_key is None:
+            return self._execute_action(name, stored_context)
+        action_idempotency_key = _action_idempotency_key(
+            parent_idempotency_key,
+            name,
+            0,
+        )
+        return self._execute_action(
+            name,
+            stored_context,
+            idempotency_key=action_idempotency_key,
+            parent_idempotency_key=parent_idempotency_key,
+        )
+
+    def _execute_action(
+        self,
+        name: str,
+        context: Mapping[str, Any] | None = None,
+        *,
+        idempotency_key: str | None = None,
+        parent_idempotency_key: str | None = None,
+    ) -> OptimizationActionResult:
         if not name or not name.strip():
             raise ValueError("name must not be empty")
         action = self.get_action(name)
         if action is None:
             raise KeyError(f"unknown optimization action: {name}")
         stored_context = dict(context or {})
+        key_fields: dict[str, Any] = {}
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ValueError("idempotency_key must not be empty")
+            if not isinstance(parent_idempotency_key, str) or not parent_idempotency_key.strip():
+                raise ValueError("parent_idempotency_key must not be empty")
+            stored_context["idempotency_key"] = idempotency_key
+            stored_context["parent_idempotency_key"] = parent_idempotency_key
+            key_fields = {
+                "idempotency_key": idempotency_key,
+                "parent_idempotency_key": parent_idempotency_key,
+            }
         try:
             value = action.apply(stored_context)
-            result = OptimizationActionResult(name, True, value)
+            result = OptimizationActionResult(
+                action=name,
+                success=True,
+                result=value,
+                idempotency_key=idempotency_key,
+                parent_idempotency_key=parent_idempotency_key,
+            )
         except Exception as exc:
-            result = OptimizationActionResult(name, False, error=str(exc))
+            result = OptimizationActionResult(
+                action=name,
+                success=False,
+                error=str(exc),
+                idempotency_key=idempotency_key,
+                parent_idempotency_key=parent_idempotency_key,
+            )
             with self._lock:
                 self._history.append(result)
-            self._publish("OptimizationFailed", EventType.FAILURE, {"optimization_id": self.optimizer_id, "action": name, "error": str(exc)})
+            self._publish(
+                "OptimizationFailed",
+                EventType.FAILURE,
+                {
+                    "optimization_id": self.optimizer_id,
+                    "action": name,
+                    "error": str(exc),
+                    **key_fields,
+                },
+            )
             return result
         with self._lock:
             self._history.append(result)
@@ -247,32 +384,113 @@ class SystemOptimizer:
         action = self.get_action(result.action)
         if action is None:
             raise KeyError(f"unknown optimization action: {result.action}")
+
+        rollback_key = None
+        rollback_key_fields: dict[str, Any] = {}
+        if result.idempotency_key is not None:
+            rollback_key = _rollback_idempotency_key(
+                result.idempotency_key,
+                result.action,
+            )
+            rollback_key_fields = {
+                "idempotency_key": result.idempotency_key,
+                "parent_idempotency_key": result.parent_idempotency_key,
+                "rollback_idempotency_key": rollback_key,
+            }
+
         try:
-            action.rollback(result.result)
+            if rollback_key is None:
+                action.rollback(result.result)
+            else:
+                if not _accepts_keyword_argument(action.rollback, "idempotency_key"):
+                    raise TypeError(
+                        "keyed optimization rollback callback must accept the "
+                        "idempotency_key keyword argument"
+                    )
+                action.rollback(result.result, idempotency_key=rollback_key)
         except Exception as exc:
-            failure = OptimizationActionResult(result.action, False, result.result, False, str(exc))
-            self._publish("OptimizationFailed", EventType.FAILURE, {"optimization_id": self.optimizer_id, "action": result.action, "error": str(exc), "rollback": True})
+            state_uncertain = (
+                not isinstance(result.result, Mapping)
+                or result.result.get("changed") is not False
+            )
+            failure = OptimizationActionResult(
+                action=result.action,
+                success=False,
+                result=result.result,
+                error=str(exc),
+                idempotency_key=result.idempotency_key,
+                parent_idempotency_key=result.parent_idempotency_key,
+                rollback_idempotency_key=rollback_key,
+                state_uncertain=state_uncertain,
+            )
+            self._publish(
+                "OptimizationFailed",
+                EventType.FAILURE,
+                {
+                    "optimization_id": self.optimizer_id,
+                    "action": result.action,
+                    "error": str(exc),
+                    "rollback": True,
+                    "state_uncertain": state_uncertain,
+                    **rollback_key_fields,
+                },
+            )
             with self._lock:
                 self._history.append(failure)
             return failure
-        rolled_back = OptimizationActionResult(result.action, True, result.result, True)
+
+        rolled_back = OptimizationActionResult(
+            action=result.action,
+            success=True,
+            result=result.result,
+            rolled_back=True,
+            idempotency_key=result.idempotency_key,
+            parent_idempotency_key=result.parent_idempotency_key,
+            rollback_idempotency_key=rollback_key,
+        )
         with self._lock:
             self._history.append(rolled_back)
         return rolled_back
 
-    def execute_actions(self, actions: list[str] | tuple[str, ...], context: Mapping[str, Any] | None = None, *, rollback_on_failure: bool = True) -> tuple[OptimizationActionResult, ...]:
+    def execute_actions(
+        self,
+        actions: list[str] | tuple[str, ...],
+        context: Mapping[str, Any] | None = None,
+        *,
+        rollback_on_failure: bool = True,
+    ) -> tuple[OptimizationActionResult, ...]:
         results: list[OptimizationActionResult] = []
-        for name in actions:
-            result = self.execute_action(name, context)
+        base_context = dict(context or {})
+        parent_idempotency_key = base_context.get("idempotency_key")
+        if parent_idempotency_key is not None and (
+            not isinstance(parent_idempotency_key, str)
+            or not parent_idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key must not be empty")
+
+        for ordinal, name in enumerate(actions):
+            if parent_idempotency_key is None:
+                result = self.execute_action(name, base_context)
+            else:
+                result = self._execute_action(
+                    name,
+                    base_context,
+                    idempotency_key=_action_idempotency_key(
+                        parent_idempotency_key,
+                        name,
+                        ordinal,
+                    ),
+                    parent_idempotency_key=parent_idempotency_key,
+                )
             results.append(result)
             if not result.success:
                 if rollback_on_failure:
-                    for previous in reversed(results[:-1]):
+                    for index in range(len(results) - 2, -1, -1):
+                        previous = results[index]
                         if previous.success and not previous.rolled_back:
-                            self.rollback_action(previous)
+                            results[index] = self.rollback_action(previous)
                 break
         return tuple(results)
-
     def _publish(
         self,
         event_name: str,

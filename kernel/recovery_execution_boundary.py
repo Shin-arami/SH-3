@@ -5,10 +5,11 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from inspect import Parameter, signature
 from threading import Event as ThreadEvent
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from foundation.Enums.category import Category
 from foundation.Enums.event import EventType
@@ -42,6 +43,15 @@ def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 class RecoveryExecutionBackend(Protocol):
     def recover_with_strategy(self, snapshot: FailureSnapshot, strategy: str) -> Any: ...
+
+class IdempotentRecoveryExecutionBackend(Protocol):
+    def recover_with_strategy(
+        self,
+        snapshot: FailureSnapshot,
+        strategy: str,
+        *,
+        idempotency_key: str,
+    ) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +268,26 @@ class RecoveryExecutionBoundary:
             replay_stage_store, SQLiteReplayStageStore
         ):
             raise TypeError("replay_stage_store must be SQLiteReplayStageStore or None")
+        if replay_stage_store is not None:
+            try:
+                parameters = signature(backend.recover_with_strategy).parameters.values()
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "persistent recovery backend must expose an idempotency_key parameter"
+                ) from exc
+            supports_idempotency_key = any(
+                (
+                    parameter.name == "idempotency_key"
+                    and parameter.kind
+                    in {Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY}
+                )
+                or parameter.kind is Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            if not supports_idempotency_key:
+                raise TypeError(
+                    "persistent recovery backend must accept idempotency_key"
+                )
         self.backend = backend
         self._replay_stage_store = replay_stage_store
         self._event_publisher = event_publisher
@@ -439,6 +469,11 @@ class RecoveryExecutionBoundary:
                     "request_id": request.request_id,
                     "failure_id": request.failure_id,
                     "strategy": request.strategy,
+                    **(
+                        {"idempotency_key": replay_claim[0].idempotency_key}
+                        if replay_claim is not None
+                        else {}
+                    ),
                 },
                 context,
             )
@@ -587,7 +622,17 @@ class RecoveryExecutionBoundary:
         value: Any = None
         error_message: str | None = None
         try:
-            value = self.backend.recover_with_strategy(snapshot, request.strategy)
+            if replay_claim is None:
+                value = self.backend.recover_with_strategy(
+                    snapshot,
+                    request.strategy,
+                )
+            else:
+                value = cast(IdempotentRecoveryExecutionBackend, self.backend).recover_with_strategy(
+                    snapshot,
+                    request.strategy,
+                    idempotency_key=replay_claim[0].idempotency_key,
+                )
             success = True
         except Exception as exc:
             error_message = str(exc)
@@ -599,6 +644,11 @@ class RecoveryExecutionBoundary:
                 "failure_id": request.failure_id,
                 "strategy": request.strategy,
                 "success": success,
+                **(
+                    {"idempotency_key": replay_claim[0].idempotency_key}
+                    if replay_claim is not None
+                    else {}
+                ),
                 **({"result": value} if success else {"error": error_message or "recovery execution failed"}),
             },
             context,

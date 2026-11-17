@@ -83,6 +83,10 @@ class OptimizationUpdate:
     result: Any = None
     rolled_back: bool = False
     error: str | None = None
+    idempotency_key: str | None = None
+    parent_idempotency_key: str | None = None
+    rollback_idempotency_key: str | None = None
+    state_uncertain: bool = False
 
     def __post_init__(self) -> None:
         _text("action", self.action)
@@ -94,11 +98,20 @@ class OptimizationUpdate:
             raise TypeError("changed must be bool")
         if not isinstance(self.rolled_back, bool):
             raise TypeError("rolled_back must be bool")
+        if not isinstance(self.state_uncertain, bool):
+            raise TypeError("state_uncertain must be bool")
         if self.error is not None:
             _text("error", self.error)
+        for name, value in (
+            ("idempotency_key", self.idempotency_key),
+            ("parent_idempotency_key", self.parent_idempotency_key),
+            ("rollback_idempotency_key", self.rollback_idempotency_key),
+        ):
+            if value is not None:
+                _text(name, value)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "action": self.action,
             "target": self.target.value,
             "success": self.success,
@@ -107,7 +120,16 @@ class OptimizationUpdate:
             "rolled_back": self.rolled_back,
             "error": self.error,
         }
-
+        for name, value in (
+            ("idempotency_key", self.idempotency_key),
+            ("parent_idempotency_key", self.parent_idempotency_key),
+            ("rollback_idempotency_key", self.rollback_idempotency_key),
+        ):
+            if value is not None:
+                data[name] = value
+        if self.state_uncertain:
+            data["state_uncertain"] = True
+        return data
 
 @dataclass(frozen=True, slots=True)
 class OptimizationUpdateRequest:
@@ -171,7 +193,11 @@ class OptimizationUpdateRequest:
         request_identity: dict[str, Any]
         if idempotency_key is not None:
             _text("idempotency_key", idempotency_key)
-            request_identity = {"idempotency_key": idempotency_key}
+            request_identity = {
+                "idempotency_key": idempotency_key,
+                "tenant_id": context.tenant_id,
+            }
+
         else:
             request_identity = {
                 "optimization_id": optimization_id,
@@ -211,6 +237,19 @@ class OptimizationUpdateRequest:
             "metadata": dict(self.metadata),
             "idempotency_key": self.idempotency_key,
         }
+
+
+def _request_input_fingerprint(request: OptimizationUpdateRequest) -> str:
+    """Fingerprint semantic optimizer input for process-local key collision checks."""
+    return short_id(
+        {
+            "optimization_id": request.optimization_id,
+            "actions": list(request.actions),
+            "tenant_id": request.tenant_id,
+        },
+        length=64,
+        prefix="optimizer-update-input:",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +298,14 @@ class OptimizationUpdateResult:
 
     @property
     def changed(self) -> bool:
-        return any(item.changed and not item.rolled_back for item in self.updates)
+        return any(
+            (item.changed or item.state_uncertain) and not item.rolled_back
+            for item in self.updates
+        )
+
+    @property
+    def state_uncertain(self) -> bool:
+        return any(item.state_uncertain for item in self.updates)
 
     @property
     def propagation_context(self) -> EventPropagationContext:
@@ -273,7 +319,7 @@ class OptimizationUpdateResult:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "request_id": self.request_id,
             "optimization_id": self.optimization_id,
             "success": self.success,
@@ -286,6 +332,9 @@ class OptimizationUpdateResult:
             "tenant_id": self.tenant_id,
             "error": self.error,
         }
+        if self.state_uncertain:
+            data["state_uncertain"] = True
+        return data
 
 
 class OptimizationUpdateBoundary:
@@ -296,6 +345,7 @@ class OptimizationUpdateBoundary:
         "_inflight",
         "_last_context",
         "_lock",
+        "_request_fingerprints",
         "_results",
         "_subscriber_id",
         "optimizer",
@@ -322,6 +372,7 @@ class OptimizationUpdateBoundary:
         self._inflight: dict[str, ThreadEvent] = {}
         self._last_context: EventPropagationContext | None = None
         self._lock = RLock()
+        self._request_fingerprints: dict[str, str] = {}
         self._results: dict[str, OptimizationUpdateResult] = {}
         self._subscriber_id = _text("subscriber_id", subscriber_id)
         self._configure()
@@ -356,6 +407,18 @@ class OptimizationUpdateBoundary:
         with self._lock:
             return self._results.get(request_id)
 
+    def _register_request_identity_locked(
+        self,
+        request: OptimizationUpdateRequest,
+    ) -> None:
+        current = _request_input_fingerprint(request)
+        previous = self._request_fingerprints.get(request.request_id)
+        if previous is not None and previous != current:
+            raise ValueError(
+                "idempotency key was reused with conflicting optimization input"
+            )
+        self._request_fingerprints[request.request_id] = current
+
     def request(
         self,
         optimization: Mapping[str, Any],
@@ -373,6 +436,7 @@ class OptimizationUpdateBoundary:
             idempotency_key=idempotency_key,
         )
         with self._lock:
+            self._register_request_identity_locked(request)
             existing = self._results.get(request.request_id)
             if existing is not None:
                 return existing
@@ -470,6 +534,7 @@ class OptimizationUpdateBoundary:
         context: EventPropagationContext,
     ) -> OptimizationUpdateResult:
         with self._lock:
+            self._register_request_identity_locked(request)
             existing = self._results.get(request.request_id)
             if existing is not None:
                 return existing
@@ -533,6 +598,21 @@ class OptimizationUpdateBoundary:
                         "action": update.action,
                         "target": update.target.value,
                         "change": update.result,
+                        **(
+                            {"idempotency_key": update.idempotency_key}
+                            if update.idempotency_key is not None
+                            else {}
+                        ),
+                        **(
+                            {"parent_idempotency_key": update.parent_idempotency_key}
+                            if update.parent_idempotency_key is not None
+                            else {}
+                        ),
+                        **(
+                            {"rollback_idempotency_key": update.rollback_idempotency_key}
+                            if update.rollback_idempotency_key is not None
+                            else {}
+                        ),
                     },
                     result_context,
                     category=event_category,
@@ -540,7 +620,11 @@ class OptimizationUpdateBoundary:
         result_context = self._publish(
             "OptimizationUpdateCompleted" if result.success else "OptimizationUpdateFailed",
             EventType.COMPLETE if result.success else EventType.FAILURE,
-            {"request": request.to_dict(), "result": result.to_dict()},
+            {
+                "request": request.to_dict(),
+                "result": result.to_dict(),
+                **({"state_uncertain": True} if result.state_uncertain else {}),
+            },
             result_context,
         )
         evidence_boundary = self._evidence_boundary
@@ -569,7 +653,12 @@ class OptimizationUpdateBoundary:
         if target is None:
             raise ValueError(f"unsupported optimization action result: {action}")
         value = getattr(item, "result", None)
-        changed = bool(value.get("changed", False)) if isinstance(value, Mapping) else bool(getattr(item, "success", False))
+        state_uncertain = bool(getattr(item, "state_uncertain", False))
+        changed = (
+            bool(value.get("changed", False))
+            if isinstance(value, Mapping)
+            else bool(getattr(item, "success", False))
+        ) or state_uncertain
         return OptimizationUpdate(
             action=action,
             target=target,
@@ -578,6 +667,10 @@ class OptimizationUpdateBoundary:
             result=value,
             rolled_back=bool(getattr(item, "rolled_back", False)),
             error=getattr(item, "error", None),
+            state_uncertain=state_uncertain,
+            idempotency_key=getattr(item, "idempotency_key", None),
+            parent_idempotency_key=getattr(item, "parent_idempotency_key", None),
+            rollback_idempotency_key=getattr(item, "rollback_idempotency_key", None),
         )
 
     def _publish(
