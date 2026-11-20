@@ -9,6 +9,9 @@ from collections.abc import Mapping, Sequence
 from os import PathLike
 from pathlib import Path
 
+from infrastructure.security.persistent_operation_store import (
+    SQLiteReplayOperationStore,
+)
 from infrastructure.security.persistent_replay_ops import (
     DatabaseReadinessReport,
     PersistentReplayReadinessError,
@@ -90,11 +93,12 @@ def provision_persistent_replay_database(
             f"refusing to provision an existing database path: {path}"
         ) from exc
 
-    # These constructors initialize the two schemas in the reserved file. Keep
-    # the file on error so an operator can inspect it; never auto-delete it.
+    # These constructors initialize all persistent replay schemas in the
+    # reserved file. Keep it on error for operator inspection.
     SQLiteEvidenceStore(path, timeout_seconds=timeout)
     SQLiteReplayClaimStore(path, timeout_seconds=timeout)
     SQLiteReplayStageStore(path, timeout_seconds=timeout)
+    SQLiteReplayOperationStore(path, timeout_seconds=timeout)
     return check_database(path, timeout_seconds=timeout)
 
 

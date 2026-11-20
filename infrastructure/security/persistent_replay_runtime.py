@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 
+from infrastructure.security.persistent_operation_store import (
+    SQLiteReplayOperationStore,
+)
 from infrastructure.security.persistent_replay_ops import check_database
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
@@ -79,12 +82,13 @@ def resolve_persistent_replay_database_path(
 
 @dataclass(frozen=True, slots=True)
 class PersistentReplayStores:
-    """One validated database path and its three persistent stores."""
+    """One validated database path and its persistent replay stores."""
 
     database_path: Path
     evidence_store: SQLiteEvidenceStore
     replay_claim_store: SQLiteReplayClaimStore
     replay_stage_store: SQLiteReplayStageStore | None = None
+    replay_operation_store: SQLiteReplayOperationStore | None = None
 
     def __post_init__(self) -> None:
         path = Path(self.database_path).expanduser().resolve()
@@ -105,6 +109,21 @@ class PersistentReplayStores:
                 raise ValueError(
                     "replay_stage_store database path does not match database_path"
                 )
+        if self.replay_operation_store is not None:
+            if self.replay_stage_store is None:
+                raise ValueError(
+                    "replay_operation_store requires replay_stage_store"
+                )
+            if not isinstance(
+                self.replay_operation_store, SQLiteReplayOperationStore
+            ):
+                raise TypeError(
+                    "replay_operation_store must be SQLiteReplayOperationStore or None"
+                )
+            if self.replay_operation_store.database_path != path:
+                raise ValueError(
+                    "replay_operation_store database path does not match database_path"
+                )
         object.__setattr__(self, "database_path", path)
 
 
@@ -115,7 +134,7 @@ def create_persistent_replay_stores(
     create_if_missing: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> PersistentReplayStores:
-    """Create paired runtime stores after checking database lifecycle state.
+    """Create runtime stores after checking database lifecycle state.
 
     Existing databases are validated before either store is opened. Missing
     databases fail closed by default so a misspelled path cannot silently start
@@ -148,10 +167,14 @@ def create_persistent_replay_stores(
     evidence_store = SQLiteEvidenceStore(path, timeout_seconds=timeout)
     replay_claim_store = SQLiteReplayClaimStore(path, timeout_seconds=timeout)
     replay_stage_store = SQLiteReplayStageStore(path, timeout_seconds=timeout)
+    replay_operation_store = SQLiteReplayOperationStore(
+        path, timeout_seconds=timeout
+    )
     check_database(path, timeout_seconds=timeout)
     return PersistentReplayStores(
         database_path=path,
         evidence_store=evidence_store,
         replay_claim_store=replay_claim_store,
         replay_stage_store=replay_stage_store,
+        replay_operation_store=replay_operation_store,
     )

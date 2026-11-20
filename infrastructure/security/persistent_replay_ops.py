@@ -17,6 +17,12 @@ from pathlib import Path
 
 from foundation.utils.hash import short_id
 from infrastructure.security import EvidenceRecord
+from infrastructure.security.persistent_operation_store import (
+    ReplayOperationKey,
+    ReplayOperationKind,
+    ReplayOperationStatus,
+    _decode_replay_operation_result,
+)
 from infrastructure.security.persistent_store import ReplayStageKey
 
 __all__ = [
@@ -50,6 +56,26 @@ _STAGE_COLUMNS = {
     "cycle_id",
     "cycle_fingerprint",
     "stage_name",
+    "input_fingerprint",
+    "state",
+    "generation",
+    "attempts",
+    "owner_token",
+    "result_json",
+    "result_integrity",
+    "updated_at",
+}
+_OPERATION_TABLE = "sh3_replay_operations"
+_OPERATION_COLUMNS = {
+    "tenant_scope",
+    "idempotency_key",
+    "cycle_id",
+    "cycle_fingerprint",
+    "parent_stage_key",
+    "operation_kind",
+    "operation_name",
+    "ordinal",
+    "parent_operation_key",
     "input_fingerprint",
     "state",
     "generation",
@@ -127,6 +153,7 @@ class DatabaseReadinessReport:
     pending_evidence_reconciliation_count: int = 0
     pending_evidence_reconciliations: tuple[PendingEvidenceReconciliation, ...] = field(default=(), repr=False)
     replay_stage_execution_count: int = 0
+    replay_operation_execution_count: int = 0
 
 
 def _timeout(value: float) -> float:
@@ -565,6 +592,301 @@ def _validate_replay_stage_rows(
 
     return count
 
+
+def _require_replay_operation_schema(connection: sqlite3.Connection) -> None:
+    table_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (_OPERATION_TABLE,),
+    ).fetchone()
+    table_sql = (
+        "" if table_sql_row is None or table_sql_row[0] is None else str(table_sql_row[0])
+    )
+    normalized_sql = "".join(table_sql.lower().split())
+    required_checks = (
+        "operation_kindtextnotnullcheck(operation_kindin('action','rollback'))",
+        "statetextnotnullcheck(statein('claimed','completed'))",
+        "ordinalintegernotnullcheck(ordinal>=0)",
+        "generationintegernotnullcheck(generation>=1)",
+        "attemptsintegernotnullcheck(attempts>=1)",
+        "ordinalintegernotnullcheck(ordinal>=0)",
+        "generationintegernotnullcheck(generation>=1)",
+        "attemptsintegernotnullcheck(attempts>=1)",
+        "check((operation_kind='action'andparent_operation_keyisnull)or"
+        "(operation_kind='rollback'andparent_operation_keyisnotnull))",
+        "check((state='claimed'andowner_tokenisnotnullandresult_jsonisnulland"
+        "result_integrityisnull)or(state='completed'andowner_tokenisnulland"
+        "result_jsonisnotnullandresult_integrityisnotnull))",
+    )
+    if any(required not in normalized_sql for required in required_checks):
+        raise PersistentReplayReadinessError(
+            "database table sh3_replay_operations does not enforce the required operation checks"
+        )
+
+    rows = connection.execute(f"PRAGMA table_info({_OPERATION_TABLE})").fetchall()
+    actual = {str(row["name"]): row for row in rows}
+    if not _OPERATION_COLUMNS.issubset(actual):
+        missing = ", ".join(sorted(_OPERATION_COLUMNS - set(actual)))
+        raise PersistentReplayReadinessError(
+            f"database schema is missing required columns in {_OPERATION_TABLE}: {missing}"
+        )
+    primary_keys = tuple(
+        str(row["name"])
+        for row in sorted(rows, key=lambda item: int(item["pk"]))
+        if int(row["pk"]) > 0
+    )
+    if primary_keys != ("tenant_scope", "idempotency_key"):
+        raise PersistentReplayReadinessError(
+            "database table sh3_replay_operations must use "
+            "(tenant_scope, idempotency_key) as its composite primary key"
+        )
+    required_not_null = {
+        "tenant_scope",
+        "idempotency_key",
+        "cycle_id",
+        "cycle_fingerprint",
+        "parent_stage_key",
+        "operation_kind",
+        "operation_name",
+        "ordinal",
+        "input_fingerprint",
+        "state",
+        "generation",
+        "attempts",
+        "updated_at",
+    }
+    nullable = sorted(
+        name for name in required_not_null if not bool(actual[name]["notnull"])
+    )
+    if nullable:
+        raise PersistentReplayReadinessError(
+            "database schema requires NOT NULL columns in sh3_replay_operations: "
+            + ", ".join(nullable)
+        )
+
+    for index_name, expected_columns in (
+        ("sh3_replay_operations_cycle_state_idx", ("cycle_id", "state")),
+        (
+            "sh3_replay_operations_parent_stage_idx",
+            ("parent_stage_key", "operation_kind", "ordinal"),
+        ),
+    ):
+        index_rows = connection.execute(
+            f"PRAGMA index_list({_OPERATION_TABLE})"
+        ).fetchall()
+        index_row = next(
+            (row for row in index_rows if str(row["name"]) == index_name),
+            None,
+        )
+        if index_row is None:
+            raise PersistentReplayReadinessError(
+                f"database is missing required index {index_name}"
+            )
+        if bool(index_row["unique"]) or bool(index_row["partial"]):
+            raise PersistentReplayReadinessError(
+                f"index {index_name} must be non-unique and non-partial"
+            )
+        columns = tuple(
+            str(row["name"])
+            for row in connection.execute(
+                f"PRAGMA index_info({index_name})"
+            ).fetchall()
+        )
+        if columns != expected_columns:
+            raise PersistentReplayReadinessError(
+                f"index {index_name} must use ordered columns {expected_columns}"
+            )
+
+
+def _require_replay_operation_parent_foreign_keys(
+    connection: sqlite3.Connection,
+) -> None:
+    rows = connection.execute(
+        f"PRAGMA foreign_key_list({_OPERATION_TABLE})"
+    ).fetchall()
+    claim_links = [
+        row
+        for row in rows
+        if str(row["table"]) == _CLAIM_TABLE
+        and str(row["from"]) == "cycle_id"
+        and str(row["to"]) == "cycle_id"
+    ]
+    stage_links = [
+        row
+        for row in rows
+        if str(row["table"]) == _STAGE_TABLE
+        and str(row["from"]) == "parent_stage_key"
+        and str(row["to"]) == "idempotency_key"
+    ]
+    self_links = {
+        (str(row["from"]), str(row["to"]))
+        for row in rows
+        if str(row["table"]) == _OPERATION_TABLE
+    }
+    if len(claim_links) != 1 or len(stage_links) != 1 or self_links != {
+        ("tenant_scope", "tenant_scope"),
+        ("parent_operation_key", "idempotency_key"),
+    }:
+        raise PersistentReplayReadinessError(
+            "operation table must reference its replay claim, parent stage, "
+            "and tenant-scoped parent Action"
+        )
+
+
+def _validate_replay_operation_rows(connection: sqlite3.Connection) -> int:
+    rows = connection.execute(
+        "SELECT tenant_scope, idempotency_key, cycle_id, cycle_fingerprint, "
+        "parent_stage_key, operation_kind, operation_name, ordinal, "
+        "parent_operation_key, input_fingerprint, state, generation, attempts, "
+        "owner_token, result_json, result_integrity, updated_at "
+        "FROM sh3_replay_operations ORDER BY tenant_scope, idempotency_key"
+    ).fetchall()
+    count = 0
+    for row in rows:
+        try:
+            tenant_scope = row["tenant_scope"]
+            if not isinstance(tenant_scope, str):
+                raise ValueError("operation tenant scope is invalid")
+            if isinstance(row["ordinal"], bool) or not isinstance(row["ordinal"], int):
+                raise ValueError("operation ordinal is invalid")
+            key = ReplayOperationKey(
+                idempotency_key=_required_text("idempotency_key", row["idempotency_key"]),
+                tenant_id=tenant_scope or None,
+                cycle_id=_required_text("cycle_id", row["cycle_id"]),
+                cycle_fingerprint=_required_text(
+                    "cycle_fingerprint", row["cycle_fingerprint"]
+                ),
+                parent_stage_key=_required_text(
+                    "parent_stage_key", row["parent_stage_key"]
+                ),
+                operation_kind=ReplayOperationKind(
+                    _required_text("operation_kind", row["operation_kind"])
+                ),
+                operation_name=_required_text(
+                    "operation_name", row["operation_name"]
+                ),
+                ordinal=row["ordinal"],
+                input_fingerprint=_required_text(
+                    "input_fingerprint", row["input_fingerprint"]
+                ),
+                parent_operation_key=(
+                    None
+                    if row["parent_operation_key"] is None
+                    else _required_text(
+                        "parent_operation_key", row["parent_operation_key"]
+                    )
+                ),
+            )
+            state = _required_text("state", row["state"])
+            generation = row["generation"]
+            attempts = row["attempts"]
+            updated_at = row["updated_at"]
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 1
+                or isinstance(attempts, bool)
+                or not isinstance(attempts, int)
+                or attempts < 1
+            ):
+                raise ValueError("operation generation or attempts are invalid")
+            if (
+                isinstance(updated_at, bool)
+                or not isinstance(updated_at, (int, float))
+                or not math.isfinite(float(updated_at))
+            ):
+                raise ValueError("operation updated_at is invalid")
+            parent_claim = connection.execute(
+                "SELECT fingerprint, state, generation, owner_token "
+                "FROM sh3_replay_claims WHERE cycle_id = ?",
+                (key.cycle_id,),
+            ).fetchone()
+            if (
+                parent_claim is None
+                or parent_claim["fingerprint"] != key.cycle_fingerprint
+                or generation > int(parent_claim["generation"])
+                or (
+                    state == ReplayOperationStatus.CLAIMED.value
+                    and parent_claim["state"] == "completed"
+                )
+                or (
+                    state == ReplayOperationStatus.CLAIMED.value
+                    and parent_claim["state"] == "claimed"
+                    and generation == int(parent_claim["generation"])
+                    and row["owner_token"] != parent_claim["owner_token"]
+                )
+            ):
+                raise ValueError("operation row does not match its parent replay claim")
+            parent_stage = connection.execute(
+                "SELECT cycle_id, cycle_fingerprint, state, generation, owner_token "
+                "FROM sh3_replay_stage_executions WHERE idempotency_key = ?",
+                (key.parent_stage_key,),
+            ).fetchone()
+            if (
+                parent_stage is None
+                or parent_stage["cycle_id"] != key.cycle_id
+                or parent_stage["cycle_fingerprint"] != key.cycle_fingerprint
+                or generation > int(parent_stage["generation"])
+                or (
+                    state == ReplayOperationStatus.CLAIMED.value
+                    and parent_stage["state"] == ReplayOperationStatus.COMPLETED.value
+                )
+                or (
+                    state == ReplayOperationStatus.CLAIMED.value
+                    and generation == int(parent_stage["generation"])
+                    and row["owner_token"] != parent_stage["owner_token"]
+                )
+            ):
+                raise ValueError("operation row does not match its parent stage")
+
+            if key.operation_kind is ReplayOperationKind.ROLLBACK:
+                parent_operation = connection.execute(
+                    "SELECT operation_kind, operation_name, ordinal, cycle_id, "
+                    "cycle_fingerprint, parent_stage_key, state "
+                    "FROM sh3_replay_operations "
+                    "WHERE tenant_scope = ? AND idempotency_key = ?",
+                    (key.tenant_scope, key.parent_operation_key),
+                ).fetchone()
+                if (
+                    parent_operation is None
+                    or parent_operation["operation_kind"] != "action"
+                    or parent_operation["operation_name"] != key.operation_name
+                    or parent_operation["ordinal"] != key.ordinal
+                    or parent_operation["cycle_id"] != key.cycle_id
+                    or parent_operation["cycle_fingerprint"] != key.cycle_fingerprint
+                    or parent_operation["parent_stage_key"] != key.parent_stage_key
+                    or parent_operation["state"] != "completed"
+                ):
+                    raise ValueError("Rollback row has no matching completed parent Action")
+
+            owner_token = row["owner_token"]
+            result_json = row["result_json"]
+            result_integrity = row["result_integrity"]
+            if state == ReplayOperationStatus.CLAIMED.value:
+                if (
+                    not isinstance(owner_token, str)
+                    or not owner_token.strip()
+                    or result_json is not None
+                    or result_integrity is not None
+                ):
+                    raise ValueError("claimed operation state is inconsistent")
+            elif state == ReplayOperationStatus.COMPLETED.value:
+                if (
+                    owner_token is not None
+                    or not isinstance(result_json, str)
+                    or not isinstance(result_integrity, str)
+                ):
+                    raise ValueError("completed operation state is inconsistent")
+                _decode_replay_operation_result(result_json, result_integrity)
+            else:
+                raise ValueError("operation state is unknown")
+        except Exception as exc:
+            raise PersistentReplayReadinessError(
+                "replay operation result or row identity/ownership verification failed"
+            ) from exc
+        count += 1
+    return count
+
+
 def check_database(
     database_path: str | os.PathLike[str],
     *,
@@ -699,6 +1021,7 @@ def check_database(
                 now = time.time()
                 replay_claim_count = 0
                 replay_stage_execution_count = 0
+                replay_operation_execution_count = 0
                 expired_claim_count = 0
                 pending_evidence_reconciliation_count = 0
                 pending_evidence_reconciliations: list[PendingEvidenceReconciliation] = []
@@ -778,6 +1101,12 @@ def check_database(
                     replay_stage_execution_count = _validate_replay_stage_rows(
                         connection
                     )
+                if _OPERATION_TABLE in tables:
+                    _require_replay_operation_schema(connection)
+                    _require_replay_operation_parent_foreign_keys(connection)
+                    replay_operation_execution_count = (
+                        _validate_replay_operation_rows(connection)
+                    )
                 journal_row = connection.execute("PRAGMA journal_mode").fetchone()
                 journal_mode = str(journal_row[0]).lower() if journal_row else "unknown"
             finally:
@@ -800,6 +1129,7 @@ def check_database(
         pending_evidence_reconciliation_count=pending_evidence_reconciliation_count,
         pending_evidence_reconciliations=tuple(pending_evidence_reconciliations),
         replay_stage_execution_count=replay_stage_execution_count,
+        replay_operation_execution_count=replay_operation_execution_count,
     )
 
 
