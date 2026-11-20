@@ -18,6 +18,9 @@ from foundation.utils.logging import error, info
 from infrastructure.event_bus import EventPublisher
 from infrastructure.events import Event, EventPropagationContext
 from infrastructure.security import EvidenceStore
+from infrastructure.security.persistent_operation_store import (
+    SQLiteReplayOperationStore,
+)
 from infrastructure.security.persistent_store import (
     SQLiteEvidenceStore,
     SQLiteReplayClaimStore,
@@ -53,6 +56,7 @@ class SH3Kernel:
         "policy",
         "recovery_execution_boundary",
         "recovery_strategy_boundary",
+        "replay_operation_store",
         "replay_stage_store",
         "runtime",
         "system_optimizer",
@@ -65,6 +69,7 @@ class SH3Kernel:
         evidence_store: EvidenceStore | None = None,
         replay_claim_store: SQLiteReplayClaimStore | None = None,
         replay_stage_store: SQLiteReplayStageStore | None = None,
+        replay_operation_store: SQLiteReplayOperationStore | None = None,
     ) -> None:
         if evidence_store is not None and not isinstance(evidence_store, EvidenceStore):
             raise TypeError("evidence_store must be EvidenceStore or None")
@@ -85,6 +90,19 @@ class SH3Kernel:
                 raise ValueError(
                     "replay claim and stage stores must share one SQLite database"
                 )
+        if replay_operation_store is not None:
+            if replay_claim_store is None or replay_stage_store is None:
+                raise ValueError(
+                    "replay_operation_store requires replay_claim_store and replay_stage_store"
+                )
+            if replay_operation_store.database_path != replay_claim_store.database_path:
+                raise ValueError(
+                    "operation and replay claim stores must share one SQLite database"
+                )
+            if replay_operation_store.database_path != replay_stage_store.database_path:
+                raise ValueError(
+                    "operation and replay stage stores must share one SQLite database"
+                )
         if replay_claim_store is not None:
             if not isinstance(evidence_store, SQLiteEvidenceStore):
                 raise ValueError("replay_claim_store requires SQLiteEvidenceStore")
@@ -94,6 +112,7 @@ class SH3Kernel:
         self._last_event_id: str | None = None
         self._propagation_context: EventPropagationContext | None = None
         self.replay_stage_store = replay_stage_store
+        self.replay_operation_store = replay_operation_store
 
         self.runtime = RuntimeCore(event_publisher=event_publisher)
         self.context_manager = ContextManager()
@@ -132,6 +151,7 @@ class SH3Kernel:
         self.system_optimizer = SystemOptimizer(
             self,
             event_publisher=event_publisher,
+            replay_operation_store=replay_operation_store,
         )
         from kernel.cognitive_learning_boundary import CognitiveLearningBoundary
         from kernel.learning_closed_loop_evidence_boundary import LearningClosedLoopEvidenceBoundary

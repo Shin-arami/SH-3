@@ -16,6 +16,7 @@ from foundation.utils.hash import short_id
 from foundation.utils.logging import error
 from infrastructure.event_bus import EventBus, EventPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from kernel.replay_execution_context import DurableOperationPersistenceError
 
 __all__ = [
     "OptimizationEvidenceRecorder",
@@ -454,6 +455,11 @@ class OptimizationUpdateBoundary:
                 raise RuntimeError(f"optimization update result not produced: {request.request_id}")
             return result
         try:
+            # Durable replay owner tokens are process-local. Execute the persistent
+            # request directly under its private ReplayExecutionContext rather than
+            # serializing that context through the EventBus request payload.
+            if bool(getattr(self.optimizer, "has_replay_execution_context", False)):
+                return self._execute(request, context)
             publisher = self.event_publisher
             event_bus = self._event_bus
             if publisher is None or event_bus is None:
@@ -558,6 +564,8 @@ class OptimizationUpdateBoundary:
             updates = tuple(self._normalize(item) for item in raw_results)
             success = all(item.success for item in updates) if updates else True
             error_message = next((item.error for item in updates if item.error), None)
+        except DurableOperationPersistenceError:
+            raise
         except Exception as exc:
             updates = ()
             success = False

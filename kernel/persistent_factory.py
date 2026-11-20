@@ -66,5 +66,6 @@ def create_persistent_sh3_kernel(
         evidence_store=stores.evidence_store,
         replay_claim_store=stores.replay_claim_store,
         replay_stage_store=stores.replay_stage_store,
+        replay_operation_store=stores.replay_operation_store,
     )
     return PersistentKernelRuntime(kernel=kernel, stores=stores)

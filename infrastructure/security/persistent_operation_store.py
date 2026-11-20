@@ -210,6 +210,39 @@ def _decode_replay_operation_result(
         ) from exc
 
 
+def _decode_replay_operation_plan(
+    actions_json: str,
+    expected_integrity: str,
+) -> tuple[str, ...]:
+    try:
+        raw = json.loads(actions_json)
+        if not isinstance(raw, Mapping):
+            raise TypeError("operation plan must be a JSON object")
+        canonical = _canonical_json(raw)
+        if canonical != actions_json:
+            raise ValueError("operation plan is not canonical JSON")
+        if _operation_result_integrity(canonical) != expected_integrity:
+            raise PersistentEvidenceIntegrityError(
+                "persisted replay operation plan integrity failed"
+            )
+        version = raw.get("version")
+        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+            raise ValueError("unsupported optimizer action plan version")
+        actions = raw.get("actions")
+        if not isinstance(actions, list):
+            raise TypeError("operation plan actions must be a JSON array")
+        normalized: list[str] = []
+        for action in actions:
+            normalized.append(_text("action", action))
+        return tuple(normalized)
+    except PersistentEvidenceIntegrityError:
+        raise
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PersistentEvidenceIntegrityError(
+            "persisted replay operation plan is malformed"
+        ) from exc
+
+
 class SQLiteReplayOperationStore(_SQLiteDatabase):
     """Durable tenant-scoped Action/Rollback ledger sharing the replay database.
 
@@ -304,6 +337,27 @@ class SQLiteReplayOperationStore(_SQLiteDatabase):
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS sh3_replay_operations_parent_stage_idx "
                 "ON sh3_replay_operations(parent_stage_key, operation_kind, ordinal)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sh3_replay_operation_plans (
+                    tenant_scope TEXT NOT NULL,
+                    parent_stage_key TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    cycle_fingerprint TEXT NOT NULL,
+                    plan_version INTEGER NOT NULL CHECK (plan_version >= 1),
+                    actions_json TEXT NOT NULL,
+                    actions_integrity TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK (generation >= 1),
+                    owner_token TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (tenant_scope, parent_stage_key),
+                    FOREIGN KEY (cycle_id)
+                        REFERENCES sh3_replay_claims(cycle_id),
+                    FOREIGN KEY (parent_stage_key)
+                        REFERENCES sh3_replay_stage_executions(idempotency_key)
+                )
+                """
             )
 
     @staticmethod
@@ -773,6 +827,189 @@ class SQLiteReplayOperationStore(_SQLiteDatabase):
             except Exception:
                 self._rollback(connection)
                 raise
+
+    def get_or_create_action_plan(
+        self,
+        *,
+        tenant_id: str | None,
+        cycle_id: str,
+        cycle_fingerprint: str,
+        parent_stage_key: str,
+        owner_token: str,
+        generation: int,
+        actions: tuple[str, ...] | list[str],
+        now: datetime | None = None,
+    ) -> tuple[str, ...]:
+        """Persist the optimizer's ordered Action plan before executing it.
+
+        The first plan for a tenant-scoped parent Stage is immutable. A retry
+        returns that plan even when a restarted Runtime would currently propose
+        a different action list because its in-memory snapshot has changed.
+        The owner/generation metadata is advanced under the same SQLite write
+        transaction as the parent Claim and Stage validation.
+        """
+        if tenant_id is not None:
+            _text("tenant_id", tenant_id)
+        _text("cycle_id", cycle_id)
+        _text("cycle_fingerprint", cycle_fingerprint)
+        _text("parent_stage_key", parent_stage_key)
+        _text("owner_token", owner_token)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("generation must be a positive integer")
+        if not isinstance(actions, (tuple, list)):
+            raise TypeError("actions must be a list or tuple")
+        normalized_actions = tuple(_text("action", item) for item in actions)
+        encoded = _canonical_json(
+            {"version": 1, "actions": list(normalized_actions)}
+        )
+        integrity = _operation_result_integrity(encoded)
+        tenant_scope = tenant_id if tenant_id is not None else ""
+        current_time = SQLiteReplayClaimStore._now_timestamp(now)
+
+        with self._connection() as connection:
+            self._begin(connection)
+            try:
+                claim = connection.execute(
+                    "SELECT fingerprint, state, generation, owner_token, lease_expires_at "
+                    "FROM sh3_replay_claims WHERE cycle_id = ?",
+                    (cycle_id,),
+                ).fetchone()
+                if claim is None:
+                    raise ReplayClaimOwnershipError(
+                        f"replay claim is missing for {cycle_id}"
+                    )
+                if claim[0] != cycle_fingerprint:
+                    raise ReplayOperationConflictError(
+                        f"replay fingerprint conflicts for {cycle_id}"
+                    )
+                if (
+                    claim[1] != "claimed"
+                    or claim[2] != generation
+                    or claim[3] != owner_token
+                    or claim[4] is None
+                    or float(claim[4]) <= current_time
+                ):
+                    raise ReplayClaimOwnershipError(
+                        f"replay claim ownership was lost for {cycle_id}"
+                    )
+
+                stage = connection.execute(
+                    "SELECT cycle_id, cycle_fingerprint, state, generation, owner_token "
+                    "FROM sh3_replay_stage_executions WHERE idempotency_key = ?",
+                    (parent_stage_key,),
+                ).fetchone()
+                if (
+                    stage is None
+                    or stage[0] != cycle_id
+                    or stage[1] != cycle_fingerprint
+                    or stage[2] != ReplayOperationStatus.CLAIMED.value
+                    or stage[3] != generation
+                    or stage[4] != owner_token
+                ):
+                    raise ReplayClaimOwnershipError(
+                        "optimizer action plan requires the active parent Stage owner and generation"
+                    )
+
+                existing = connection.execute(
+                    "SELECT cycle_id, cycle_fingerprint, plan_version, actions_json, "
+                    "actions_integrity, generation, owner_token "
+                    "FROM sh3_replay_operation_plans "
+                    "WHERE tenant_scope = ? AND parent_stage_key = ?",
+                    (tenant_scope, parent_stage_key),
+                ).fetchone()
+                if existing is None:
+                    connection.execute(
+                        "INSERT INTO sh3_replay_operation_plans "
+                        "(tenant_scope, parent_stage_key, cycle_id, cycle_fingerprint, "
+                        "plan_version, actions_json, actions_integrity, generation, "
+                        "owner_token, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                        (
+                            tenant_scope,
+                            parent_stage_key,
+                            cycle_id,
+                            cycle_fingerprint,
+                            encoded,
+                            integrity,
+                            generation,
+                            owner_token,
+                            current_time,
+                        ),
+                    )
+                    result = normalized_actions
+                else:
+                    if (
+                        existing[0] != cycle_id
+                        or existing[1] != cycle_fingerprint
+                        or isinstance(existing[2], bool)
+                        or not isinstance(existing[2], int)
+                        or existing[2] != 1
+                    ):
+                        raise ReplayOperationConflictError(
+                            "optimizer action plan identity or version conflicts"
+                        )
+                    result = _decode_replay_operation_plan(existing[3], existing[4])
+                    stored_generation = existing[5]
+                    stored_owner = existing[6]
+                    if (
+                        isinstance(stored_generation, bool)
+                        or not isinstance(stored_generation, int)
+                        or stored_generation < 1
+                    ):
+                        raise PersistentEvidenceIntegrityError(
+                            "persisted optimizer action plan generation is invalid"
+                        )
+                    if stored_generation > generation:
+                        raise ReplayClaimOwnershipError(
+                            "optimizer action plan is owned by a newer generation"
+                        )
+                    if stored_generation == generation and stored_owner != owner_token:
+                        raise ReplayClaimOwnershipError(
+                            "optimizer action plan is owned by another worker"
+                        )
+                    if stored_generation < generation:
+                        cursor = connection.execute(
+                            "UPDATE sh3_replay_operation_plans "
+                            "SET generation = ?, owner_token = ?, updated_at = ? "
+                            "WHERE tenant_scope = ? AND parent_stage_key = ? "
+                            "AND generation = ? AND owner_token = ?",
+                            (
+                                generation,
+                                owner_token,
+                                current_time,
+                                tenant_scope,
+                                parent_stage_key,
+                                stored_generation,
+                                stored_owner,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise ReplayClaimOwnershipError(
+                                "optimizer action plan ownership takeover was lost"
+                            )
+                self._commit(connection)
+                return result
+            except Exception:
+                self._rollback(connection)
+                raise
+
+    def count_plans(self, *, cycle_id: str | None = None) -> int:
+        if cycle_id is not None:
+            _text("cycle_id", cycle_id)
+        with self._connection() as connection:
+            if cycle_id is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM sh3_replay_operation_plans"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM sh3_replay_operation_plans WHERE cycle_id = ?",
+                    (cycle_id,),
+                ).fetchone()
+        return int(row[0])
 
     def count(self, *, cycle_id: str | None = None) -> int:
         if cycle_id is not None:

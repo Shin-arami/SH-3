@@ -23,6 +23,10 @@ from infrastructure.security.persistent_store import (
     SQLiteReplayStageStore,
 )
 from kernel.optimizer_update_boundary import OptimizationUpdateBoundary
+from kernel.replay_execution_context import (
+    DurableOperationPersistenceError,
+    ReplayExecutionContext,
+)
 
 __all__ = [
     "LEARNING_RESULT_DOMAIN",
@@ -537,11 +541,37 @@ class LearningOptimizerBoundary:
                     stage_key.idempotency_key,
                 )
 
-            result = self._execute(
-                request,
-                request_context,
-                idempotency_key=stage_key.idempotency_key,
+            replay_operation_store = getattr(
+                self.optimizer, "replay_operation_store", None
             )
+            replay_scope = getattr(self.optimizer, "replay_execution_scope", None)
+            if replay_operation_store is not None:
+                if not callable(replay_scope):
+                    raise TypeError(
+                        "persistent optimizer backend with an operation store must expose replay_execution_scope"
+                    )
+                if stage_execution.owner_token is None:
+                    raise RuntimeError("claimed optimizer stage has no owner token")
+                replay_context = ReplayExecutionContext(
+                    cycle_id=replay_cycle_id,
+                    cycle_fingerprint=replay_cycle_fingerprint,
+                    parent_stage_key=stage_key.idempotency_key,
+                    owner_token=stage_execution.owner_token,
+                    generation=stage_execution.generation,
+                    tenant_id=request_context.tenant_id,
+                )
+                with replay_scope(replay_context):
+                    result = self._execute(
+                        request,
+                        request_context,
+                        idempotency_key=stage_key.idempotency_key,
+                    )
+            else:
+                result = self._execute(
+                    request,
+                    request_context,
+                    idempotency_key=stage_key.idempotency_key,
+                )
             stage_result = _stage_json_value(result.to_dict())
             if not isinstance(stage_result, Mapping):
                 raise TypeError("persistent optimizer result must normalize to a mapping")
@@ -785,6 +815,8 @@ class LearningOptimizerBoundary:
                 if idempotency_key is not None:
                     optimization = _stage_json_value(optimization)
                 error_message = None
+            except DurableOperationPersistenceError:
+                raise
             except Exception as exc:
                 optimizer_context = getattr(self.optimizer, "propagation_context", None)
                 if (
