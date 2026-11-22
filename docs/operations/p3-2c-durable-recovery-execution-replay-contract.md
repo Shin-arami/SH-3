@@ -60,14 +60,23 @@ does not publish the `OptimizerHealingRequested` or
 `RecoveryExecutionRequested` START events. Non-ledger legacy requests retain
 the previous EventBus request behavior.
 
-When a Recovery backend execution reaches a normal terminal outcome, the
-`RecoveryExecutionCompleted` or `RecoveryExecutionFailed` event is published
-only after its Operation Ledger outcome and parent Stage have both been
-persisted successfully. When a previously completed Operation or Stage is
-restored, `RecoveryExecutionBoundary` returns the restored result directly and
-does not republish a Recovery Execution terminal event. The enclosing
-Optimizer Healing request can publish `OptimizerHealingCompleted` or
-`OptimizerHealingFailed` when it reaches its own normal terminal path.
+When a Recovery backend execution reaches a normal terminal outcome and an
+event publisher is configured, the terminal Event object is prepared before
+finalization so its event ID can remain the result's causation ID. The publisher
+is invoked only after its Operation Ledger outcome and parent Stage have both
+been persisted successfully. If no publisher is configured or event
+preparation fails, no Recovery Execution terminal event is emitted; the durable
+Operation and Stage records remain the source of truth. A process can still
+stop after both commits and before the publish call; this contract does not
+provide a transactional event outbox or guarantee terminal event delivery
+across that final crash window. Publisher delivery failures are best-effort
+notifications and do not undo the committed Recovery outcome. When a previously
+completed Operation or Stage is restored, `RecoveryExecutionBoundary` returns
+the restored result directly and does not republish a Recovery Execution
+terminal event. The enclosing Optimizer Healing request can publish
+`OptimizerHealingCompleted` or `OptimizerHealingFailed` when it reaches its
+own normal terminal path. Consumers must treat the durable replay records as
+the source of truth rather than relying only on event delivery.
 
 An Operation Ledger claim, Operation result restoration, Operation completion,
 or parent Stage finalization failure raises `DurableOperationPersistenceError`

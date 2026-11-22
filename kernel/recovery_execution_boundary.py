@@ -720,23 +720,59 @@ class RecoveryExecutionBoundary:
             success = True
         except Exception as exc:
             error_message = str(exc)
-        final_context = self._publish(
-            "RecoveryExecutionCompleted" if success else "RecoveryExecutionFailed",
-            EventType.COMPLETE if success else EventType.FAILURE,
-            {
-                "request_id": request.request_id,
-                "failure_id": request.failure_id,
-                "strategy": request.strategy,
-                "success": success,
-                **(
-                    {"idempotency_key": replay_claim[0].idempotency_key}
-                    if replay_claim is not None
-                    else {}
-                ),
-                **({"result": value} if success else {"error": error_message or "recovery execution failed"}),
-            },
-            context,
+        event_name = (
+            "RecoveryExecutionCompleted" if success else "RecoveryExecutionFailed"
         )
+        event_type = EventType.COMPLETE if success else EventType.FAILURE
+        event_payload: dict[str, Any] = {
+            "request_id": request.request_id,
+            "failure_id": request.failure_id,
+            "strategy": request.strategy,
+            "success": success,
+            **(
+                {"idempotency_key": replay_claim[0].idempotency_key}
+                if replay_claim is not None
+                else {}
+            ),
+            **(
+                {"result": value}
+                if success
+                else {"error": error_message or "recovery execution failed"}
+            ),
+        }
+        terminal_event: Event | None = None
+        terminal_publisher: EventPublisher | None = None
+        final_context = context
+        if operation_claim is None:
+            # Preserve the legacy non-ledger and Stage-only event lifecycle.
+            final_context = self._publish(
+                event_name, event_type, event_payload, context
+            )
+        else:
+            # Prepare the immutable event before persistence so its ID remains
+            # the result's causation ID. Dispatch is deliberately deferred until
+            # both the Operation Ledger and parent Stage have committed.
+            terminal_publisher = self.event_publisher
+            if terminal_publisher is not None:
+                try:
+                    terminal_event = Event.create(
+                        event_name=event_name,
+                        producer=self._subscriber_id,
+                        payload=event_payload,
+                        category=Category.ACTION,
+                        event_type=event_type,
+                        correlation_id=context.correlation_id,
+                        causation_id=context.causation_id,
+                        trace_id=context.trace_id,
+                        tenant_id=context.tenant_id,
+                    )
+                    final_context = context.next(terminal_event.metadata.event_id)
+                except Exception as exc:
+                    terminal_event = None
+                    error(
+                        "Recovery execution event preparation failed",
+                        {"event_name": event_name, "error": str(exc)},
+                    )
         result = RecoveryExecutionResult(
             request_id=request.request_id,
             strategy_request_id=request.strategy_request_id,
@@ -805,6 +841,16 @@ class RecoveryExecutionBoundary:
                 self._result_stage_keys[request.request_id] = replay_claim[0].idempotency_key
             else:
                 self._result_stage_keys.pop(request.request_id, None)
+        if terminal_event is not None and terminal_publisher is not None:
+            try:
+                terminal_publisher.publish(terminal_event)
+            except Exception as exc:
+                # The durable result is already committed. Notification failure
+                # must not turn that confirmed outcome into a Recovery failure.
+                error(
+                    "Recovery execution event publication failed",
+                    {"event_name": event_name, "error": str(exc)},
+                )
         return result
 
     def _publish(
