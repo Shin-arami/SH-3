@@ -34,6 +34,7 @@ from kernel.learning_optimizer_boundary import LearningOptimizerBoundary
 from kernel.optimizer_healing_boundary import OptimizerHealingBoundary
 from kernel.recovery_execution_boundary import RecoveryExecutionBoundary
 from kernel.recovery_strategy_boundary import RecoveryStrategyBoundary
+from kernel.replay_execution_context import DurableOperationPersistenceError
 
 __all__ = ["ClosedLoopStatus", "LearningClosedLoopCoordinator", "LearningClosedLoopReport"]
 
@@ -1037,6 +1038,8 @@ class LearningClosedLoopCoordinator:
                 ))
         except ReplayClaimOwnershipError:
             raise
+        except DurableOperationPersistenceError:
+            raise
         except Exception as exc:
             healing_error: Exception | None = None
             if recover:
@@ -1044,6 +1047,8 @@ class LearningClosedLoopCoordinator:
                     self._ensure_claim_ownership(cycle_id)
                     healing_result = self._recover("closed_loop", cycle_id, result, propagation, error=exc)
                     self._ensure_claim_ownership(cycle_id)
+                except DurableOperationPersistenceError:
+                    raise
                 except Exception as recovery_exc:
                     healing_error = recovery_exc
                     healing_result = None
@@ -1297,6 +1302,8 @@ class LearningClosedLoopCoordinator:
             return
         try:
             self.run(result, context=EventPropagationContext.from_event(event))
+        except DurableOperationPersistenceError:
+            raise
         except Exception as exc:
             error("Learning closed loop event handling failed", {"result_id": result.result_id, "error": str(exc)})
 

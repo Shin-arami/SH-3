@@ -17,11 +17,18 @@ from foundation.utils.hash import short_id
 from foundation.utils.logging import error
 from infrastructure.event_bus import EventBus, EventPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security.persistent_operation_store import (
+    ReplayOperationKey,
+    ReplayOperationKind,
+    ReplayOperationStatus,
+    SQLiteReplayOperationStore,
+)
 from infrastructure.security.persistent_store import (
     ReplayStageKey,
     SQLiteReplayStageStore,
 )
 from kernel.recovery_strategy_boundary import RecoveryStrategyResult
+from kernel.replay_execution_context import DurableOperationPersistenceError
 from self_healing.core import FailureSnapshot
 
 __all__ = [
@@ -243,6 +250,7 @@ class RecoveryExecutionBoundary:
         "_last_context",
         "_lock",
         "_pending",
+        "_replay_operation_store",
         "_replay_stage_store",
         "_result_stage_keys",
         "_results",
@@ -257,6 +265,7 @@ class RecoveryExecutionBoundary:
         *,
         subscriber_id: str = "recovery.execution-boundary",
         replay_stage_store: SQLiteReplayStageStore | None = None,
+        replay_operation_store: SQLiteReplayOperationStore | None = None,
     ) -> None:
         if backend is None:
             raise TypeError("backend must not be None")
@@ -288,8 +297,16 @@ class RecoveryExecutionBoundary:
                 raise TypeError(
                     "persistent recovery backend must accept idempotency_key"
                 )
+        if replay_operation_store is not None:
+            if not isinstance(replay_operation_store, SQLiteReplayOperationStore):
+                raise TypeError("replay_operation_store must be SQLiteReplayOperationStore or None")
+            if replay_stage_store is None:
+                raise ValueError("replay_operation_store requires replay_stage_store")
+            if replay_operation_store.database_path != replay_stage_store.database_path:
+                raise ValueError("recovery stage and operation stores must share one SQLite database")
         self.backend = backend
         self._replay_stage_store = replay_stage_store
+        self._replay_operation_store = replay_operation_store
         self._event_publisher = event_publisher
         self._event_bus: EventBus | None = None
         self._lock = RLock()
@@ -297,12 +314,21 @@ class RecoveryExecutionBoundary:
         self._result_stage_keys: dict[str, str] = {}
         self._pending: dict[
             str,
-            tuple[RecoveryExecutionRequest, FailureSnapshot, tuple[ReplayStageKey, str, int] | None],
+            tuple[
+                RecoveryExecutionRequest,
+                FailureSnapshot,
+                tuple[ReplayStageKey, str, int] | None,
+                tuple[ReplayOperationKey, str, int] | None,
+            ],
         ] = {}
         self._inflight: dict[str, ThreadEvent] = {}
         self._last_context: EventPropagationContext | None = None
         self._subscriber_id = _text("subscriber_id", subscriber_id)
         self._configure()
+
+    @property
+    def replay_operation_store(self) -> SQLiteReplayOperationStore | None:
+        return self._replay_operation_store
 
     @property
     def event_publisher(self) -> EventPublisher | None:
@@ -409,7 +435,7 @@ class RecoveryExecutionBoundary:
             if waiter is None:
                 waiter = ThreadEvent()
                 self._inflight[request.request_id] = waiter
-                self._pending[request.request_id] = (request, snapshot, None)
+                self._pending[request.request_id] = (request, snapshot, None, None)
                 leader = True
             else:
                 leader = False
@@ -424,14 +450,13 @@ class RecoveryExecutionBoundary:
 
         try:
             replay_claim: tuple[ReplayStageKey, str, int] | None = None
+            operation_claim: tuple[ReplayOperationKey, str, int] | None = None
             if replay_key is not None:
                 assert replay_owner is not None
                 assert replay_generation is not None
                 assert self._replay_stage_store is not None
                 stage_execution = self._replay_stage_store.begin(
-                    replay_key,
-                    replay_owner,
-                    replay_generation,
+                    replay_key, replay_owner, replay_generation
                 )
                 status_value = getattr(stage_execution.status, "value", stage_execution.status)
                 if str(status_value).lower() in {"completed", "replaystagestatus.completed"}:
@@ -440,27 +465,79 @@ class RecoveryExecutionBoundary:
                         raise RuntimeError(
                             "completed recovery execution stage has no mapping result"
                         )
-                    return self._restore_persisted_result(
-                        request,
-                        replay_key,
-                        persisted,
-                    )
+                    return self._restore_persisted_result(request, replay_key, persisted)
                 replay_claim = (replay_key, replay_owner, replay_generation)
+                if self._replay_operation_store is not None:
+                    try:
+                        operation_key = ReplayOperationKey.create(
+                            idempotency_key=short_id(
+                                {
+                                    "recovery_execution_stage_key": replay_key.idempotency_key,
+                                    "operation": "recovery_execution",
+                                },
+                                length=24,
+                                prefix="recovery-operation:",
+                            ),
+                            tenant_id=request.tenant_id,
+                            cycle_id=replay_key.cycle_id,
+                            cycle_fingerprint=replay_key.cycle_fingerprint,
+                            parent_stage_key=replay_key.idempotency_key,
+                            operation_kind=ReplayOperationKind.ACTION,
+                            operation_name="recovery_execution",
+                            ordinal=0,
+                            input_payload={
+                                "strategy": request.strategy,
+                                "stage_input": dict(replay_stage_input or {}),
+                            },
+                        )
+                        operation_execution = self._replay_operation_store.begin(
+                            operation_key, replay_owner, replay_generation
+                        )
+                    except Exception as exc:
+                        raise DurableOperationPersistenceError(
+                            "could not claim durable recovery execution outcome"
+                        ) from exc
+                    if operation_execution.status is ReplayOperationStatus.COMPLETED:
+                        persisted_operation = operation_execution.result
+                        if not isinstance(persisted_operation, Mapping):
+                            raise DurableOperationPersistenceError(
+                                "completed recovery operation has no persisted outcome"
+                            )
+                        try:
+                            restored = self._restore_persisted_result(
+                                request, replay_key, persisted_operation, cache_result=False
+                            )
+                            self._replay_stage_store.complete(
+                                replay_key, replay_owner, replay_generation, persisted_operation
+                            )
+                        except Exception as exc:
+                            raise DurableOperationPersistenceError(
+                                "could not restore or finalize the durable recovery outcome"
+                            ) from exc
+                        with self._lock:
+                            self._last_context = restored.propagation_context
+                            self._results[request.request_id] = restored
+                            self._result_stage_keys[request.request_id] = replay_key.idempotency_key
+                        return restored
+                    operation_claim = (operation_key, replay_owner, replay_generation)
                 with self._lock:
                     self._pending[request.request_id] = (
-                        request,
-                        snapshot,
-                        replay_claim,
+                        request, snapshot, replay_claim, operation_claim
                     )
 
+            # Durable recovery execution carries private owner/generation state.
+            # Execute synchronously instead of sending that scope through EventBus handlers.
+            if operation_claim is not None:
+                return self._execute(
+                    request, snapshot, context=context, replay_claim=replay_claim,
+                    operation_claim=operation_claim,
+                )
             publisher = self.event_publisher
             event_bus = self._event_bus
             if publisher is None or event_bus is None:
                 return self._execute(
-                    request,
-                    snapshot,
-                    context=context,
-                    replay_claim=replay_claim,
+                    request, snapshot, context=context, replay_claim=replay_claim,
+                    operation_claim=operation_claim,
                 )
             self._publish(
                 "RecoveryExecutionRequested",
@@ -521,7 +598,7 @@ class RecoveryExecutionBoundary:
             pending = self._pending.get(request_id)
         if pending is None:
             return
-        request, snapshot, replay_claim = pending
+        request, snapshot, replay_claim, operation_claim = pending
         context = EventPropagationContext.from_event(event)
         try:
             self._execute(
@@ -529,7 +606,10 @@ class RecoveryExecutionBoundary:
                 snapshot,
                 context=context,
                 replay_claim=replay_claim,
+                operation_claim=operation_claim,
             )
+        except DurableOperationPersistenceError:
+            raise
         except Exception as exc:
             self._publish(
                 "RecoveryExecutionFailed",
@@ -552,6 +632,8 @@ class RecoveryExecutionBoundary:
         request: RecoveryExecutionRequest,
         replay_key: ReplayStageKey,
         payload: Mapping[str, Any],
+        *,
+        cache_result: bool = True,
     ) -> RecoveryExecutionResult:
         if payload.get("schema_version") != 1:
             raise RuntimeError("unsupported recovery execution stage result schema")
@@ -593,10 +675,11 @@ class RecoveryExecutionBoundary:
             tenant_id=optional_text("tenant_id"),
             error=error_value,
         )
-        with self._lock:
-            self._last_context = restored.propagation_context
-            self._results[request.request_id] = restored
-            self._result_stage_keys[request.request_id] = replay_key.idempotency_key
+        if cache_result:
+            with self._lock:
+                self._last_context = restored.propagation_context
+                self._results[request.request_id] = restored
+                self._result_stage_keys[request.request_id] = replay_key.idempotency_key
         return restored
 
     def _execute(
@@ -606,6 +689,7 @@ class RecoveryExecutionBoundary:
         *,
         context: EventPropagationContext,
         replay_claim: tuple[ReplayStageKey, str, int] | None = None,
+        operation_claim: tuple[ReplayOperationKey, str, int] | None = None,
     ) -> RecoveryExecutionResult:
         with self._lock:
             existing = self._results.get(request.request_id)
@@ -671,10 +755,18 @@ class RecoveryExecutionBoundary:
             key, owner_token, generation = replay_claim
             if self._replay_stage_store is None:
                 raise RuntimeError("persistent recovery execution store is unavailable")
+            try:
+                persisted_value = _json_compatible(result.result)
+            except Exception as exc:
+                if operation_claim is not None:
+                    raise DurableOperationPersistenceError(
+                        "could not serialize the durable recovery execution outcome"
+                    ) from exc
+                raise
             persisted_result = {
                 "schema_version": 1,
                 "success": result.success,
-                "result": _json_compatible(result.result),
+                "result": persisted_value,
                 "created_at": result.created_at.isoformat(),
                 "correlation_id": result.correlation_id,
                 "causation_id": result.causation_id,
@@ -682,12 +774,30 @@ class RecoveryExecutionBoundary:
                 "tenant_id": result.tenant_id,
                 "error": result.error,
             }
-            self._replay_stage_store.complete(
-                key,
-                owner_token,
-                generation,
-                persisted_result,
-            )
+            if operation_claim is not None:
+                operation_key, operation_owner, operation_generation = operation_claim
+                if self._replay_operation_store is None:
+                    raise DurableOperationPersistenceError(
+                        "durable recovery operation store is unavailable"
+                    )
+                try:
+                    self._replay_operation_store.complete(
+                        operation_key, operation_owner, operation_generation, persisted_result
+                    )
+                except Exception as exc:
+                    raise DurableOperationPersistenceError(
+                        "could not persist the durable recovery execution outcome"
+                    ) from exc
+            try:
+                self._replay_stage_store.complete(
+                    key, owner_token, generation, persisted_result
+                )
+            except Exception as exc:
+                if operation_claim is not None:
+                    raise DurableOperationPersistenceError(
+                        "could not finalize the recovery Stage after its operation outcome was saved"
+                    ) from exc
+                raise
         with self._lock:
             self._last_context = final_context
             self._results[request.request_id] = result
@@ -721,6 +831,8 @@ class RecoveryExecutionBoundary:
             )
             publisher.publish(event)
             return context.next(event.metadata.event_id)
+        except DurableOperationPersistenceError:
+            raise
         except Exception as exc:
             error("Recovery execution event publication failed", {"event_name": event_name, "error": str(exc)})
             return context

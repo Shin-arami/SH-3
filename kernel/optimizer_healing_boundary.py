@@ -17,6 +17,7 @@ from infrastructure.events import Event, EventPropagationContext
 from kernel.learning_optimizer_boundary import LearningOptimizationResult
 from kernel.recovery_execution_boundary import RecoveryExecutionBoundary
 from kernel.recovery_strategy_boundary import RecoveryStrategyBoundary
+from kernel.replay_execution_context import DurableOperationPersistenceError
 
 __all__ = [
     "OptimizerHealingBoundary",
@@ -407,6 +408,11 @@ class OptimizerHealingBoundary:
         return self._execution_boundary
 
     @property
+    def replay_operation_store(self) -> Any:
+        boundary = self._execution_boundary
+        return None if boundary is None else boundary.replay_operation_store
+
+    @property
     def event_publisher(self) -> EventPublisher | None:
         with self._lock:
             return self._event_publisher
@@ -472,6 +478,14 @@ class OptimizerHealingBoundary:
             event_bus = self._event_bus
         if existing is not None:
             return existing
+        # Persistent Recovery owner/generation state is private process context.
+        # Dispatch it synchronously so durable persistence failures cannot be
+        # swallowed by EventBus delivery and converted into a missing-result error.
+        if (
+            request.replay_cycle_id is not None
+            and self.replay_operation_store is not None
+        ):
+            return self._execute(request, context)
         if publisher is None or event_bus is None:
             return self._execute(request, context)
         self._publish(
@@ -519,6 +533,8 @@ class OptimizerHealingBoundary:
         try:
             request = OptimizerHealingRequest.from_dict(payload)
             self._execute(request, EventPropagationContext.from_event(event))
+        except DurableOperationPersistenceError:
+            raise
         except Exception as exc:
             error(
                 "Optimizer healing boundary event handling failed",
@@ -595,6 +611,8 @@ class OptimizerHealingBoundary:
                 healing = value if isinstance(value, Mapping) else {"result": value}
                 result_context = self.healer.propagation_context or context
                 success = True
+            except DurableOperationPersistenceError:
+                raise
             except Exception as exc:
                 error_message = str(exc)
                 result_context = self.healer.propagation_context or context

@@ -199,6 +199,7 @@ class SH3Kernel:
             self.meta_controller.healer,
             event_publisher=event_publisher,
             replay_stage_store=replay_stage_store,
+            replay_operation_store=replay_operation_store,
         )
         self.optimizer_healing_boundary = OptimizerHealingBoundary(
             self.meta_controller.healer,
