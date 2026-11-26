@@ -73,6 +73,7 @@ def _initialize_semantically_corrupt_database(path: Path) -> None:
                 evidence.evidence_id,
             ),
         )
+    connection.close()
 
 
 @pytest.mark.parametrize("command", ("backup", "restore"), ids=("backup", "restore"))

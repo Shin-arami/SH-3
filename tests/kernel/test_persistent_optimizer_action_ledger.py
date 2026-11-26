@@ -682,3 +682,303 @@ def test_action_plan_readiness_rejects_tampered_manifest(tmp_path: Path) -> None
         match="operation plan identity, integrity, or ownership verification failed",
     ):
         check_database(database)
+
+@pytest.mark.parametrize(
+    (
+        "case_name",
+        "action_result",
+        "expected_success",
+        "expected_uncertain",
+    ),
+    [
+        (
+            "changed-true",
+            {"changed": True, "state": "mutation-applied"},
+            False,
+            True,
+        ),
+        (
+            "changed-false",
+            {"changed": False, "state": "no-mutation"},
+            True,
+            False,
+        ),
+        (
+            "changed-unknown",
+            {"observation": "changed flag is absent"},
+            False,
+            True,
+        ),
+    ],
+)
+def test_runtime_state_reconciliation_matrix_after_restart(
+    tmp_path: Path,
+    case_name: str,
+    action_result: dict[str, Any],
+    expected_success: bool,
+    expected_uncertain: bool,
+) -> None:
+    database_name = f"runtime-reconciliation-{case_name}.sqlite3"
+    (
+        first_kernel,
+        evidence,
+        claims,
+        stages,
+        operations,
+        first_claim,
+        stage_key,
+        first_scope,
+    ) = _manual_replay_scope(tmp_path, database_name)
+
+    action_name = "runtime_reconciliation_probe"
+    first_calls = 0
+    restarted_calls = 0
+
+    def apply_first(_: Any) -> dict[str, Any]:
+        nonlocal first_calls
+        first_calls += 1
+        return dict(action_result)
+
+    def rollback_noop(
+        _: Any,
+        *,
+        idempotency_key: str,
+    ) -> None:
+        _ = idempotency_key
+
+    first_kernel.system_optimizer.register_action(
+        OptimizationAction(action_name, apply_first, rollback_noop)
+    )
+    action_context = {"idempotency_key": stage_key.idempotency_key}
+
+    with first_kernel.system_optimizer.replay_execution_scope(first_scope):
+        first = first_kernel.system_optimizer.execute_actions(
+            (action_name,),
+            action_context,
+        )
+
+    assert first[0].success is True
+    assert first[0].result == action_result
+    assert first_calls == 1
+
+    operation_key = _action_idempotency_key(
+        stage_key.idempotency_key,
+        action_name,
+        0,
+    )
+    with sqlite3.connect(operations.database_path) as connection:
+        before_replay = connection.execute(
+            "SELECT state, generation, attempts, owner_token, result_json "
+            "FROM sh3_replay_operations "
+            "WHERE tenant_scope = ? AND idempotency_key = ?",
+            (TENANT_ID, operation_key),
+        ).fetchone()
+
+    assert before_replay is not None
+    assert before_replay[0] == "completed"
+    assert before_replay[1] == first_claim.generation
+    assert before_replay[2] == 1
+    assert before_replay[3] is None
+
+    assert first_claim.owner_token is not None
+    assert claims.release(
+        CYCLE_ID,
+        first_claim.owner_token,
+        first_claim.generation,
+        now=NOW,
+    )
+    second_claim = _claim(claims)
+    assert second_claim.owner_token is not None
+    assert second_claim.generation == first_claim.generation + 1
+
+    second_stage = stages.begin(
+        stage_key,
+        second_claim.owner_token,
+        second_claim.generation,
+        now=NOW,
+    )
+    assert second_stage.status is ReplayStageStatus.CLAIMED
+
+    restarted_kernel = _kernel(evidence, claims, stages, operations)
+
+    def forbidden_restart_apply(_: Any) -> dict[str, Any]:
+        nonlocal restarted_calls
+        restarted_calls += 1
+        return dict(action_result)
+
+    restarted_kernel.system_optimizer.register_action(
+        OptimizationAction(
+            action_name,
+            forbidden_restart_apply,
+            rollback_noop,
+        )
+    )
+    second_scope = ReplayExecutionContext(
+        cycle_id=CYCLE_ID,
+        cycle_fingerprint=CYCLE_FINGERPRINT,
+        parent_stage_key=stage_key.idempotency_key,
+        owner_token=second_claim.owner_token,
+        generation=second_claim.generation,
+        tenant_id=TENANT_ID,
+    )
+
+    with restarted_kernel.system_optimizer.replay_execution_scope(second_scope):
+        restored = restarted_kernel.system_optimizer.execute_actions(
+            (action_name,),
+            action_context,
+        )
+
+    assert first_calls == 1
+    assert restarted_calls == 0
+    assert restored[0].success is expected_success
+    assert restored[0].state_uncertain is expected_uncertain
+    assert restored[0].result == action_result
+
+    if expected_uncertain:
+        assert restored[0].error is not None
+        assert "reconciliation is required" in restored[0].error
+    else:
+        assert restored[0].error is None
+
+    with sqlite3.connect(operations.database_path) as connection:
+        after_replay = connection.execute(
+            "SELECT state, generation, attempts, owner_token, result_json "
+            "FROM sh3_replay_operations "
+            "WHERE tenant_scope = ? AND idempotency_key = ?",
+            (TENANT_ID, operation_key),
+        ).fetchone()
+
+    # Reconciliation must not rewrite or re-execute the completed Operation.
+    assert after_replay == before_replay
+    assert operations.count(cycle_id=CYCLE_ID) == 1
+
+
+def test_completed_failed_action_and_rollback_are_not_retried_after_runtime_takeover(
+    tmp_path: Path,
+) -> None:
+    (
+        first_kernel,
+        evidence,
+        claims,
+        stages,
+        operations,
+        first_claim,
+        stage_key,
+        first_scope,
+    ) = _manual_replay_scope(
+        tmp_path,
+        "failed-action-rollback-takeover.sqlite3",
+    )
+
+    calls = {"first": 0, "second": 0, "rollback": 0}
+
+    def apply_first(_: Any) -> dict[str, Any]:
+        calls["first"] += 1
+        return {"changed": True, "token": "first-action"}
+
+    def fail_rollback(
+        result: Any,
+        *,
+        idempotency_key: str,
+    ) -> None:
+        _ = result
+        _ = idempotency_key
+        calls["rollback"] += 1
+        raise RuntimeError("compensation outcome is uncertain")
+
+    def fail_second(_: Any) -> Any:
+        calls["second"] += 1
+        raise RuntimeError("second Action failed")
+
+    first_kernel.system_optimizer.register_action(
+        OptimizationAction("first", apply_first, fail_rollback)
+    )
+    first_kernel.system_optimizer.register_action(
+        OptimizationAction(
+            "second",
+            fail_second,
+            lambda result, *, idempotency_key: None,
+        )
+    )
+
+    action_context = {"idempotency_key": stage_key.idempotency_key}
+    with first_kernel.system_optimizer.replay_execution_scope(first_scope):
+        first = first_kernel.system_optimizer.execute_actions(
+            ("first", "second"),
+            action_context,
+        )
+
+    assert first[0].success is False
+    assert first[0].state_uncertain is True
+    assert first[1].success is False
+    assert first[1].state_uncertain is True
+    assert calls == {"first": 1, "second": 1, "rollback": 1}
+    assert operations.count(cycle_id=CYCLE_ID) == 3
+
+    assert first_claim.owner_token is not None
+    assert claims.release(
+        CYCLE_ID,
+        first_claim.owner_token,
+        first_claim.generation,
+        now=NOW,
+    )
+    second_claim = _claim(claims)
+    assert second_claim.owner_token is not None
+    assert second_claim.generation == first_claim.generation + 1
+
+    second_stage = stages.begin(
+        stage_key,
+        second_claim.owner_token,
+        second_claim.generation,
+        now=NOW,
+    )
+    assert second_stage.status is ReplayStageStatus.CLAIMED
+
+    restarted_kernel = _kernel(evidence, claims, stages, operations)
+    restarted_kernel.system_optimizer.register_action(
+        OptimizationAction("first", apply_first, fail_rollback)
+    )
+    restarted_kernel.system_optimizer.register_action(
+        OptimizationAction(
+            "second",
+            fail_second,
+            lambda result, *, idempotency_key: None,
+        )
+    )
+    second_scope = ReplayExecutionContext(
+        cycle_id=CYCLE_ID,
+        cycle_fingerprint=CYCLE_FINGERPRINT,
+        parent_stage_key=stage_key.idempotency_key,
+        owner_token=second_claim.owner_token,
+        generation=second_claim.generation,
+        tenant_id=TENANT_ID,
+    )
+
+    with restarted_kernel.system_optimizer.replay_execution_scope(second_scope):
+        restored = restarted_kernel.system_optimizer.execute_actions(
+            ("first", "second"),
+            action_context,
+        )
+
+    assert len(restored) == 1
+    assert restored[0].action == "first"
+    assert restored[0].success is False
+    assert restored[0].result == first[0].result
+    assert restored[0].rolled_back is False
+    assert restored[0].state_uncertain is True
+    assert restored[0].error is not None
+    assert "Runtime's in-memory state was not restored" in restored[0].error
+    assert calls == {"first": 1, "second": 1, "rollback": 1}
+    assert operations.count(cycle_id=CYCLE_ID) == 3
+    assert calls == {"first": 1, "second": 1, "rollback": 1}
+    assert operations.count(cycle_id=CYCLE_ID) == 3
+
+    with sqlite3.connect(operations.database_path) as connection:
+        rows = connection.execute(
+            "SELECT operation_kind, operation_name, state, attempts "
+            "FROM sh3_replay_operations WHERE cycle_id = ?",
+            (CYCLE_ID,),
+        ).fetchall()
+
+    assert len(rows) == 3
+    assert all(row[2] == "completed" and row[3] == 1 for row in rows)

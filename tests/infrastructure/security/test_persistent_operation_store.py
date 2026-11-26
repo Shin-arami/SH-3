@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing as mp
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -615,3 +616,406 @@ def test_readiness_rejects_missing_operation_state_index(tmp_path: Path) -> None
         match="missing required index sh3_replay_operations_cycle_state_idx",
     ):
         check_database(database)
+
+def _p3_2f_stop_processes(processes: list[Any]) -> None:
+    """Terminate and reap test child processes without leaving orphans."""
+    for process in processes:
+        if process.pid is None:
+            continue
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=5.0)
+
+
+def _p3_2f_operation_begin_worker(
+    database_path: str,
+    key: ReplayOperationKey,
+    owner_token: str,
+    generation: int,
+    now: datetime,
+    timeout_seconds: float,
+    ready_event: Any,
+    start_event: Any,
+    result_queue: Any,
+) -> None:
+    """Attempt one Operation begin from an independently spawned process."""
+    try:
+        store = SQLiteReplayOperationStore(
+            database_path,
+            timeout_seconds=timeout_seconds,
+        )
+        ready_event.set()
+        if not start_event.wait(timeout=20.0):
+            result_queue.put(("error", "start barrier timed out", ""))
+            return
+        execution = store.begin(
+            key,
+            owner_token,
+            generation,
+            now=now,
+        )
+        result_queue.put(
+            ("claimed", execution.generation, execution.attempts)
+        )
+    except ReplayOperationBusyError:
+        ready_event.set()
+        result_queue.put(("busy", 0, 0))
+    except Exception as exc:
+        ready_event.set()
+        result_queue.put(
+            ("error", type(exc).__name__, str(exc))
+        )
+
+
+def _p3_2f_operation_lock_timeout_worker(
+    database_path: str,
+    key: ReplayOperationKey,
+    owner_token: str,
+    generation: int,
+    now: datetime,
+    ready_event: Any,
+    start_event: Any,
+    result_queue: Any,
+) -> None:
+    """Attempt begin after another process has acquired the SQLite write lock."""
+    try:
+        store = SQLiteReplayOperationStore(
+            database_path,
+            timeout_seconds=0.15,
+        )
+        ready_event.set()
+        if not start_event.wait(timeout=20.0):
+            result_queue.put(("error", "start barrier timed out", None))
+            return
+        try:
+            store.begin(
+                key,
+                owner_token,
+                generation,
+                now=now,
+            )
+        except sqlite3.OperationalError as exc:
+            result_queue.put(
+                (
+                    "locked",
+                    str(exc),
+                    getattr(exc, "sqlite_errorcode", None),
+                )
+            )
+        else:
+            result_queue.put(("unexpected_success", "", None))
+    except Exception as exc:
+        ready_event.set()
+        result_queue.put(
+            ("error", f"{type(exc).__name__}: {exc}", None)
+        )
+
+
+def _p3_2f_operation_takeover_worker(
+    database_path: str,
+    key: ReplayOperationKey,
+    owner_token: str,
+    generation: int,
+    now: datetime,
+    result_queue: Any,
+) -> None:
+    """Take over an unfinished Operation using the new parent generation."""
+    try:
+        execution = SQLiteReplayOperationStore(
+            database_path,
+            timeout_seconds=5.0,
+        ).begin(
+            key,
+            owner_token,
+            generation,
+            now=now,
+        )
+        result_queue.put(
+            ("claimed", execution.generation, execution.attempts)
+        )
+    except Exception as exc:
+        result_queue.put(
+            ("error", type(exc).__name__, str(exc))
+        )
+
+
+def _p3_2f_operation_stale_complete_worker(
+    database_path: str,
+    key: ReplayOperationKey,
+    old_owner_token: str,
+    old_generation: int,
+    now: datetime,
+    result_queue: Any,
+) -> None:
+    """Attempt completion with a stale owner from another process."""
+    try:
+        SQLiteReplayOperationStore(
+            database_path,
+            timeout_seconds=5.0,
+        ).complete(
+            key,
+            old_owner_token,
+            old_generation,
+            {"success": True, "stale_owner": True},
+            now=now,
+        )
+    except ReplayClaimOwnershipError:
+        result_queue.put(("fenced",))
+    except Exception as exc:
+        result_queue.put(
+            ("error", type(exc).__name__, str(exc))
+        )
+    else:
+        result_queue.put(("completed",))
+
+
+def test_operation_begin_is_atomic_across_processes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operation-multiprocess-begin.sqlite3"
+    _, _, operations, claim, parent_stage_key = _prepared_database(database)
+    assert claim.owner_token is not None
+    key = _action_key(parent_stage_key)
+
+    worker_count = 4
+    context = mp.get_context("spawn")
+    start_event = context.Event()
+    ready_events = [context.Event() for _ in range(worker_count)]
+    result_queue = context.Queue()
+    processes: list[Any] = []
+
+    try:
+        for ready_event in ready_events:
+            process = context.Process(
+                target=_p3_2f_operation_begin_worker,
+                args=(
+                    str(database),
+                    key,
+                    claim.owner_token,
+                    claim.generation,
+                    _NOW,
+                    10.0,
+                    ready_event,
+                    start_event,
+                    result_queue,
+                ),
+            )
+            process.start()
+            processes.append(process)
+
+        for ready_event in ready_events:
+            assert ready_event.wait(timeout=20.0), (
+                "A worker did not finish initialization before the start gate."
+            )
+
+        # All workers are initialized before any worker enters begin().
+        start_event.set()
+
+        outcomes = [
+            result_queue.get(timeout=20.0)
+            for _ in range(worker_count)
+        ]
+
+        for process in processes:
+            process.join(timeout=20.0)
+            assert not process.is_alive(), "A worker process did not exit."
+            assert process.exitcode == 0
+
+    finally:
+        start_event.set()
+        _p3_2f_stop_processes(processes)
+        result_queue.close()
+        result_queue.join_thread()
+
+    statuses = [outcome[0] for outcome in outcomes]
+    assert statuses.count("claimed") == 1, outcomes
+    assert statuses.count("busy") == worker_count - 1, outcomes
+    assert all(status in {"claimed", "busy"} for status in statuses), outcomes
+
+    claimed_outcome = next(
+        outcome for outcome in outcomes if outcome[0] == "claimed"
+    )
+    assert claimed_outcome[1:] == (claim.generation, 1)
+    assert operations.count(cycle_id=_CYCLE_ID) == 1
+
+
+def test_operation_begin_observes_cross_process_sqlite_writer_lock_timeout(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operation-multiprocess-lock-timeout.sqlite3"
+    _, _, operations, claim, parent_stage_key = _prepared_database(database)
+    assert claim.owner_token is not None
+    key = _action_key(parent_stage_key)
+
+    context = mp.get_context("spawn")
+    ready_event = context.Event()
+    start_event = context.Event()
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_p3_2f_operation_lock_timeout_worker,
+        args=(
+            str(database),
+            key,
+            claim.owner_token,
+            claim.generation,
+            _NOW,
+            ready_event,
+            start_event,
+            result_queue,
+        ),
+    )
+    processes: list[Any] = []
+    lock_connection: sqlite3.Connection | None = None
+
+    try:
+        process.start()
+        processes.append(process)
+
+        # The child constructs its store before the parent takes the write lock.
+        assert ready_event.wait(timeout=20.0), (
+            "The child did not initialize its Operation Store."
+        )
+
+        lock_connection = sqlite3.connect(
+            str(database),
+            timeout=5.0,
+            isolation_level=None,
+        )
+        lock_connection.execute("BEGIN IMMEDIATE")
+
+        # The child now attempts BEGIN IMMEDIATE while this process holds it.
+        start_event.set()
+        outcome = result_queue.get(timeout=10.0)
+
+        process.join(timeout=10.0)
+        assert not process.is_alive(), "The lock-timeout worker did not exit."
+        assert process.exitcode == 0
+
+    finally:
+        start_event.set()
+        _p3_2f_stop_processes(processes)
+
+        if lock_connection is not None:
+            if lock_connection.in_transaction:
+                lock_connection.execute("ROLLBACK")
+            lock_connection.close()
+
+        result_queue.close()
+        result_queue.join_thread()
+
+    assert outcome[0] == "locked", outcome
+    assert "locked" in outcome[1].lower(), outcome
+    assert isinstance(outcome[2], int), outcome
+    assert (outcome[2] & 0xFF) == sqlite3.SQLITE_BUSY, outcome
+
+    # The failed begin must not leave an Operation row behind.
+    assert operations.count(cycle_id=_CYCLE_ID) == 0
+
+
+def test_operation_generation_fences_old_process_owner(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "operation-multiprocess-generation-fencing.sqlite3"
+    claims, stages, operations, first_claim, parent_stage_key = (
+        _prepared_database(database)
+    )
+    assert first_claim.owner_token is not None
+    key = _action_key(parent_stage_key)
+
+    original = operations.begin(
+        key,
+        first_claim.owner_token,
+        first_claim.generation,
+        now=_NOW,
+    )
+    assert original.status is ReplayOperationStatus.CLAIMED
+    assert original.generation == first_claim.generation
+
+    # Release the first parent generation and acquire a newer generation.
+    assert claims.release(
+        _CYCLE_ID,
+        first_claim.owner_token,
+        first_claim.generation,
+        now=_NOW,
+    )
+
+    second_claim = claims.claim(
+        _CYCLE_ID,
+        _CYCLE_FINGERPRINT,
+        lease_seconds=600.0,
+        now=_NOW,
+    )
+    assert second_claim.status is ReplayClaimStatus.CLAIMED
+    assert second_claim.owner_token is not None
+    assert second_claim.generation == first_claim.generation + 1
+
+    second_stage = stages.begin(
+        parent_stage_key,
+        second_claim.owner_token,
+        second_claim.generation,
+        now=_NOW,
+    )
+    assert second_stage.status is ReplayStageStatus.CLAIMED
+
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    processes: list[Any] = []
+
+    try:
+        # Process 1 takes over the unfinished Operation in the new generation.
+        takeover_process = context.Process(
+            target=_p3_2f_operation_takeover_worker,
+            args=(
+                str(database),
+                key,
+                second_claim.owner_token,
+                second_claim.generation,
+                _NOW,
+                result_queue,
+            ),
+        )
+        takeover_process.start()
+        processes.append(takeover_process)
+
+        takeover_outcome = result_queue.get(timeout=15.0)
+        takeover_process.join(timeout=15.0)
+        assert not takeover_process.is_alive()
+        assert takeover_process.exitcode == 0
+        assert takeover_outcome == (
+            "claimed",
+            second_claim.generation,
+            2,
+        )
+
+        # Process 2 tries to complete using the previous owner's credentials.
+        stale_process = context.Process(
+            target=_p3_2f_operation_stale_complete_worker,
+            args=(
+                str(database),
+                key,
+                first_claim.owner_token,
+                first_claim.generation,
+                _NOW,
+                result_queue,
+            ),
+        )
+        stale_process.start()
+        processes.append(stale_process)
+
+        stale_outcome = result_queue.get(timeout=15.0)
+        stale_process.join(timeout=15.0)
+        assert not stale_process.is_alive()
+        assert stale_process.exitcode == 0
+        assert stale_outcome == ("fenced",)
+
+    finally:
+        _p3_2f_stop_processes(processes)
+        result_queue.close()
+        result_queue.join_thread()
+
+    restored = operations.get(key)
+    assert restored is not None
+    assert restored.status is ReplayOperationStatus.CLAIMED
+    assert restored.generation == second_claim.generation
+    assert restored.attempts == 2
+    assert restored.owner_token == second_claim.owner_token

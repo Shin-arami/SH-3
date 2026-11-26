@@ -8,7 +8,12 @@ from typing import Any
 
 import pytest
 
-from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
+from infrastructure.event_bus import (
+    EventBus,
+    EventBusPublisher,
+    EventSubscription,
+    PublishResult,
+)
 from infrastructure.events import Event, EventPropagationContext
 from infrastructure.security.persistent_operation_store import (
     SQLiteReplayOperationStore,
@@ -572,3 +577,151 @@ def test_tampered_completed_operation_fails_closed_without_backend_or_event(
     assert second_backend.calls == 0
     assert observed == []
     assert _read_replay_states(database) == ("completed", "claimed")
+
+class _TerminalFailurePublisher:
+    """Publisher test double for post-commit notification failures."""
+
+    def __init__(self, mode: str) -> None:
+        if mode not in {"not_delivered", "raises"}:
+            raise ValueError("unsupported publication failure mode")
+        self.mode = mode
+        self.events: list[Event] = []
+        self.results: list[PublishResult] = []
+
+    def publish(self, event: Event) -> PublishResult:
+        self.events.append(event)
+        if self.mode == "raises":
+            raise RuntimeError("injected post-commit publisher failure")
+        result = PublishResult(
+            event_id=event.id,
+            accepted=True,
+            queued=True,
+            delivered=False,
+            error="injected terminal event delivery failure",
+        )
+        self.results.append(result)
+        return result
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["not_delivered", "raises"],
+)
+def test_terminal_publisher_failure_after_durable_commit_preserves_recovery_outcome(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    database = tmp_path / f"recovery-terminal-publisher-{failure_mode}.sqlite3"
+    _, claims, stages, operations = _stores(database)
+    first_claim = _claim(claims)
+    first_backend = _RecoveryBackend()
+    first_publisher = _TerminalFailurePublisher(failure_mode)
+    first_boundary = RecoveryExecutionBoundary(
+        first_backend,
+        event_publisher=first_publisher,
+        replay_stage_store=stages,
+        replay_operation_store=operations,
+    )
+
+    first_result = _request(first_boundary, first_backend, first_claim)
+
+    assert first_result.success is True
+    assert first_backend.calls == 1
+    assert len(first_publisher.events) == 1
+    terminal_event = first_publisher.events[0]
+    assert terminal_event.name == "RecoveryExecutionCompleted"
+    assert first_result.causation_id == terminal_event.metadata.event_id
+    assert _read_replay_states(database) == ("completed", "completed")
+
+    if failure_mode == "not_delivered":
+        assert len(first_publisher.results) == 1
+        publication_result = first_publisher.results[0]
+        assert publication_result.event_id == terminal_event.id
+        assert publication_result.accepted is True
+        assert publication_result.delivered is False
+        assert publication_result.error is not None
+    else:
+        assert first_publisher.results == []
+
+    with sqlite3.connect(database) as connection:
+        operation = connection.execute(
+            "SELECT state, attempts FROM sh3_replay_operations "
+            "WHERE cycle_id = ? AND operation_name = 'recovery_execution'",
+            (CYCLE_ID,),
+        ).fetchone()
+        stage = connection.execute(
+            "SELECT state FROM sh3_replay_stage_executions "
+            "WHERE cycle_id = ? AND stage_name = ?",
+            (CYCLE_ID, RECOVERY_STAGE_NAME),
+        ).fetchone()
+
+    assert operation == ("completed", 1)
+    assert stage == ("completed",)
+
+    # A new claim generation simulates recovery after the publisher failure.
+    assert claims.release(
+        CYCLE_ID,
+        first_claim.owner_token,
+        first_claim.generation,
+    )
+    second_claim = _claim(claims)
+    second_backend = _RecoveryBackend()
+    second_publisher = _TerminalFailurePublisher(failure_mode)
+    second_boundary = RecoveryExecutionBoundary(
+        second_backend,
+        event_publisher=second_publisher,
+        replay_stage_store=SQLiteReplayStageStore(database),
+        replay_operation_store=SQLiteReplayOperationStore(database),
+    )
+
+    restored = _request(second_boundary, second_backend, second_claim)
+
+    assert restored.success is True
+    assert restored.result == first_result.result
+    assert restored.causation_id == first_result.causation_id
+    assert second_backend.calls == 0
+    assert second_publisher.events == []
+    assert second_publisher.results == []
+    assert _read_replay_states(database) == ("completed", "completed")
+
+
+def test_event_bus_terminal_delivery_failure_is_observable_after_durable_commit(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "recovery-event-bus-delivery-failure.sqlite3"
+    _, claims, stages, operations = _stores(database)
+    claim = _claim(claims)
+    bus = EventBus()
+
+    def fail_terminal_delivery(event: Event) -> None:
+        raise RuntimeError(
+            f"injected observer failure for {event.name}"
+        )
+
+    bus.subscribe(
+        EventSubscription(
+            subscriber_id="p3-2f-failing-terminal-observer",
+            handler=fail_terminal_delivery,
+            event_name="RecoveryExecutionCompleted",
+        )
+    )
+
+    backend = _RecoveryBackend()
+    boundary = RecoveryExecutionBoundary(
+        backend,
+        event_publisher=EventBusPublisher(bus),
+        replay_stage_store=stages,
+        replay_operation_store=operations,
+    )
+
+    result = _request(boundary, backend, claim)
+
+    assert result.success is True
+    assert backend.calls == 1
+    assert _read_replay_states(database) == ("completed", "completed")
+
+    snapshot = bus.snapshot()
+    assert snapshot.published == 1
+    assert snapshot.accepted == 1
+    assert snapshot.failed == 1
+    assert snapshot.delivered == 0
