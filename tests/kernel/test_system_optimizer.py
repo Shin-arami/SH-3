@@ -76,10 +76,14 @@ def test_execute_actions_derives_stable_unique_child_idempotency_keys() -> None:
 def test_execute_action_derives_a_child_key_from_a_parent_key() -> None:
     optimizer = SystemOptimizer(SH3Kernel())
     observed: list[dict[str, object]] = []
+    def record(context: Mapping[str, Any]) -> dict[str, bool]:
+        observed.append(dict(context))
+        return {"changed": False}
+
     optimizer.register_action(
         OptimizationAction(
             "single",
-            lambda context: observed.append(dict(context)) or {"changed": False},
+            record,
             lambda _: None,
         )
     )

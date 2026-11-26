@@ -12,6 +12,7 @@ from foundation.Enums.event import EventType
 from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
 from infrastructure.security.persistent_store import (
+    ReplayClaim,
     ReplayClaimStatus,
     ReplayStageKey,
     ReplayStageStatus,
@@ -177,7 +178,7 @@ def _persistent_request(
     boundary: RecoveryStrategyBoundary,
     snapshot: FailureSnapshot,
     context: EventPropagationContext,
-    claim: object,
+    claim: ReplayClaim,
 ) -> RecoveryStrategyResult:
     owner_token = claim.owner_token
     generation = claim.generation

@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from self_healing.core import SelfHealingCore, SelfHealingException
+from self_healing.core import FailureSnapshot, SelfHealingCore, SelfHealingException
 from services.learning import LearningService
 
 
@@ -45,7 +45,12 @@ def test_learning_service_records_successful_recovery() -> None:
 
 def test_learning_service_records_failed_recovery() -> None:
     class FailingHealer(SelfHealingCore):
-        def _fallback(self, snapshot: Any) -> Any:
+        def _fallback(
+            self,
+            snapshot: FailureSnapshot,
+            *,
+            idempotency_key: str | None = None,
+        ) -> dict[str, Any]:
             raise RuntimeError("recovery failure")
 
     learning = LearningService()

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -10,6 +11,12 @@ from foundation.Enums.category import Category
 from foundation.Enums.event import EventType
 from infrastructure.event_bus import EventBus, EventBusPublisher, EventSubscription
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security.persistent_store import (
+    ReplayStageExecution,
+    ReplayStageKey,
+    ReplayStageStatus,
+    SQLiteReplayStageStore,
+)
 from kernel import SH3Kernel
 from kernel.recovery_execution_boundary import (
     RecoveryExecutionBoundary,
@@ -139,7 +146,13 @@ def test_publisher_replacement_rebinds_subscription() -> None:
 
 def test_failure_is_captured_as_typed_result() -> None:
     class FailingHealer(SelfHealingCore):
-        def recover_with_strategy(self, snapshot: FailureSnapshot, strategy: str) -> object:
+        def recover_with_strategy(
+        self,
+        snapshot: FailureSnapshot,
+        strategy: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Any:
             raise RuntimeError("execution failure")
 
     failing = FailingHealer()
@@ -158,7 +171,13 @@ def test_failure_is_captured_as_typed_result() -> None:
 
 def test_failure_event_is_published() -> None:
     class FailingHealer(SelfHealingCore):
-        def recover_with_strategy(self, snapshot: FailureSnapshot, strategy: str) -> object:
+        def recover_with_strategy(
+        self,
+        snapshot: FailureSnapshot,
+        strategy: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> Any:
             raise RuntimeError("execution failure")
 
     bus = EventBus()
@@ -206,34 +225,60 @@ def test_request_requires_strategy_result_type() -> None:
 
 
 # P2-2 persistent recovery execution regression coverage.
-def _p2_2_fake_replay_stage_store():
-    from types import SimpleNamespace
+class _P22FakeReplayStageStore(SQLiteReplayStageStore):
+    def __init__(self) -> None:
+        self.completed: dict[str, ReplayStageExecution] = {}
+        self.begin_calls: list[tuple[str, str, int]] = []
+        self.complete_calls: list[tuple[str, str, int]] = []
 
-    from infrastructure.security.persistent_store import SQLiteReplayStageStore
+    def begin(
+        self,
+        key: ReplayStageKey,
+        owner_token: str,
+        generation: int,
+        *,
+        now: datetime | None = None,
+    ) -> ReplayStageExecution:
+        self.begin_calls.append((key.idempotency_key, owner_token, generation))
+        persisted = self.completed.get(key.idempotency_key)
+        if persisted is not None:
+            return persisted
+        return ReplayStageExecution(
+            key=key,
+            status=ReplayStageStatus.CLAIMED,
+            generation=generation,
+            attempts=1,
+            owner_token=owner_token,
+        )
 
-    class FakeReplayStageStore(SQLiteReplayStageStore):
-        def __init__(self):
-            self.completed = {}
-            self.begin_calls = []
-            self.complete_calls = []
+    def complete(
+        self,
+        key: ReplayStageKey,
+        owner_token: str,
+        generation: int,
+        result: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> ReplayStageExecution:
+        self.complete_calls.append((key.idempotency_key, owner_token, generation))
+        execution = ReplayStageExecution(
+            key=key,
+            status=ReplayStageStatus.COMPLETED,
+            generation=generation,
+            attempts=1,
+            owner_token=None,
+            result=dict(result),
+        )
+        self.completed[key.idempotency_key] = execution
+        return execution
 
-        def begin(self, key, owner_token, generation, *, now=None):
-            self.begin_calls.append((key.idempotency_key, owner_token, generation))
-            persisted = self.completed.get(key.idempotency_key)
-            if persisted is not None:
-                return SimpleNamespace(status="completed", result=dict(persisted))
-            return SimpleNamespace(status="claimed", result=None)
 
-        def complete(self, key, owner_token, generation, result, *, now=None):
-            self.complete_calls.append((key.idempotency_key, owner_token, generation))
-            self.completed[key.idempotency_key] = dict(result)
-            return SimpleNamespace(status="completed", result=dict(result))
-
-    return FakeReplayStageStore()
+def _p2_2_fake_replay_stage_store() -> _P22FakeReplayStageStore:
+    return _P22FakeReplayStageStore()
 
 
 class _PersistentReplayCountingHealer(SelfHealingCore):
-    def __init__(self, *, fail=False):
+    def __init__(self, *, fail: bool = False) -> None:
         super().__init__()
         self.execution_calls = 0
         self.idempotency_keys: list[str | None] = []
@@ -241,11 +286,11 @@ class _PersistentReplayCountingHealer(SelfHealingCore):
 
     def recover_with_strategy(
         self,
-        snapshot,
-        strategy,
+        snapshot: FailureSnapshot,
+        strategy: str,
         *,
-        idempotency_key=None,
-    ):
+        idempotency_key: str | None = None,
+    ) -> dict[str, str]:
         self.execution_calls += 1
         self.idempotency_keys.append(idempotency_key)
         if self.fail:
@@ -257,7 +302,13 @@ class _PersistentReplayCountingHealer(SelfHealingCore):
         }
 
 
-def _p2_2_replay_arguments(*, generation, owner="execution-owner", result_id="result-1", error_message="boom"):
+def _p2_2_replay_arguments(
+    *,
+    generation: int,
+    owner: str = "execution-owner",
+    result_id: str = "result-1",
+    error_message: str = "boom",
+) -> dict[str, Any]:
     return {
         "replay_cycle_id": "execution-cycle",
         "replay_cycle_fingerprint": "execution-cycle-fingerprint",
@@ -272,9 +323,13 @@ def _p2_2_replay_arguments(*, generation, owner="execution-owner", result_id="re
     }
 
 
-def test_persistent_recovery_execution_rejects_backend_without_idempotency_contract():
+def test_persistent_recovery_execution_rejects_backend_without_idempotency_contract() -> None:
     class LegacyBackend:
-        def recover_with_strategy(self, snapshot, strategy):
+        def recover_with_strategy(
+            self,
+            snapshot: FailureSnapshot,
+            strategy: str,
+        ) -> dict[str, str]:
             return {"strategy": strategy}
 
     store = _p2_2_fake_replay_stage_store()
@@ -285,14 +340,18 @@ def test_persistent_recovery_execution_rejects_backend_without_idempotency_contr
         )
 
 
-def test_recovery_execution_propagates_stage_key_into_self_healing_action_and_events(
-):
+def test_recovery_execution_propagates_stage_key_into_self_healing_action_and_events() -> None:
     class KeyAwareHealer(SelfHealingCore):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__()
-            self.action_idempotency_key = None
+            self.action_idempotency_key: str | None = None
 
-        def _rebuild(self, snapshot, *, idempotency_key=None):
+        def _rebuild(
+            self,
+            snapshot: FailureSnapshot,
+            *,
+            idempotency_key: str | None = None,
+        ) -> dict[str, Any]:
             self.action_idempotency_key = idempotency_key
             return super()._rebuild(
                 snapshot,
@@ -348,7 +407,7 @@ def test_recovery_execution_propagates_stage_key_into_self_healing_action_and_ev
     )
 
 
-def test_persistent_recovery_execution_replays_after_restart_without_backend_call():
+def test_persistent_recovery_execution_replays_after_restart_without_backend_call() -> None:
     store = _p2_2_fake_replay_stage_store()
     first_healer = _PersistentReplayCountingHealer()
     _, _, first_strategy, first_snapshot = _strategy_result(first_healer)
@@ -437,7 +496,7 @@ def test_rebuild_preserves_legacy_context_manager_clear_signature() -> None:
     assert result["context_rebuilt"] is True
 
 
-def test_persistent_recovery_execution_caches_failure_result_across_restart():
+def test_persistent_recovery_execution_caches_failure_result_across_restart() -> None:
     store = _p2_2_fake_replay_stage_store()
     first_healer = _PersistentReplayCountingHealer(fail=True)
     _, _, first_strategy, first_snapshot = _strategy_result(first_healer)
@@ -473,7 +532,7 @@ def test_persistent_recovery_execution_caches_failure_result_across_restart():
     assert second_healer.execution_calls == 0
 
 
-def test_persistent_recovery_execution_uses_a_new_stage_for_different_input():
+def test_persistent_recovery_execution_uses_a_new_stage_for_different_input() -> None:
     store = _p2_2_fake_replay_stage_store()
     healer = _PersistentReplayCountingHealer()
     boundary = RecoveryExecutionBoundary(healer, replay_stage_store=store)
@@ -513,7 +572,7 @@ def test_persistent_recovery_execution_uses_a_new_stage_for_different_input():
     assert len(store.complete_calls) == 2
 
 
-def test_persistent_recovery_execution_rejects_partial_replay_metadata():
+def test_persistent_recovery_execution_rejects_partial_replay_metadata() -> None:
     store = _p2_2_fake_replay_stage_store()
     healer = _PersistentReplayCountingHealer()
     _, _, strategy, snapshot = _strategy_result(healer)
@@ -536,7 +595,7 @@ def test_persistent_recovery_execution_rejects_partial_replay_metadata():
     assert store.begin_calls == []
 
 
-def test_recovery_execution_without_replay_metadata_keeps_legacy_behavior():
+def test_recovery_execution_without_replay_metadata_keeps_legacy_behavior() -> None:
     store = _p2_2_fake_replay_stage_store()
     healer = _PersistentReplayCountingHealer()
     _, _, strategy, snapshot = _strategy_result(healer)
