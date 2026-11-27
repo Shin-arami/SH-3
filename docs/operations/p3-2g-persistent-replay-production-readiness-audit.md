@@ -62,7 +62,7 @@ Both `.github/workflows/ci.yml` and `.github/workflows/security.yml` declare pus
 
 ### G-01 — Active branch is not protected and is outside automatic CI/Security filters
 
-**Severity:** P0  
+**Severity:** P0
 **Status:** Open
 
 **Evidence**
@@ -88,7 +88,7 @@ Changes can reach the active development branch without the repository's own CI/
 
 ### G-02 — Persisted Action plans do not fingerprint Action implementation compatibility
 
-**Severity:** P0  
+**Severity:** P0
 **Status:** Open
 
 **Evidence**
@@ -113,7 +113,7 @@ An Action can retain its registered name while its implementation or rollback be
 
 ### G-03 — Database schema lifecycle has no explicit migration/version mechanism
 
-**Severity:** P1  
+**Severity:** P1
 **Status:** Open
 
 **Evidence**
@@ -139,7 +139,7 @@ A future application version can require a different schema while an older persi
 
 ### G-04 — SHA-256 digests provide integrity checking, not database-writer authenticity
 
-**Severity:** P1  
+**Severity:** P1
 **Status:** Open — threat-model decision required
 
 **Evidence**
@@ -163,7 +163,7 @@ Tests must demonstrate the declared threat model. Do not claim authenticity or t
 
 ### G-05 — Retention, archival, and destructive evidence clearing are not lifecycle-safe
 
-**Severity:** P1  
+**Severity:** P1
 **Status:** Open
 
 **Evidence**
@@ -188,7 +188,7 @@ Unbounded evidence, claim, stage, operation, and plan growth can increase disk u
 
 ### G-06 — Repository ignore rules do not explicitly protect local persistent database artifacts
 
-**Severity:** P1  
+**Severity:** P1
 **Status:** Open
 
 **Evidence**
@@ -208,7 +208,7 @@ A local operational database or backup containing evidence and tenant/operationa
 
 ### G-07 — README points to a SECURITY.md policy that is absent from the audited branch
 
-**Severity:** P2  
+**Severity:** P2
 **Status:** Open
 
 **Evidence**
@@ -229,7 +229,7 @@ A researcher or user cannot follow a repository-defined vulnerability disclosure
 
 ### G-08 — Tenant isolation is not demonstrated end-to-end across every persistence table
 
-**Severity:** P1  
+**Severity:** P1
 **Status:** Open — invariant clarification required
 
 **Evidence**
@@ -254,7 +254,7 @@ If the intended model is a shared database for multiple tenants, globally unique
 
 ### G-09 — Forced process termination at orchestration crash windows is not established by the reviewed evidence
 
-**Severity:** P1  
+**Severity:** P1
 **Status:** Open
 
 **Evidence**
@@ -278,7 +278,7 @@ Each test must assert downstream idempotency/deduplication behavior, owner-gener
 
 ### G-10 — Recovery event notifications are best-effort, not durably delivered
 
-**Severity:** P2  
+**Severity:** P2
 **Status:** Open — consumer contract decision required
 
 **Evidence**
@@ -301,7 +301,7 @@ Do not claim guaranteed event delivery until an Outbox or equivalent durable tra
 
 ### G-11 — Dependency and GitHub Actions supply-chain auditing is incomplete
 
-**Severity:** P2  
+**Severity:** P2
 **Status:** Open
 
 **Evidence**
@@ -325,7 +325,7 @@ The current dependency audit does not evidence an audit of the full build/test/r
 
 ### G-12 — Production backup, retention, encryption, monitoring, and RPO/RTO controls are documented but not operationally evidenced
 
-**Severity:** P1  
+**Severity:** P1
 **Status:** Open — deployment evidence required
 
 **Evidence**
@@ -350,7 +350,7 @@ A sound backup API is not the same as an operational backup service. A productio
 
 ### G-13 — External recovery side effects require an explicit idempotency contract
 
-**Severity:** P1 if a real external backend is deployed; otherwise conditional  
+**Severity:** P1 if a real external backend is deployed; otherwise conditional
 **Status:** Open — deployment-specific
 
 **Evidence**
