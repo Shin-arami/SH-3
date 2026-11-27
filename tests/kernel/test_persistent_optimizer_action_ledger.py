@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,6 +166,9 @@ def test_completed_runtime_action_is_reused_after_stage_finalize_retry(
             original_action.rollback,
             original_action.description,
             original_action.replay_policy,
+            contract_id=original_action.contract_id,
+            implementation_version=original_action.implementation_version,
+            rollback_version=original_action.rollback_version,
         ),
         replace=True,
     )
@@ -259,6 +263,9 @@ def test_operation_commit_failure_propagates_and_same_runtime_retry_finalizes_ca
             original_action.rollback,
             original_action.description,
             original_action.replay_policy,
+            contract_id=original_action.contract_id,
+            implementation_version=original_action.implementation_version,
+            rollback_version=original_action.rollback_version,
         ),
         replace=True,
     )
@@ -345,6 +352,9 @@ def test_stateful_completed_action_fails_closed_after_runtime_restart(
             original_action.rollback,
             original_action.description,
             original_action.replay_policy,
+            contract_id=original_action.contract_id,
+            implementation_version=original_action.implementation_version,
+            rollback_version=original_action.rollback_version,
         ),
         replace=True,
     )
@@ -393,6 +403,9 @@ def test_stateful_completed_action_fails_closed_after_runtime_restart(
             restored_action.rollback,
             restored_action.description,
             restored_action.replay_policy,
+            contract_id=restored_action.contract_id,
+            implementation_version=restored_action.implementation_version,
+            rollback_version=restored_action.rollback_version,
         ),
         replace=True,
     )
@@ -471,10 +484,24 @@ def test_action_and_failed_rollback_results_are_durable_and_not_repeated(
         raise RuntimeError("second Action failed")
 
     kernel.system_optimizer.register_action(
-        OptimizationAction("first", apply_first, fail_rollback),
+        OptimizationAction(
+            "first",
+            apply_first,
+            fail_rollback,
+            contract_id="tests.optimizer.first",
+            implementation_version="1",
+            rollback_version="1",
+        ),
     )
     kernel.system_optimizer.register_action(
-        OptimizationAction("second", fail_second, lambda result: None),
+        OptimizationAction(
+            "second",
+            fail_second,
+            lambda result: None,
+            contract_id="tests.optimizer.second",
+            implementation_version="1",
+            rollback_version="1",
+        ),
     )
 
     action_context = {"idempotency_key": stage_key.idempotency_key}
@@ -507,6 +534,13 @@ def test_action_and_failed_rollback_results_are_durable_and_not_repeated(
         input_payload={
             "action": "first",
             "ordinal": 0,
+            "action_contract": {
+                "name": "first",
+                "contract_id": "tests.optimizer.first",
+                "implementation_version": "1",
+                "rollback_version": "1",
+                "replay_policy": "require_local_state",
+            },
             "action_result": {"changed": True, "token": "first-action"},
         },
     )
@@ -537,6 +571,9 @@ def test_result_only_action_can_reuse_completed_result_after_runtime_restart(
             report_only,
             lambda result, *, idempotency_key: None,
             replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+            contract_id="tests.optimizer.safe_report",
+            implementation_version="1",
+            rollback_version="1",
         )
     )
     parent_context = {"idempotency_key": stage_key.idempotency_key}
@@ -568,6 +605,9 @@ def test_result_only_action_can_reuse_completed_result_after_runtime_restart(
             report_only,
             lambda result, *, idempotency_key: None,
             replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+            contract_id="tests.optimizer.safe_report",
+            implementation_version="1",
+            rollback_version="1",
         )
     )
     next_scope = ReplayExecutionContext(
@@ -611,6 +651,9 @@ def test_persisted_action_plan_rejects_unregistered_action_after_restart(
             lambda context: {"changed": False},
             lambda result, *, idempotency_key: None,
             replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+            contract_id="tests.optimizer.custom_action",
+            implementation_version="1",
+            rollback_version="1",
         )
     )
     parent_context = {"idempotency_key": stage_key.idempotency_key}
@@ -657,6 +700,9 @@ def test_action_plan_readiness_rejects_tampered_manifest(tmp_path: Path) -> None
             lambda context: {"changed": False},
             lambda result, *, idempotency_key: None,
             replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+            contract_id="tests.optimizer.safe_report",
+            implementation_version="1",
+            rollback_version="1",
         )
     )
     with kernel.system_optimizer.replay_execution_scope(scope):
@@ -671,7 +717,7 @@ def test_action_plan_readiness_rejects_tampered_manifest(tmp_path: Path) -> None
             "UPDATE sh3_replay_operation_plans SET actions_json = ? "
             "WHERE tenant_scope = ? AND parent_stage_key = ?",
             (
-                '{"actions":[],"version":1}',
+                '{"actions":[],"version":2}',
                 TENANT_ID,
                 stage_key.idempotency_key,
             ),
@@ -682,6 +728,232 @@ def test_action_plan_readiness_rejects_tampered_manifest(tmp_path: Path) -> None
         match="operation plan identity, integrity, or ownership verification failed",
     ):
         check_database(database)
+
+@pytest.mark.parametrize(
+    "changed_field",
+    ("implementation_version", "rollback_version"),
+)
+def test_persisted_action_plan_rejects_action_contract_drift(
+    tmp_path: Path,
+    changed_field: str,
+) -> None:
+    database_name = f"action-plan-contract-drift-{changed_field}.sqlite3"
+    (
+        kernel,
+        evidence,
+        claims,
+        stages,
+        operations,
+        first_claim,
+        stage_key,
+        first_scope,
+    ) = _manual_replay_scope(tmp_path, database_name)
+    callback_calls = {"first": 0, "restart": 0}
+
+    def apply_first(_: Any) -> dict[str, Any]:
+        callback_calls["first"] += 1
+        return {"changed": False, "value": "stable"}
+
+    def apply_after_restart(_: Any) -> dict[str, Any]:
+        callback_calls["restart"] += 1
+        return {"changed": False, "value": "stable"}
+
+    def rollback_noop(_: Any, *, idempotency_key: str) -> None:
+        _ = idempotency_key
+
+    contract = {
+        "contract_id": "tests.optimizer.contract_probe",
+        "implementation_version": "1",
+        "rollback_version": "1",
+    }
+    kernel.system_optimizer.register_action(
+        OptimizationAction(
+            "contract_probe",
+            apply_first,
+            rollback_noop,
+            replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+            contract_id=contract["contract_id"],
+            implementation_version=contract["implementation_version"],
+            rollback_version=contract["rollback_version"],
+        )
+    )
+    parent_context = {"idempotency_key": stage_key.idempotency_key}
+    with kernel.system_optimizer.replay_execution_scope(first_scope):
+        first = kernel.system_optimizer.execute_actions(("contract_probe",), parent_context)
+
+    assert first[0].success is True
+    assert callback_calls == {"first": 1, "restart": 0}
+    assert operations.count(cycle_id=CYCLE_ID) == 1
+    assert operations.count_plans(cycle_id=CYCLE_ID) == 1
+    assert claims.release(CYCLE_ID, first_claim.owner_token, first_claim.generation)
+
+    next_claim = _claim(claims)
+    assert next_claim.generation == first_claim.generation + 1
+    next_stage = stages.begin(
+        stage_key,
+        next_claim.owner_token,
+        next_claim.generation,
+        now=NOW,
+    )
+    assert next_stage.status is ReplayStageStatus.CLAIMED
+    restarted_kernel = _kernel(evidence, claims, stages, operations)
+    changed_contract = dict(contract)
+    changed_contract[changed_field] = "2"
+    restarted_kernel.system_optimizer.register_action(
+        OptimizationAction(
+            "contract_probe",
+            apply_after_restart,
+            rollback_noop,
+            replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+            contract_id=changed_contract["contract_id"],
+            implementation_version=changed_contract["implementation_version"],
+            rollback_version=changed_contract["rollback_version"],
+        )
+    )
+    next_scope = ReplayExecutionContext(
+        cycle_id=CYCLE_ID,
+        cycle_fingerprint=CYCLE_FINGERPRINT,
+        parent_stage_key=stage_key.idempotency_key,
+        owner_token=next_claim.owner_token,
+        generation=next_claim.generation,
+        tenant_id=TENANT_ID,
+    )
+    with restarted_kernel.system_optimizer.replay_execution_scope(next_scope), pytest.raises(
+        DurableOperationPersistenceError,
+        match="could not persist or restore the optimizer Action plan",
+    ):
+        restarted_kernel.system_optimizer.execute_actions(
+            ("contract_probe",), parent_context
+        )
+
+    assert callback_calls == {"first": 1, "restart": 0}
+    assert operations.count(cycle_id=CYCLE_ID) == 1
+    assert operations.count_plans(cycle_id=CYCLE_ID) == 1
+
+
+def test_direct_persistent_action_rejects_contract_drift(
+    tmp_path: Path,
+) -> None:
+    database_name = "direct-action-contract-drift.sqlite3"
+    (
+        kernel,
+        evidence,
+        claims,
+        stages,
+        operations,
+        first_claim,
+        stage_key,
+        first_scope,
+    ) = _manual_replay_scope(tmp_path, database_name)
+    callback_calls = {"first": 0, "restart": 0}
+
+    def apply_first(_: Any) -> dict[str, Any]:
+        callback_calls["first"] += 1
+        return {"changed": False, "value": "stable"}
+
+    def apply_after_restart(_: Any) -> dict[str, Any]:
+        callback_calls["restart"] += 1
+        return {"changed": False, "value": "stable"}
+
+    def rollback_noop(_: Any, *, idempotency_key: str) -> None:
+        _ = idempotency_key
+
+    kernel.system_optimizer.register_action(
+        OptimizationAction(
+            "direct_probe",
+            apply_first,
+            rollback_noop,
+            contract_id="tests.optimizer.direct_probe",
+            implementation_version="1",
+            rollback_version="1",
+            replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+        )
+    )
+    parent_context = {"idempotency_key": stage_key.idempotency_key}
+    with kernel.system_optimizer.replay_execution_scope(first_scope):
+        first = kernel.system_optimizer.execute_action("direct_probe", parent_context)
+    assert first.success is True
+    assert callback_calls == {"first": 1, "restart": 0}
+    assert operations.count(cycle_id=CYCLE_ID) == 1
+    assert operations.count_plans(cycle_id=CYCLE_ID) == 0
+
+    assert claims.release(CYCLE_ID, first_claim.owner_token, first_claim.generation)
+    next_claim = _claim(claims)
+    stages.begin(stage_key, next_claim.owner_token, next_claim.generation, now=NOW)
+    restarted_kernel = _kernel(evidence, claims, stages, operations)
+    restarted_kernel.system_optimizer.register_action(
+        OptimizationAction(
+            "direct_probe",
+            apply_after_restart,
+            rollback_noop,
+            contract_id="tests.optimizer.direct_probe",
+            implementation_version="2",
+            rollback_version="1",
+            replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+        )
+    )
+    next_scope = ReplayExecutionContext(
+        cycle_id=CYCLE_ID,
+        cycle_fingerprint=CYCLE_FINGERPRINT,
+        parent_stage_key=stage_key.idempotency_key,
+        owner_token=next_claim.owner_token,
+        generation=next_claim.generation,
+        tenant_id=TENANT_ID,
+    )
+    with restarted_kernel.system_optimizer.replay_execution_scope(next_scope), pytest.raises(
+        DurableOperationPersistenceError,
+        match="could not claim durable optimizer Action direct_probe",
+    ):
+        restarted_kernel.system_optimizer.execute_action("direct_probe", parent_context)
+
+    assert callback_calls == {"first": 1, "restart": 0}
+    assert operations.count(cycle_id=CYCLE_ID) == 1
+
+
+def test_legacy_v1_action_plan_is_rejected_without_implicit_upgrade(
+    tmp_path: Path,
+) -> None:
+    database_name = "legacy-v1-action-plan.sqlite3"
+    database = tmp_path / database_name
+    kernel, _, _, _, operations, _, stage_key, scope = _manual_replay_scope(
+        tmp_path, database_name
+    )
+    kernel.system_optimizer.register_action(
+        OptimizationAction(
+            "legacy_probe",
+            lambda _: {"changed": False},
+            lambda _, *, idempotency_key: None,
+            replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+            contract_id="tests.optimizer.legacy_probe",
+            implementation_version="1",
+            rollback_version="1",
+        )
+    )
+    with kernel.system_optimizer.replay_execution_scope(scope):
+        kernel.system_optimizer.execute_actions(
+            ("legacy_probe",),
+            {"idempotency_key": stage_key.idempotency_key},
+        )
+    assert operations.count_plans(cycle_id=CYCLE_ID) == 1
+
+    legacy_json = '{"actions":["legacy_probe"],"version":1}'
+    legacy_integrity = "sha256:" + hashlib.sha256(
+        legacy_json.encode("utf-8")
+    ).hexdigest()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE sh3_replay_operation_plans "
+            "SET plan_version = 1, actions_json = ?, actions_integrity = ? "
+            "WHERE tenant_scope = ? AND parent_stage_key = ?",
+            (legacy_json, legacy_integrity, TENANT_ID, stage_key.idempotency_key),
+        )
+
+    with pytest.raises(
+        PersistentReplayReadinessError,
+        match="operation plan identity, integrity, or ownership verification failed",
+    ):
+        check_database(database)
+
 
 @pytest.mark.parametrize(
     (
@@ -747,7 +1019,14 @@ def test_runtime_state_reconciliation_matrix_after_restart(
         _ = idempotency_key
 
     first_kernel.system_optimizer.register_action(
-        OptimizationAction(action_name, apply_first, rollback_noop)
+        OptimizationAction(
+            action_name,
+            apply_first,
+            rollback_noop,
+            contract_id="tests.optimizer.runtime_reconciliation_probe",
+            implementation_version="1",
+            rollback_version="1",
+        )
     )
     action_context = {"idempotency_key": stage_key.idempotency_key}
 
@@ -811,6 +1090,9 @@ def test_runtime_state_reconciliation_matrix_after_restart(
             action_name,
             forbidden_restart_apply,
             rollback_noop,
+            contract_id="tests.optimizer.runtime_reconciliation_probe",
+            implementation_version="1",
+            rollback_version="1",
         )
     )
     second_scope = ReplayExecutionContext(
@@ -891,13 +1173,23 @@ def test_completed_failed_action_and_rollback_are_not_retried_after_runtime_take
         raise RuntimeError("second Action failed")
 
     first_kernel.system_optimizer.register_action(
-        OptimizationAction("first", apply_first, fail_rollback)
+        OptimizationAction(
+            "first",
+            apply_first,
+            fail_rollback,
+            contract_id="tests.optimizer.first",
+            implementation_version="1",
+            rollback_version="1",
+        )
     )
     first_kernel.system_optimizer.register_action(
         OptimizationAction(
             "second",
             fail_second,
             lambda result, *, idempotency_key: None,
+            contract_id="tests.optimizer.second",
+            implementation_version="1",
+            rollback_version="1",
         )
     )
 
@@ -936,13 +1228,23 @@ def test_completed_failed_action_and_rollback_are_not_retried_after_runtime_take
 
     restarted_kernel = _kernel(evidence, claims, stages, operations)
     restarted_kernel.system_optimizer.register_action(
-        OptimizationAction("first", apply_first, fail_rollback)
+        OptimizationAction(
+            "first",
+            apply_first,
+            fail_rollback,
+            contract_id="tests.optimizer.first",
+            implementation_version="1",
+            rollback_version="1",
+        )
     )
     restarted_kernel.system_optimizer.register_action(
         OptimizationAction(
             "second",
             fail_second,
             lambda result, *, idempotency_key: None,
+            contract_id="tests.optimizer.second",
+            implementation_version="1",
+            rollback_version="1",
         )
     )
     second_scope = ReplayExecutionContext(

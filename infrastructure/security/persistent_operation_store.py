@@ -210,10 +210,45 @@ def _decode_replay_operation_result(
         ) from exc
 
 
+_ACTION_CONTRACT_FIELDS = (
+    "name",
+    "contract_id",
+    "implementation_version",
+    "rollback_version",
+    "replay_policy",
+)
+
+
+def _normalize_action_contracts(
+    actions: tuple[str, ...],
+    action_contracts: tuple[Mapping[str, str], ...] | list[Mapping[str, str]],
+) -> tuple[dict[str, str], ...]:
+    if not isinstance(action_contracts, (tuple, list)):
+        raise TypeError("action_contracts must be a list or tuple")
+    if len(actions) != len(action_contracts):
+        raise ValueError("action names and Action contracts must have equal lengths")
+    normalized: list[dict[str, str]] = []
+    for index, raw_contract in enumerate(action_contracts):
+        if not isinstance(raw_contract, Mapping):
+            raise TypeError(f"action_contracts[{index}] must be a mapping")
+        if set(raw_contract) != set(_ACTION_CONTRACT_FIELDS):
+            raise ValueError(f"action_contracts[{index}] has an invalid field set")
+        contract = {
+            field_name: _text(field_name, raw_contract[field_name])
+            for field_name in _ACTION_CONTRACT_FIELDS
+        }
+        if contract["name"] != actions[index]:
+            raise ValueError("Action contract name does not match the ordered Action plan")
+        if contract["replay_policy"] not in {"reuse_result", "require_local_state"}:
+            raise ValueError("Action contract replay_policy is unsupported")
+        normalized.append(contract)
+    return tuple(normalized)
+
+
 def _decode_replay_operation_plan(
     actions_json: str,
     expected_integrity: str,
-) -> tuple[str, ...]:
+) -> tuple[dict[str, str], ...]:
     try:
         raw = json.loads(actions_json)
         if not isinstance(raw, Mapping):
@@ -226,15 +261,20 @@ def _decode_replay_operation_plan(
                 "persisted replay operation plan integrity failed"
             )
         version = raw.get("version")
-        if isinstance(version, bool) or not isinstance(version, int) or version != 1:
-            raise ValueError("unsupported optimizer action plan version")
+        if isinstance(version, bool) or not isinstance(version, int) or version != 2:
+            raise ValueError(
+                "unsupported optimizer Action plan version; version 1 has no "
+                "implementation compatibility metadata and requires explicit reconciliation"
+            )
         actions = raw.get("actions")
         if not isinstance(actions, list):
             raise TypeError("operation plan actions must be a JSON array")
-        normalized: list[str] = []
-        for action in actions:
-            normalized.append(_text("action", action))
-        return tuple(normalized)
+        action_names: list[str] = []
+        for index, action in enumerate(actions):
+            if not isinstance(action, Mapping):
+                raise TypeError(f"operation plan action {index} must be an object")
+            action_names.append(_text("name", action.get("name")))
+        return _normalize_action_contracts(tuple(action_names), actions)
     except PersistentEvidenceIntegrityError:
         raise
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -838,15 +878,19 @@ class SQLiteReplayOperationStore(_SQLiteDatabase):
         owner_token: str,
         generation: int,
         actions: tuple[str, ...] | list[str],
+        action_contracts: tuple[Mapping[str, str], ...] | list[Mapping[str, str]],
+        registered_action_contracts: Mapping[str, Mapping[str, str]] | None = None,
         now: datetime | None = None,
     ) -> tuple[str, ...]:
-        """Persist the optimizer's ordered Action plan before executing it.
+        """Persist the ordered Action plan and its explicit compatibility contract.
 
-        The first plan for a tenant-scoped parent Stage is immutable. A retry
-        returns that plan even when a restarted Runtime would currently propose
-        a different action list because its in-memory snapshot has changed.
-        The owner/generation metadata is advanced under the same SQLite write
-        transaction as the parent Claim and Stage validation.
+        The first plan for a tenant-scoped parent Stage is immutable. On replay,
+        the persisted Action names and order are authoritative; current optimizer
+        proposals may differ because earlier Actions changed runtime state. Every
+        persisted Action must still be registered with the same contract identifier,
+        implementation version, rollback version, and replay policy. Version-1
+        name-only plans are rejected because their implementation compatibility
+        cannot be established. Owner/generation fencing remains transactional.
         """
         if tenant_id is not None:
             _text("tenant_id", tenant_id)
@@ -863,8 +907,26 @@ class SQLiteReplayOperationStore(_SQLiteDatabase):
         if not isinstance(actions, (tuple, list)):
             raise TypeError("actions must be a list or tuple")
         normalized_actions = tuple(_text("action", item) for item in actions)
+        normalized_contracts = _normalize_action_contracts(
+            normalized_actions,
+            action_contracts,
+        )
+        normalized_registered_contracts: dict[str, dict[str, str]]
+        if registered_action_contracts is None:
+            normalized_registered_contracts = {
+                contract["name"]: contract for contract in normalized_contracts
+            }
+        else:
+            if not isinstance(registered_action_contracts, Mapping):
+                raise TypeError("registered_action_contracts must be a mapping")
+            normalized_registered_contracts = {}
+            for raw_name, raw_contract in registered_action_contracts.items():
+                registered_name = _text("registered_action", raw_name)
+                normalized_registered_contracts[registered_name] = (
+                    _normalize_action_contracts((registered_name,), (raw_contract,))[0]
+                )
         encoded = _canonical_json(
-            {"version": 1, "actions": list(normalized_actions)}
+            {"version": 2, "actions": list(normalized_contracts)}
         )
         integrity = _operation_result_integrity(encoded)
         tenant_scope = tenant_id if tenant_id is not None else ""
@@ -926,7 +988,7 @@ class SQLiteReplayOperationStore(_SQLiteDatabase):
                         "INSERT INTO sh3_replay_operation_plans "
                         "(tenant_scope, parent_stage_key, cycle_id, cycle_fingerprint, "
                         "plan_version, actions_json, actions_integrity, generation, "
-                        "owner_token, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+                        "owner_token, updated_at) VALUES (?, ?, ?, ?, 2, ?, ?, ?, ?, ?)",
                         (
                             tenant_scope,
                             parent_stage_key,
@@ -946,12 +1008,27 @@ class SQLiteReplayOperationStore(_SQLiteDatabase):
                         or existing[1] != cycle_fingerprint
                         or isinstance(existing[2], bool)
                         or not isinstance(existing[2], int)
-                        or existing[2] != 1
+                        or existing[2] != 2
                     ):
                         raise ReplayOperationConflictError(
                             "optimizer action plan identity or version conflicts"
                         )
-                    result = _decode_replay_operation_plan(existing[3], existing[4])
+                    stored_contracts = _decode_replay_operation_plan(existing[3], existing[4])
+                    for stored_contract in stored_contracts:
+                        registered_contract = normalized_registered_contracts.get(
+                            stored_contract["name"]
+                        )
+                        if registered_contract is None:
+                            raise ReplayOperationConflictError(
+                                "persisted optimizer Action is no longer registered: "
+                                + stored_contract["name"]
+                            )
+                        if registered_contract != stored_contract:
+                            raise ReplayOperationConflictError(
+                                "persisted optimizer Action plan is incompatible with the "
+                                "registered Action contracts"
+                            )
+                    result = tuple(contract["name"] for contract in stored_contracts)
                     stored_generation = existing[5]
                     stored_owner = existing[6]
                     if (
