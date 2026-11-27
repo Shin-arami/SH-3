@@ -810,7 +810,7 @@ def _validate_replay_operation_plan_rows(
             if (
                 isinstance(row[4], bool)
                 or not isinstance(row[4], int)
-                or row[4] != 1
+                or row[4] != 2
             ):
                 raise ValueError("operation plan version is unsupported")
             if (

@@ -86,6 +86,9 @@ class OptimizationAction:
     replay_policy: OptimizationActionReplayPolicy = (
         OptimizationActionReplayPolicy.REQUIRE_LOCAL_STATE
     )
+    contract_id: str | None = None
+    implementation_version: str | None = None
+    rollback_version: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():
@@ -96,9 +99,52 @@ class OptimizationAction:
             raise TypeError("rollback must be callable")
         if not isinstance(self.replay_policy, OptimizationActionReplayPolicy):
             raise TypeError("replay_policy must be OptimizationActionReplayPolicy")
+        compatibility_values = (
+            ("contract_id", self.contract_id),
+            ("implementation_version", self.implementation_version),
+            ("rollback_version", self.rollback_version),
+        )
+        supplied = tuple(value is not None for _, value in compatibility_values)
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "contract_id, implementation_version, and rollback_version "
+                "must be supplied together"
+            )
+        for field_name, value in compatibility_values:
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{field_name} must be a non-empty string")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "description": self.description}
+        data: dict[str, Any] = {"name": self.name, "description": self.description}
+        if self.contract_id is not None:
+            data.update(
+                {
+                    "contract_id": self.contract_id,
+                    "implementation_version": self.implementation_version,
+                    "rollback_version": self.rollback_version,
+                }
+            )
+        return data
+
+
+def _durable_action_contract(action: OptimizationAction) -> dict[str, str]:
+    """Return explicit compatibility metadata required for durable replay."""
+    if (
+        action.contract_id is None
+        or action.implementation_version is None
+        or action.rollback_version is None
+    ):
+        raise DurableOperationPersistenceError(
+            f"persistent optimizer Action {action.name!r} must declare contract_id, "
+            "implementation_version, and rollback_version"
+        )
+    return {
+        "name": action.name,
+        "contract_id": action.contract_id,
+        "implementation_version": action.implementation_version,
+        "rollback_version": action.rollback_version,
+        "replay_policy": action.replay_policy.value,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +345,38 @@ class SystemOptimizer:
             raise DurableOperationPersistenceError(
                 "persistent optimizer actions require an active ReplayExecutionContext"
             )
+
+        action_contracts: list[dict[str, str]] = []
+        missing_actions: list[str] = []
+        for name in actions:
+            action = self.get_action(name)
+            if action is None:
+                missing_actions.append(name)
+                continue
+            action_contracts.append(_durable_action_contract(action))
+        if missing_actions:
+            raise DurableOperationPersistenceError(
+                "persisted optimizer Action plan contains unregistered Actions: "
+                + ", ".join(missing_actions)
+            )
+
+        # The persisted plan is authoritative on replay. Build a registry snapshot
+        # so the store can validate the contracts of the persisted Action names,
+        # even when current optimization proposes a different (or empty) set.
+        with self._lock:
+            registered_actions = tuple(self._actions.values())
+        registered_action_contracts: dict[str, dict[str, str]] = {}
+        for registered_action in registered_actions:
+            try:
+                registered_action_contracts[registered_action.name] = (
+                    _durable_action_contract(registered_action)
+                )
+            except DurableOperationPersistenceError:
+                # An unrelated non-durable Action must not invalidate a plan.
+                # If a persisted Action itself lacks a contract, the store will
+                # reject it because its name will be absent from this mapping.
+                continue
+
         try:
             return store.get_or_create_action_plan(
                 tenant_id=replay.tenant_id,
@@ -308,6 +386,8 @@ class SystemOptimizer:
                 owner_token=replay.owner_token,
                 generation=replay.generation,
                 actions=actions,
+                action_contracts=tuple(action_contracts),
+                registered_action_contracts=registered_action_contracts,
             )
         except Exception as exc:
             raise DurableOperationPersistenceError(
@@ -354,6 +434,9 @@ class SystemOptimizer:
                 self._apply_reduce_context_depth,
                 self._rollback_context,
                 "Reduce one runtime context level.",
+                contract_id="sh3.optimizer.reduce_context_depth",
+                implementation_version="1",
+                rollback_version="1",
             )
         )
         self.register_action(
@@ -363,6 +446,9 @@ class SystemOptimizer:
                 self._rollback_noop,
                 "Create a deterministic compressed memory view.",
                 replay_policy=OptimizationActionReplayPolicy.REUSE_RESULT,
+                contract_id="sh3.optimizer.compress_memory",
+                implementation_version="1",
+                rollback_version="1",
             )
         )
         self.register_action(
@@ -371,6 +457,9 @@ class SystemOptimizer:
                 self._apply_simplify_policy,
                 self._rollback_policy,
                 "Remove the lowest-weight policy rule.",
+                contract_id="sh3.optimizer.simplify_policy",
+                implementation_version="1",
+                rollback_version="1",
             )
         )
 
@@ -612,6 +701,7 @@ class SystemOptimizer:
             raise DurableOperationPersistenceError(
                 "Action parent key does not match the active Replay Stage"
             )
+        action_contract = _durable_action_contract(action)
         volatile = {
             "idempotency_key",
             "parent_idempotency_key",
@@ -637,6 +727,7 @@ class SystemOptimizer:
                     "action": name,
                     "ordinal": ordinal,
                     "replay_policy": action.replay_policy.value,
+                    "action_contract": action_contract,
                     "context": _operation_json_value(semantic_context),
                 },
             )
@@ -849,6 +940,7 @@ class SystemOptimizer:
             raise DurableOperationPersistenceError(
                 "durable Rollback execution requires the active replay context and Action key"
             )
+        action_contract = _durable_action_contract(action)
         try:
             operation_key = ReplayOperationKey.create(
                 idempotency_key=rollback_key,
@@ -863,6 +955,7 @@ class SystemOptimizer:
                 input_payload={
                     "action": result.action,
                     "ordinal": result.ordinal,
+                    "action_contract": action_contract,
                     "action_result": _operation_json_value(result.result),
                 },
             )
