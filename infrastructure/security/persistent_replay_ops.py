@@ -24,6 +24,11 @@ from infrastructure.security.persistent_operation_store import (
     _decode_replay_operation_plan,
     _decode_replay_operation_result,
 )
+from infrastructure.security.persistent_schema import (
+    CURRENT_SCHEMA_VERSION,
+    PersistentSchemaError,
+    read_schema_version,
+)
 from infrastructure.security.persistent_store import ReplayStageKey
 
 __all__ = [
@@ -169,6 +174,7 @@ class DatabaseReadinessReport:
     replay_stage_execution_count: int = 0
     replay_operation_execution_count: int = 0
     replay_operation_plan_count: int = 0
+    schema_version: int = 0
 
 
 def _timeout(value: float) -> float:
@@ -1062,6 +1068,7 @@ def check_database(
     *,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     _connection: sqlite3.Connection | None = None,
+    _allow_unversioned_schema: bool = False,
 ) -> DatabaseReadinessReport:
     """Run read-only SQLite and SH-3 evidence/claim consistency checks."""
     timeout = _timeout(timeout_seconds)
@@ -1075,6 +1082,19 @@ def check_database(
         with connection_context as connection:
             connection.execute("BEGIN")
             try:
+                try:
+                    schema_version = read_schema_version(connection)
+                except PersistentSchemaError as exc:
+                    raise PersistentReplayReadinessError(
+                        f"database schema metadata is invalid: {exc}"
+                    ) from exc
+                if schema_version != CURRENT_SCHEMA_VERSION and not (
+                    _allow_unversioned_schema and schema_version == 0
+                ):
+                    raise PersistentReplayReadinessError(
+                        f"database schema version {schema_version} requires explicit "
+                        "migration or is unsupported"
+                    )
                 integrity_rows = tuple(
                     str(row[0]) for row in connection.execute("PRAGMA integrity_check")
                 )
@@ -1098,7 +1118,18 @@ def check_database(
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     )
                 }
-                missing_tables = {_EVIDENCE_TABLE, _CLAIM_TABLE} - tables
+                required_tables = (
+                    {_EVIDENCE_TABLE, _CLAIM_TABLE}
+                    if schema_version == 0
+                    else {
+                        _EVIDENCE_TABLE,
+                        _CLAIM_TABLE,
+                        _STAGE_TABLE,
+                        _OPERATION_TABLE,
+                        _OPERATION_PLAN_TABLE,
+                    }
+                )
+                missing_tables = required_tables - tables
                 if missing_tables:
                     raise PersistentReplayReadinessError(
                         "database is missing SH-3 table(s): "
@@ -1308,6 +1339,7 @@ def check_database(
         replay_stage_execution_count=replay_stage_execution_count,
         replay_operation_execution_count=replay_operation_execution_count,
         replay_operation_plan_count=replay_operation_plan_count,
+        schema_version=schema_version,
     )
 
 
@@ -1435,6 +1467,7 @@ def _create_verified_snapshot(
     destination_path: str | os.PathLike[str],
     *,
     timeout_seconds: float,
+    _allow_unversioned_schema: bool = False,
 ) -> DatabaseReadinessReport:
     timeout = _timeout(timeout_seconds)
     source = _existing_database(source_path)
@@ -1448,6 +1481,11 @@ def _create_verified_snapshot(
             source,
             timeout_seconds=timeout,
             _connection=source_connection,
+            **(
+                {"_allow_unversioned_schema": True}
+                if _allow_unversioned_schema
+                else {}
+            ),
         )
         _require_source_identity(source, source_identity, phase="during preflight")
         destination = _prepare_destination(destination_path, source)
@@ -1472,7 +1510,17 @@ def _create_verified_snapshot(
             _require_source_identity(
                 source, source_identity, phase="during snapshot creation"
             )
-            snapshot_report = check_database(temporary, timeout_seconds=timeout)
+            if _allow_unversioned_schema:
+                snapshot_report = check_database(
+                    temporary,
+                    timeout_seconds=timeout,
+                    _allow_unversioned_schema=True,
+                )
+            else:
+                snapshot_report = check_database(
+                    temporary,
+                    timeout_seconds=timeout,
+                )
             _require_source_identity(
                 source, source_identity, phase="before snapshot publication"
             )
@@ -1539,12 +1587,22 @@ def restore_database(
     destination_path: str | os.PathLike[str],
     *,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    allow_unversioned_schema: bool = False,
 ) -> DatabaseReadinessReport:
-    """Restore a verified backup to a new database path without replacing data."""
+    """Restore a verified backup to a new path without replacing data.
+
+    Set allow_unversioned_schema=True only when restoring a verified pre-migration
+    snapshot; the restored database remains unavailable to Runtime until migrated.
+    """
     return _create_verified_snapshot(
         backup_path,
         destination_path,
         timeout_seconds=timeout_seconds,
+        **(
+            {"_allow_unversioned_schema": True}
+            if allow_unversioned_schema
+            else {}
+        ),
     )
 
 

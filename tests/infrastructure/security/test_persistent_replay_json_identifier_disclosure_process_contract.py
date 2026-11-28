@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -264,6 +265,9 @@ def test_module_cli_readiness_error_report_is_invariant_under_identifier_disclos
         payload={"cycle_id": cycle_id, "result_id": result_id, "status": "completed"},
     )
     SQLiteEvidenceStore(database).register(evidence)
+    # Keep the identifier-disclosure check on an intentionally invalid schema.
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE sh3_replay_operation_plans")
     arguments = ("check", "--database", str(database), "--json")
 
     redacted = _run_cli(*arguments)

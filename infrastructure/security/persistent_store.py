@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any
 
 from infrastructure.security import EvidenceRecord, EvidenceStore
+from infrastructure.security.persistent_schema import ensure_schema_for_store
 
 __all__ = [
     "PersistentEvidenceIntegrityError",
@@ -158,6 +159,9 @@ class _SQLiteDatabase:
         self._database_path, self._timeout_seconds = _database_settings(
             database_path, timeout_seconds
         )
+        ensure_schema_for_store(
+            self._database_path, timeout_seconds=self._timeout_seconds
+        )
 
     @property
     def database_path(self) -> Path:
@@ -212,6 +216,9 @@ class SQLiteEvidenceStore(EvidenceStore):
         EvidenceStore.__init__(self)
         self._database_path, self._timeout_seconds = _database_settings(
             database_path, timeout_seconds
+        )
+        ensure_schema_for_store(
+            self._database_path, timeout_seconds=self._timeout_seconds
         )
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
