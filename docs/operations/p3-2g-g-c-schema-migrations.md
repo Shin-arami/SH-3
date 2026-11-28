@@ -41,7 +41,7 @@ Database schema version 1 does not convert legacy Action Plan version-1 rows int
 
 ## Recovery
 
-A pre-migration backup is a version-0 database. It is not runtime-ready until migrated. A transaction failure leaves the source at version 0 and keeps the backup. If a post-commit operational check fails, stop application writers, preserve both files, inspect the migration output, and restore the verified backup to a separate path before deciding on retry. Never overwrite the original or delete historical rows to bypass a readiness failure.
+A pre-migration backup is a version-0 database. It is not runtime-ready until migrated. A transaction failure leaves the source at version 0 and keeps the backup. If a post-commit operational check fails, stop application writers and preserve both files. Restore the verified pre-migration backup to a separate path with the explicit recovery opt-in `restore_database(backup_path, recovery_path, allow_unversioned_schema=True)`. This opt-in only permits verification and restoration of the version-0 snapshot; it does not make that copy runtime-ready. Run the explicit 0 → 1 migration against the restored copy, using a new, non-existing backup path, before starting Runtime. Never overwrite the original or delete historical rows to bypass a readiness failure.
 
 ## Verification
 

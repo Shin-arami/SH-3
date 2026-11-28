@@ -64,7 +64,7 @@ def migrate_persistent_replay_database(
     Version-0 means a pre-versioned SH-3 database whose existing tables pass
     the read-only legacy schema/data checks. The only supported upgrade in this
     release is 0 -> 1. A migration backup is published and verified before any
-    DDL is executed. DDL and PRAGMA user_version are committed in one transaction.
+    DDL is executed. DDL and the `sh3_schema_metadata.schema_version` update are committed in one transaction. The existing `PRAGMA user_version` value is preserved unchanged.
     """
     if not isinstance(confirm_migration, bool):
         raise TypeError("confirm_migration must be bool")

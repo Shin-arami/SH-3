@@ -14,6 +14,7 @@ from infrastructure.security.persistent_replay_migrate import (
 from infrastructure.security.persistent_replay_ops import (
     PersistentReplayReadinessError,
     check_database,
+    restore_database,
 )
 from infrastructure.security.persistent_replay_runtime import (
     create_persistent_replay_stores,
@@ -278,3 +279,69 @@ def test_provisioning_sets_authoritative_database_schema_version(
     )
     assert report.schema_version == CURRENT_SCHEMA_VERSION
     assert _schema_version(database) == CURRENT_SCHEMA_VERSION
+
+
+
+def test_pre_migration_backup_can_be_explicitly_restored_and_migrated(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.sqlite3"
+    pre_migration_backup = tmp_path / "source-pre-migration.sqlite3"
+    rejected_restore = tmp_path / "rejected-restore.sqlite3"
+    recovered_copy = tmp_path / "recovered-version-zero.sqlite3"
+    recovered_copy_backup = tmp_path / "recovered-copy-pre-migration.sqlite3"
+    _legacy_database(source)
+
+    migration = migrate_persistent_replay_database(
+        source,
+        pre_migration_backup,
+        confirm_migration=True,
+    )
+    assert migration.source_schema_version == 0
+    assert migration.target_schema_version == 1
+    assert _schema_version(source) == 1
+    assert _schema_version(pre_migration_backup) == 0
+
+    # Ordinary restore remains fail-closed for a pre-migration backup.
+    with pytest.raises(PersistentReplayReadinessError, match="schema version 0"):
+        restore_database(pre_migration_backup, rejected_restore)
+    assert not rejected_restore.exists()
+
+    # Recovery is possible only through the explicit unversioned-schema opt-in.
+    restored = restore_database(
+        pre_migration_backup,
+        recovered_copy,
+        allow_unversioned_schema=True,
+    )
+    assert restored.database_path == recovered_copy.resolve()
+    assert _schema_version(recovered_copy) == 0
+    assert _table_names(recovered_copy) == _table_names(pre_migration_backup)
+    with sqlite3.connect(recovered_copy) as connection:
+        user_version_row = connection.execute("PRAGMA user_version").fetchone()
+    assert user_version_row is not None
+    assert user_version_row[0] == 115000
+
+    # Restoring a version-0 backup does not bypass normal Runtime readiness.
+    with pytest.raises(PersistentReplayReadinessError, match="schema version 0"):
+        create_persistent_replay_stores(recovered_copy)
+    assert _schema_version(recovered_copy) == 0
+
+    # The recovered copy can be migrated explicitly with its own verified backup.
+    recovered_migration = migrate_persistent_replay_database(
+        recovered_copy,
+        recovered_copy_backup,
+        confirm_migration=True,
+    )
+    assert recovered_migration.source_schema_version == 0
+    assert recovered_migration.target_schema_version == 1
+    assert recovered_migration.backup_path == recovered_copy_backup.resolve()
+    assert _schema_version(recovered_copy) == 1
+    assert _schema_version(recovered_copy_backup) == 0
+    assert recovered_migration.readiness.evidence_count == 1
+    assert recovered_migration.readiness.replay_claim_count == 1
+    with sqlite3.connect(recovered_copy) as connection:
+        migrated_user_version_row = connection.execute(
+            "PRAGMA user_version"
+        ).fetchone()
+    assert migrated_user_version_row is not None
+    assert migrated_user_version_row[0] == 115000
