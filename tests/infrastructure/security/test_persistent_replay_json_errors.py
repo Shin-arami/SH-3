@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,10 @@ def test_json_error_report_classifies_readiness_schema_failure(
 ) -> None:
     database = tmp_path / "incomplete-schema.sqlite3"
     SQLiteEvidenceStore(database)
+    # Fresh Store initialization provisions the complete schema; remove a
+    # required table explicitly to exercise the Readiness failure path.
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE sh3_replay_operation_plans")
 
     assert main(["check", "--database", str(database), "--json"]) == 1
     captured = capsys.readouterr()

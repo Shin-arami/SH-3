@@ -31,6 +31,9 @@ from infrastructure.security.persistent_replay_provision import (
 from infrastructure.security.persistent_replay_runtime import (
     create_persistent_replay_stores,
 )
+from infrastructure.security.persistent_schema import (
+    PersistentSchemaMigrationRequiredError,
+)
 from infrastructure.security.persistent_store import (
     PersistentEvidenceIntegrityError,
     ReplayClaimOwnershipError,
@@ -447,17 +450,95 @@ def test_tampered_result_fails_closed_on_get_and_readiness_check(tmp_path: Path)
         check_database(database)
 
 
-def test_readiness_is_backward_compatible_and_validates_new_table(tmp_path: Path) -> None:
-    legacy_database = tmp_path / "legacy-without-operation-table.sqlite3"
-    SQLiteEvidenceStore(legacy_database)
-    SQLiteReplayClaimStore(legacy_database)
-    SQLiteReplayStageStore(legacy_database)
+def _create_unversioned_legacy_database(database: Path) -> None:
+    """Create the pre-G-C Evidence/Claim/Stage schema without migration metadata."""
+    with sqlite3.connect(database, isolation_level=None) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE sh3_evidence_records (
+                evidence_id TEXT PRIMARY KEY NOT NULL,
+                record_json TEXT NOT NULL,
+                integrity TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE sh3_replay_claims (
+                cycle_id TEXT PRIMARY KEY NOT NULL,
+                fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('claimed', 'completed', 'released')),
+                generation INTEGER NOT NULL,
+                attempts INTEGER NOT NULL,
+                owner_token TEXT,
+                lease_expires_at REAL,
+                evidence_id TEXT,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX sh3_replay_claims_state_idx
+                ON sh3_replay_claims(state, lease_expires_at);
+            CREATE TABLE sh3_replay_stage_executions (
+                idempotency_key TEXT PRIMARY KEY NOT NULL,
+                cycle_id TEXT NOT NULL,
+                cycle_fingerprint TEXT NOT NULL,
+                stage_name TEXT NOT NULL,
+                input_fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('claimed', 'completed')),
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                attempts INTEGER NOT NULL CHECK (attempts >= 1),
+                owner_token TEXT,
+                result_json TEXT,
+                result_integrity TEXT,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (cycle_id) REFERENCES sh3_replay_claims(cycle_id),
+                CHECK (
+                    (state = 'claimed' AND owner_token IS NOT NULL
+                        AND result_json IS NULL AND result_integrity IS NULL)
+                    OR
+                    (state = 'completed' AND owner_token IS NULL
+                        AND result_json IS NOT NULL AND result_integrity IS NOT NULL)
+                )
+            );
+            CREATE INDEX sh3_replay_stage_cycle_state_idx
+                ON sh3_replay_stage_executions(cycle_id, state);
+            """
+        )
 
-    legacy_report = check_database(legacy_database)
-    assert legacy_report.replay_operation_execution_count == 0
-    upgraded_stores = create_persistent_replay_stores(legacy_database)
-    assert isinstance(upgraded_stores.replay_operation_store, SQLiteReplayOperationStore)
-    assert check_database(legacy_database).replay_operation_execution_count == 0
+
+def test_unversioned_legacy_database_requires_explicit_migration_and_validates_operation_table(
+    tmp_path: Path,
+) -> None:
+    legacy_database = tmp_path / "legacy-without-operation-table.sqlite3"
+    _create_unversioned_legacy_database(legacy_database)
+
+    with sqlite3.connect(legacy_database) as connection:
+        original_tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+        assert "sh3_schema_metadata" not in original_tables
+        assert "sh3_replay_operations" not in original_tables
+        assert "sh3_replay_operation_plans" not in original_tables
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+
+    with pytest.raises(PersistentReplayReadinessError):
+        check_database(legacy_database)
+    with pytest.raises(PersistentSchemaMigrationRequiredError):
+        SQLiteEvidenceStore(legacy_database)
+    with pytest.raises(PersistentSchemaMigrationRequiredError):
+        SQLiteReplayClaimStore(legacy_database)
+    with pytest.raises(PersistentReplayReadinessError):
+        create_persistent_replay_stores(legacy_database)
+
+    # Rejected normal access must not auto-create metadata or missing tables.
+    with sqlite3.connect(legacy_database) as connection:
+        resulting_tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        )
+        assert resulting_tables == original_tables
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
 
     operations_database = tmp_path / "with-operation-table.sqlite3"
     _, _, operations, claim, parent_stage_key = _prepared_database(operations_database)
