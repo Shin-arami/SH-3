@@ -4,6 +4,7 @@ import re
 from typing import Final
 
 __all__ = [
+    "COGNITION_CONTRACT_VERSION",
     "EVENT_SCHEMA_VERSION",
     "EVIDENCE_SCHEMA_VERSION",
     "PACKAGE_NAME",
@@ -16,8 +17,10 @@ __all__ = [
 PACKAGE_NAME: Final[str] = "sh3"
 PACKAGE_VERSION: Final[str] = "2.1.0"
 PRODUCT_EDITION: Final[str] = "2.0"
+COGNITION_CONTRACT_VERSION: Final[str] = "1.0.0"
 EVENT_SCHEMA_VERSION: Final[str] = "1.0.0"
 EVIDENCE_SCHEMA_VERSION: Final[str] = "1.0.0"
+LEARNING_CLOSED_LOOP_EVIDENCE_SCHEMA_VERSION: Final[str] = "1.1.0"
 _SEMVER_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
 
 def is_semantic_version(value: str) -> bool:

@@ -4,6 +4,8 @@ from collections.abc import Callable
 from typing import Any
 
 from cognition.core import CognitionCore
+from cognition.execution_boundary import CognitiveExecutionBoundary
+from cognition.feedback_boundary import CognitiveFeedbackBoundary
 from cognition.memory import MemoryCore
 from cognition.planner import Planner
 from cognition.policy import PolicyEngine
@@ -15,8 +17,18 @@ from foundation.utils.hash import short_id
 from foundation.utils.logging import error, info
 from infrastructure.event_bus import EventPublisher
 from infrastructure.events import Event, EventPropagationContext
+from infrastructure.security import EvidenceStore
+from infrastructure.security.persistent_operation_store import (
+    SQLiteReplayOperationStore,
+)
+from infrastructure.security.persistent_store import (
+    SQLiteEvidenceStore,
+    SQLiteReplayClaimStore,
+    SQLiteReplayStageStore,
+)
 from runtime.context_manager import ContextManager
 from runtime.core import RuntimeCore
+from runtime.execution_engine import RuntimeExecutionEngine
 
 __all__ = ["SH3Kernel"]
 
@@ -27,13 +39,25 @@ class SH3Kernel:
         "_last_event_id",
         "_propagation_context",
         "cognition",
+        "cognitive_learning_boundary",
         "context_manager",
+        "feedback_boundary",
         "kernel_id",
+        "learning_closed_loop_evidence_boundary",
+        "learning_feedback_loop",
         "learning_loop",
+        "learning_optimizer_boundary",
         "memory",
         "meta_controller",
+        "optimizer_evidence_boundary",
+        "optimizer_healing_boundary",
+        "optimizer_update_boundary",
         "planner",
         "policy",
+        "recovery_execution_boundary",
+        "recovery_strategy_boundary",
+        "replay_operation_store",
+        "replay_stage_store",
         "runtime",
         "system_optimizer",
     )
@@ -42,14 +66,72 @@ class SH3Kernel:
         self,
         *,
         event_publisher: EventPublisher | None = None,
+        evidence_store: EvidenceStore | None = None,
+        replay_claim_store: SQLiteReplayClaimStore | None = None,
+        replay_stage_store: SQLiteReplayStageStore | None = None,
+        replay_operation_store: SQLiteReplayOperationStore | None = None,
     ) -> None:
+        if evidence_store is not None and not isinstance(evidence_store, EvidenceStore):
+            raise TypeError("evidence_store must be EvidenceStore or None")
+        if replay_claim_store is not None and not isinstance(
+            replay_claim_store, SQLiteReplayClaimStore
+        ):
+            raise TypeError("replay_claim_store must be SQLiteReplayClaimStore or None")
+        if replay_stage_store is not None and not isinstance(
+            replay_stage_store, SQLiteReplayStageStore
+        ):
+            raise TypeError("replay_stage_store must be SQLiteReplayStageStore or None")
+        if replay_stage_store is not None:
+            if replay_claim_store is None:
+                raise ValueError(
+                    "replay_stage_store requires replay_claim_store"
+                )
+            if replay_stage_store.database_path != replay_claim_store.database_path:
+                raise ValueError(
+                    "replay claim and stage stores must share one SQLite database"
+                )
+        if replay_operation_store is not None:
+            if replay_claim_store is None or replay_stage_store is None:
+                raise ValueError(
+                    "replay_operation_store requires replay_claim_store and replay_stage_store"
+                )
+            if replay_operation_store.database_path != replay_claim_store.database_path:
+                raise ValueError(
+                    "operation and replay claim stores must share one SQLite database"
+                )
+            if replay_operation_store.database_path != replay_stage_store.database_path:
+                raise ValueError(
+                    "operation and replay stage stores must share one SQLite database"
+                )
+        if replay_claim_store is not None:
+            if not isinstance(evidence_store, SQLiteEvidenceStore):
+                raise ValueError("replay_claim_store requires SQLiteEvidenceStore")
+            if replay_claim_store.database_path != evidence_store.database_path:
+                raise ValueError("evidence and replay claims must share one SQLite database")
         self._event_publisher = event_publisher
         self._last_event_id: str | None = None
         self._propagation_context: EventPropagationContext | None = None
+        self.replay_stage_store = replay_stage_store
+        self.replay_operation_store = replay_operation_store
 
         self.runtime = RuntimeCore(event_publisher=event_publisher)
         self.context_manager = ContextManager()
-        self.cognition = CognitionCore(self.context_manager)
+        if evidence_store is None:
+            # Preserve the legacy in-memory construction path by default.
+            self.cognition = CognitionCore(
+                self.context_manager, event_publisher=event_publisher
+            )
+        else:
+            # Persistent kernels share their evidence boundary with cognition and runtime.
+            execution_engine = RuntimeExecutionEngine(
+                event_publisher=event_publisher, evidence_store=evidence_store
+            )
+            self.cognition = CognitionCore(
+                self.context_manager,
+                execution_boundary=CognitiveExecutionBoundary(execution_engine),
+                event_publisher=event_publisher,
+                evidence_store=evidence_store,
+            )
         self.planner = Planner()
         self.policy = PolicyEngine()
         self.memory = MemoryCore()
@@ -69,6 +151,73 @@ class SH3Kernel:
         self.system_optimizer = SystemOptimizer(
             self,
             event_publisher=event_publisher,
+            replay_operation_store=replay_operation_store,
+        )
+        from kernel.cognitive_learning_boundary import CognitiveLearningBoundary
+        from kernel.learning_closed_loop_evidence_boundary import LearningClosedLoopEvidenceBoundary
+        from kernel.learning_feedback_loop import LearningClosedLoopCoordinator
+        from kernel.learning_optimizer_boundary import LearningOptimizerBoundary
+        from kernel.optimizer_evidence_boundary import OptimizationEvidenceBoundary
+        from kernel.optimizer_healing_boundary import OptimizerHealingBoundary
+        from kernel.optimizer_update_boundary import OptimizationUpdateBoundary
+        from kernel.recovery_execution_boundary import RecoveryExecutionBoundary
+        from kernel.recovery_strategy_boundary import RecoveryStrategyBoundary
+        self.cognitive_learning_boundary = CognitiveLearningBoundary(
+            self.learning_loop,
+            event_publisher=event_publisher,
+            replay_stage_store=replay_stage_store,
+        )
+        self.feedback_boundary = CognitiveFeedbackBoundary(
+            self.cognition,
+            event_publisher=event_publisher,
+        )
+        self.optimizer_evidence_boundary = OptimizationEvidenceBoundary(
+            evidence_store=evidence_store,
+            event_publisher=event_publisher,
+        )
+        self.learning_closed_loop_evidence_boundary = LearningClosedLoopEvidenceBoundary(
+            self.optimizer_evidence_boundary.evidence_store,
+            event_publisher=event_publisher,
+        )
+        self.optimizer_update_boundary = OptimizationUpdateBoundary(
+            self.system_optimizer,
+            event_publisher=event_publisher,
+            evidence_boundary=self.optimizer_evidence_boundary,
+        )
+        self.learning_optimizer_boundary = LearningOptimizerBoundary(
+            self.system_optimizer,
+            event_publisher=event_publisher,
+            update_boundary=self.optimizer_update_boundary,
+            replay_stage_store=replay_stage_store,
+        )
+        self.recovery_strategy_boundary = RecoveryStrategyBoundary(
+            self.meta_controller.healer,
+            event_publisher=event_publisher,
+            replay_stage_store=replay_stage_store,
+        )
+        self.recovery_execution_boundary = RecoveryExecutionBoundary(
+            self.meta_controller.healer,
+            event_publisher=event_publisher,
+            replay_stage_store=replay_stage_store,
+            replay_operation_store=replay_operation_store,
+        )
+        self.optimizer_healing_boundary = OptimizerHealingBoundary(
+            self.meta_controller.healer,
+            event_publisher=event_publisher,
+            strategy_boundary=self.recovery_strategy_boundary,
+            execution_boundary=self.recovery_execution_boundary,
+        )
+        self.learning_feedback_loop = LearningClosedLoopCoordinator(
+            self,
+            event_publisher=event_publisher,
+            learning_boundary=self.cognitive_learning_boundary,
+            optimizer_boundary=self.learning_optimizer_boundary,
+            healing_boundary=self.optimizer_healing_boundary,
+            recovery_strategy_boundary=self.recovery_strategy_boundary,
+            recovery_execution_boundary=self.recovery_execution_boundary,
+            feedback_boundary=self.feedback_boundary,
+            closed_loop_evidence_boundary=self.learning_closed_loop_evidence_boundary,
+            replay_claim_store=replay_claim_store,
         )
         self.kernel_id = short_id("sh3-kernel")
 
@@ -82,9 +231,23 @@ class SH3Kernel:
 
         self._event_publisher = publisher
         self.runtime.set_event_publisher(publisher)
+        self.cognition.set_event_publisher(publisher)
+        execution_backend = self.cognition.execution_boundary.backend
+        if isinstance(execution_backend, RuntimeExecutionEngine):
+            execution_backend.set_event_publisher(publisher)
         self.learning_loop.set_event_publisher(publisher)
         self.meta_controller.set_event_publisher(publisher)
         self.system_optimizer.set_event_publisher(publisher)
+        self.learning_feedback_loop.set_event_publisher(publisher)
+        self.cognitive_learning_boundary.set_event_publisher(publisher)
+        self.feedback_boundary.set_event_publisher(publisher)
+        self.learning_optimizer_boundary.set_event_publisher(publisher)
+        self.optimizer_update_boundary.set_event_publisher(publisher)
+        self.optimizer_evidence_boundary.set_event_publisher(publisher)
+        self.learning_closed_loop_evidence_boundary.set_event_publisher(publisher)
+        self.optimizer_healing_boundary.set_event_publisher(publisher)
+        self.recovery_strategy_boundary.set_event_publisher(publisher)
+        self.recovery_execution_boundary.set_event_publisher(publisher)
 
     @property
     def propagation_context(self) -> EventPropagationContext | None:
@@ -304,6 +467,26 @@ class SH3Kernel:
             context=propagation,
         )
 
+    def learning_feedback_cycle(
+        self,
+        result: Any,
+        *,
+        context: EventPropagationContext | None = None,
+        optimize: bool = True,
+        recover: bool = True,
+    ) -> Any:
+        from cognition.contracts import CognitiveResult
+        if not isinstance(result, CognitiveResult):
+            raise TypeError("result must be CognitiveResult")
+        propagation = self._new_propagation(context)
+        self._propagation_context = propagation
+        return self.learning_feedback_loop.run(
+            result,
+            context=propagation,
+            optimize=optimize,
+            recover=recover,
+        )
+
     def meta_cycle(
         self,
         *,
@@ -328,8 +511,23 @@ class SH3Kernel:
         exc: Exception,
         context: dict[str, Any] | None = None,
     ) -> Any:
+        propagation = self._new_propagation()
+        self._propagation_context = propagation
+        self.meta_controller.healer.set_propagation_context(propagation)
         snapshot = self.meta_controller.healer.detect(exc, context or {})
-        return self.meta_controller.healer.recover(snapshot)
+        strategy = self.recovery_strategy_boundary.request(
+            snapshot,
+            context=propagation,
+        )
+        execution = self.recovery_execution_boundary.request(
+            strategy,
+            snapshot,
+            context=strategy.propagation_context,
+        )
+        self._propagation_context = execution.propagation_context
+        if not execution.success:
+            raise RuntimeError(execution.error or "recovery execution failed")
+        return execution.result
 
     def execute_safe(
         self,

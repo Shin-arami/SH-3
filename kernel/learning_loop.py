@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import suppress
+from copy import deepcopy
 from threading import RLock
 from typing import Any
 
@@ -27,6 +28,7 @@ class LearningLoop:
         "_lock",
         "_propagation_context",
         "_records",
+        "_stage_results",
         "kernel",
         "loop_id",
         "max_chunk_size",
@@ -70,6 +72,7 @@ class LearningLoop:
         self._event_bus: EventBus | None = None
         self._lock = RLock()
         self._records: list[dict[str, Any]] = []
+        self._stage_results: dict[str, dict[str, Any]] = {}
         self._propagation_context: EventPropagationContext | None = None
         self._configure_event_subscription()
 
@@ -263,22 +266,50 @@ class LearningLoop:
         self,
         experience: dict[str, Any],
         score: float,
+        *,
+        idempotency_key: str | None = None,
     ) -> str:
         if not isinstance(experience, dict):
             raise TypeError("experience must be dict")
         if not 0.0 <= score <= 1.0:
             raise ValueError("score must be between 0.0 and 1.0")
 
-        key = short_id(str(experience))
+        if idempotency_key is None:
+            key = short_id(str(experience))
+        else:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ValueError("idempotency_key must not be empty")
+            key = short_id(
+                {"stage_idempotency_key": idempotency_key},
+                prefix="learning-experience:",
+            )
 
-        self.memory.write(
-            key=key,
-            value={
-                "experience": experience,
-                "score": score,
-            },
-            tags=["learning", "experience"],
-        )
+        value = {
+            "experience": experience,
+            "score": score,
+        }
+
+        if idempotency_key is None:
+            self.memory.write(
+                key=key,
+                value=value,
+                tags=["learning", "experience"],
+            )
+        else:
+            # A retry in the same Kernel must not append the same Memory key
+            # to the timeline a second time.
+            with self._lock:
+                existing = self.memory.read(key)
+                if existing is None:
+                    self.memory.write(
+                        key=key,
+                        value=value,
+                        tags=["learning", "experience"],
+                    )
+                elif existing != value:
+                    raise ValueError(
+                        "learning idempotency key conflicts with stored memory"
+                    )
 
         return key
 
@@ -287,14 +318,51 @@ class LearningLoop:
         execution_result: dict[str, Any],
         *,
         context: EventPropagationContext | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        if idempotency_key is None:
+            return self._run_once(
+                execution_result,
+                context=context,
+                idempotency_key=None,
+            )
+
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("idempotency_key must not be empty")
+
+        # Serialize same-key requests on this LearningLoop instance. The
+        # durable Stage Store remains authoritative across Runtime restarts.
+        with self._lock:
+            cached = self._stage_results.get(idempotency_key)
+            if cached is not None:
+                return deepcopy(cached)
+
+            result = self._run_once(
+                execution_result,
+                context=context,
+                idempotency_key=idempotency_key,
+            )
+            self._stage_results[idempotency_key] = deepcopy(result)
+            return result
+
+    def _run_once(
+        self,
+        execution_result: dict[str, Any],
+        *,
+        context: EventPropagationContext | None,
+        idempotency_key: str | None,
     ) -> dict[str, Any]:
         propagation = context or self._propagation_context
+        stage_metadata: dict[str, str] = {}
+        if idempotency_key is not None:
+            stage_metadata["idempotency_key"] = idempotency_key
 
         try:
             propagation = self._publish(
                 "LearningStarted",
                 {
                     "loop_id": self.loop_id,
+                    **stage_metadata,
                 },
                 EventType.START,
                 propagation,
@@ -307,6 +375,7 @@ class LearningLoop:
                 {
                     "loop_id": self.loop_id,
                     "experience": experience,
+                    **stage_metadata,
                 },
                 EventType.CREATED,
                 propagation,
@@ -315,7 +384,11 @@ class LearningLoop:
             score = self.evaluate(experience)
             self.update_policy(experience, score)
             self.tune_planner(experience, score)
-            memory_key = self.store_experience(experience, score)
+            memory_key = self.store_experience(
+                experience,
+                score,
+                idempotency_key=idempotency_key,
+            )
 
             result = {
                 "loop_id": self.loop_id,
@@ -331,6 +404,7 @@ class LearningLoop:
                     "memory_key": memory_key,
                     "score": score,
                     "success": True,
+                    **stage_metadata,
                 },
                 EventType.CREATED,
                 propagation,
@@ -343,6 +417,7 @@ class LearningLoop:
                     "memory_key": memory_key,
                     "score": score,
                     "success": True,
+                    **stage_metadata,
                 },
                 EventType.COMPLETE,
                 propagation,
@@ -359,6 +434,7 @@ class LearningLoop:
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                     "success": False,
+                    **stage_metadata,
                 },
                 EventType.FAILURE,
                 propagation,

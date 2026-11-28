@@ -97,7 +97,14 @@ def test_run_publishes_learning_failed_event(monkeypatch: pytest.MonkeyPatch) ->
     publisher = RecordingPublisher()
     loop = LearningLoop(kernel, event_publisher=publisher)
 
-    def fail_store(self: LearningLoop, experience: dict[str, Any], score: float) -> str:
+    def fail_store(
+        self: LearningLoop,
+        experience: dict[str, Any],
+        score: float,
+        *,
+        idempotency_key: str | None = None,
+    ) -> str:
+        del idempotency_key
         raise TypeError("store failed")
 
     monkeypatch.setattr(LearningLoop, "store_experience", fail_store)

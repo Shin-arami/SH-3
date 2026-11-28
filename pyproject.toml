@@ -69,6 +69,7 @@ disallow_untyped_defs = true
 disallow_any_generics = true
 check_untyped_defs = true
 pretty = true
+explicit_package_bases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
